@@ -1,0 +1,17 @@
+# Downloaded / generated assets — not tracked in git
+tiles/
+strips/
+tiles_meta.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

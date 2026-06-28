@@ -1,0 +1,27 @@
+[Unit]
+Description=Floor796 Kiosk Player
+After=network-online.target
+Wants=network-online.target
+Conflicts=getty@tty7.service
+
+[Service]
+Type=simple
+User=kiosk
+Group=kiosk
+WorkingDirectory=/opt/floor796-kiosk
+Environment=HOME=/home/kiosk
+Environment=SDL_AUDIODRIVER=dummy
+ExecStart=/opt/floor796-kiosk/run.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=complete
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
