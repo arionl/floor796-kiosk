@@ -609,20 +609,6 @@ def main():
                       status_label="Loading visible tiles")
     cache.start()
 
-    # ── Prepare hologram overlay ──
-    holo_cache_dir = os.path.join(BASE_DIR, "holograms")
-    holo = None
-    try:
-        from hologram import HologramOverlay
-        holo = HologramOverlay(holo_cache_dir)
-        status.show("Preparing holograms...")
-        holo.prepare()
-        if holo.enabled:
-            log.info("Hologram overlay: %d images", len(holo.holograms))
-    except Exception:
-        log.exception("Hologram overlay failed — continuing without it.")
-        holo = None
-
     status.show("Ready!", f"{len(cache.cache)} tiles loaded", progress=1.0)
     time.sleep(0.5)
 
@@ -721,25 +707,6 @@ def main():
                 dest_x = tc * SPACING_W - int(pos_x)
                 dest_y = tr * SPACING_H - int(pos_y)
                 screen.blit(strip_surf, (dest_x, dest_y), area=src_rect)
-
-        # ── Hologram overlay ──
-        if holo and holo.enabled:
-            holo.update(now)
-            cur = holo.current
-            if cur:
-                # Check if hologram is visible in viewport
-                h_x = cur["map_x"] - int(pos_x)
-                h_y = cur["map_y"] - int(pos_y)
-                if h_x > -cur["w"] and h_x < args.width and \
-                   h_y > -cur["h"] and h_y < args.height:
-                    # Lazy-load the hologram surface
-                    if "surface" not in cur:
-                        try:
-                            cur["surface"] = pygame.image.load(cur["path"]).convert_alpha()
-                        except Exception:
-                            cur["surface"] = None
-                    if cur.get("surface"):
-                        screen.blit(cur["surface"], (h_x, h_y))
 
         pygame.display.flip()
 
