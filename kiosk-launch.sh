@@ -1,16 +1,19 @@
 #!/bin/sh
 # Floor796 Kiosk — player launcher (runs inside X session)
-# This script is called by xinit. It runs as root initially;
-# it drops to the kiosk user to execute the Python player.
+# Called by xinit. Runs as root initially; drops to kiosk user.
 export HOME=/home/kiosk
 export SDL_AUDIODRIVER=dummy
 export SDL_VIDEODRIVER=x11
 export DISPLAY=:0
 
-cd /home/kiosk/floor796-kiosk
+INSTALL_DIR=/opt/floor796-kiosk
+WIDTH="${KIOSK_WIDTH:-1920}"
+HEIGHT="${KIOSK_HEIGHT:-1080}"
+
+cd "${INSTALL_DIR}"
 
 exec /sbin/runuser -u kiosk -- /usr/bin/python3 \
-    /home/kiosk/floor796-kiosk/kiosk_player.py \
+    "${INSTALL_DIR}/kiosk_player.py" \
     --fullscreen \
-    --width "${KIOSK_WIDTH:-1920}" \
-    --height "${KIOSK_HEIGHT:-1080}"
+    --width "${WIDTH}" \
+    --height "${HEIGHT}"

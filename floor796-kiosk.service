@@ -8,8 +8,8 @@ Type=simple
 User=root
 Environment=HOME=/home/kiosk
 Environment=SDL_AUDIODRIVER=dummy
-WorkingDirectory=/home/kiosk/floor796-kiosk
-ExecStart=/home/kiosk/floor796-kiosk/run.sh
+WorkingDirectory=/opt/floor796-kiosk
+ExecStart=/opt/floor796-kiosk/run.sh
 Restart=always
 RestartSec=5
 StandardOutput=journal
