@@ -67,7 +67,7 @@ SPACING_H = int(812 * SCALE)       # 812
 
 DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
-CACHE_MARGIN = 0
+CACHE_MARGIN = 1               # prefetch 1 ring beyond viewport
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
 BG_COLOR = (0, 0, 0)
@@ -188,7 +188,7 @@ def prepare_strips(tiles_meta, status=None):
 class TileCache:
     """Async tile cache — loads and converts strips in a background thread."""
 
-    def __init__(self, strip_dir, max_tiles=12):
+    def __init__(self, strip_dir, max_tiles=18):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
