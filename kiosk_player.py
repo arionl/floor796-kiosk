@@ -67,7 +67,7 @@ SPACING_H = int(812 * SCALE)       # 812
 
 DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
-CACHE_MARGIN = 1               # prefetch 1 ring beyond viewport
+CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
 BG_COLOR = (0, 0, 0)
@@ -206,7 +206,7 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
 class TileCache:
     """Async tile cache — loads and converts strips in a background thread."""
 
-    def __init__(self, strip_dir, max_tiles=12, display_depth=16):
+    def __init__(self, strip_dir, max_tiles=20, display_depth=16):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
@@ -274,20 +274,26 @@ class TileCache:
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
+            # Queue visible tiles first, then margin tiles
             self._queue.extend(sorted(new_pending & visible_ids))
             self._queue.extend(sorted(new_pending & margin_ids))
 
+            # Evict tiles no longer needed
             for tid in [t for t in self.cache if t not in needed]:
                 del self.cache[tid]
             self._queue = [t for t in self._queue if t in needed]
             for t in [t for t in self._results if t not in needed]:
                 del self._results[t]
 
-            while len(self.cache) > self.max_tiles:
-                evict = [t for t in self.cache if t not in visible_ids]
-                if not evict:
-                    evict = list(self.cache.keys())
-                del self.cache[evict[0]]
+            # If still over capacity, evict outer-ring tiles first.
+            # visible tiles are never evicted; ring-1 margin tiles survive
+            # longer than ring-2+ tiles.
+            if len(self.cache) > self.max_tiles:
+                # Sort: evict non-margin before margin
+                evictable = [t for t in self.cache if t not in visible_ids]
+                evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
+                while len(self.cache) > self.max_tiles and evictable:
+                    del self.cache[evictable.pop()]
 
     def poll_results(self):
         with self._lock:
