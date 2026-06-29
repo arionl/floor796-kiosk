@@ -1,7 +1,7 @@
 # Downloaded / generated assets — not tracked in git
 tiles/
 strips/
-holograms/
+holo_cache/
 tiles_meta.json
 
 # Python

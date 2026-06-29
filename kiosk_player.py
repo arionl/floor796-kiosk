@@ -609,12 +609,24 @@ def main():
                       status_label="Loading visible tiles")
     cache.start()
 
+    # ── Hologram overlay ──
+    hologram = None
+    try:
+        from hologram import HologramOverlay
+        holo_cache = os.path.join(BASE_DIR, "holo_cache")
+        hologram = HologramOverlay(holo_cache)
+        hologram.prepare()
+    except Exception as e:
+        log.warning("Hologram overlay failed: %s", e)
+        hologram = None
+
     status.show("Ready!", f"{len(cache.cache)} tiles loaded", progress=1.0)
     time.sleep(0.5)
 
     pos_x, pos_y = wanderer.x, wanderer.y
     wandering = not args.no_wander
     frame_idx = 0
+    prev_frame_idx = 0
     frame_accumulator = 0.0
     frame_interval = 1.0 / args.fps
     last_coverage_log = time.time()
@@ -660,8 +672,12 @@ def main():
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
+            prev_frame_idx = frame_idx
             frame_idx = (frame_idx + 1) % TILE_FRAMES
             frame_accumulator = 0.0
+            # Cycle hologram when animation loop restarts
+            if hologram and prev_frame_idx > frame_idx:
+                hologram.cycle_next()
 
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
@@ -707,6 +723,11 @@ def main():
                 dest_x = tc * SPACING_W - int(pos_x)
                 dest_y = tr * SPACING_H - int(pos_y)
                 screen.blit(strip_surf, (dest_x, dest_y), area=src_rect)
+
+        # ── Hologram overlay ──
+        if hologram:
+            hologram.update(frame_idx)
+            hologram.render(screen, pos_x, pos_y)
 
         pygame.display.flip()
 
