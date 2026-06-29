@@ -57,14 +57,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     python3-venv \
     mesa-utils \
     libegl-mesa0 \
-    libgles2-mesa \
-    >/dev/null 2>&1
+    libgles2 \
+    >/dev/null
 echo "    ✓ System packages installed"
 
 # ─── 2. Create kiosk user ────────────────────────────────────────────────────
 echo "[2/7] Setting up kiosk user..."
 if ! id -u "${SERVICE_USER}" &>/dev/null; then
     useradd -m -s /bin/bash "${SERVICE_USER}"
+    echo "${SERVICE_USER}:REDACTED" | chpasswd
     echo "    ✓ Created user '${SERVICE_USER}'"
 else
     echo "    ✓ User '${SERVICE_USER}' already exists"
@@ -73,17 +74,18 @@ usermod -aG video,render,input,tty "${SERVICE_USER}" 2>/dev/null || true
 
 # ─── 3. Install pygame ───────────────────────────────────────────────────────
 echo "[3/7] Installing Python packages..."
-if ! python3 -c "import pygame" 2>/dev/null; then
-    pip3 install --break-system-packages pygame-ce 2>/dev/null || \
-    pip3 install pygame-ce
+if ! python3 -c "import pygame, brotli" 2>/dev/null; then
+    pip3 install --break-system-packages pygame-ce brotli 2>/dev/null || \
+    pip3 install pygame-ce brotli
 fi
-echo "    ✓ pygame ready"
+echo "    ✓ pygame + brotli ready"
 
 # ─── 4. Copy files ───────────────────────────────────────────────────────────
 echo "[4/7] Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 cp "${SCRIPT_DIR}"/kiosk_player.py      "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/tile_manager.py      "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/hologram.py          "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/floor796-kiosk.service "${SERVICE_DST}"
