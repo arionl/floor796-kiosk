@@ -200,25 +200,35 @@ class TileCache:
         self._stop_flag = False
 
     def _worker_loop(self):
+        # Lower this thread's OS priority so it never starves the render loop
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, 10)
+        except OSError:
+            pass
+
         while not self._stop_flag:
             tid = None
             with self._lock:
                 if self._queue:
                     tid = self._queue.pop(0)
             if tid is None:
-                time.sleep(0.01)
+                time.sleep(0.05)
                 continue
 
             strip_path = os.path.join(self.strip_dir, f"{tid}.png")
             if not os.path.exists(strip_path):
                 continue
             try:
+                # Load only — do NOT call .convert() here, as it contends
+                # with the render loop for the SDL display surface.
+                # Conversion happens in poll_results() on the main thread.
                 surf = pygame.image.load(strip_path)
-                surf = surf.convert()
                 _, h = surf.get_size()
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
                     self._results[tid] = (surf, num_frames)
+                # Yield CPU to the render loop after each tile load
+                time.sleep(0.02)
             except Exception:
                 pass
 
@@ -256,6 +266,11 @@ class TileCache:
             ready = dict(self._results)
             self._results.clear()
         for tid, (surf, num_frames) in ready.items():
+            # Convert on the main thread to avoid SDL contention with render loop
+            try:
+                surf = surf.convert()
+            except Exception:
+                pass
             self.cache[tid] = (surf, num_frames)
             self.load_count += 1
 
