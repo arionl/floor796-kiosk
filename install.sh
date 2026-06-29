@@ -65,7 +65,9 @@ echo "    ✓ System packages installed"
 echo "[2/7] Setting up kiosk user..."
 if ! id -u "${SERVICE_USER}" &>/dev/null; then
     useradd -m -s /bin/bash "${SERVICE_USER}"
-    echo "${SERVICE_USER}:REDACTED" | chpasswd
+    # Set password interactively
+    echo "    Enter a password for '${SERVICE_USER}':"
+    passwd "${SERVICE_USER}"
     echo "    ✓ Created user '${SERVICE_USER}'"
 else
     echo "    ✓ User '${SERVICE_USER}' already exists"
