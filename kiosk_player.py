@@ -188,7 +188,7 @@ def prepare_strips(tiles_meta, status=None):
 class TileCache:
     """Async tile cache — loads and converts strips in a background thread."""
 
-    def __init__(self, strip_dir, max_tiles=18):
+    def __init__(self, strip_dir, max_tiles=12):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
