@@ -188,10 +188,11 @@ def prepare_strips(tiles_meta, status=None):
 class TileCache:
     """Async tile cache — loads and converts strips in a background thread."""
 
-    def __init__(self, strip_dir, max_tiles=12):
+    def __init__(self, strip_dir, max_tiles=12, display_depth=16):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
+        self.display_depth = display_depth
         self.load_count = 0
         self._queue = []
         self._results = {}
@@ -232,6 +233,14 @@ class TileCache:
             except Exception:
                 pass
 
+    def _convert_to_depth(self, surf):
+        """Convert a surface to the display depth (16-bit) to halve memory."""
+        if self.display_depth == 32:
+            return surf.convert()
+        s16 = pygame.Surface(surf.get_size(), 0, self.display_depth)
+        s16.blit(surf, (0, 0))
+        return s16
+
     def start(self):
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -266,9 +275,9 @@ class TileCache:
             ready = dict(self._results)
             self._results.clear()
         for tid, (surf, num_frames) in ready.items():
-            # Convert on the main thread to avoid SDL contention with render loop
+            # Convert to 16-bit depth to halve memory usage on 4 GB Pi.
             try:
-                surf = surf.convert()
+                surf = self._convert_to_depth(surf)
             except Exception:
                 pass
             self.cache[tid] = (surf, num_frames)
@@ -281,7 +290,8 @@ class TileCache:
                 strip_path = os.path.join(self.strip_dir, f"{tid}.png")
                 if os.path.exists(strip_path):
                     try:
-                        surf = pygame.image.load(strip_path).convert()
+                        surf = pygame.image.load(strip_path)
+                        surf = self._convert_to_depth(surf)
                         _, h = surf.get_size()
                         num_frames = max(1, h // TILE_H)
                         self.cache[tid] = (surf, num_frames)
