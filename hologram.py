@@ -359,6 +359,9 @@ class HologramOverlay:
                 log.info(f'  Decoded {len(frames)} frames')
 
             self._build_clip_mask()
+            # Pre-apply clip mask to all frames so normal rendering is a
+            # single blit (no per-frame surf.copy() + BLEND_RGBA_MULT).
+            self._apply_clip_to_all_frames()
             self.surface_matrices = [create_surface_matrix(s) for s in SURFACES]
             log.info(f'Hologram overlay ready: {len(self.scenes)} scenes')
             return True
@@ -372,6 +375,18 @@ class HologramOverlay:
         mask = pygame.Surface((SCENE_WIDTH, SCENE_HEIGHT), pygame.SRCALPHA)
         pygame.draw.polygon(mask, (255, 255, 255, 255), self.clip_poly_local)
         self.clip_mask = mask
+
+    def _apply_clip_to_all_frames(self):
+        """Pre-multiply clip mask into every frame of every scene.
+
+        After this, normal rendering is a single blit — no per-frame
+        surf.copy() + BLEND_RGBA_MULT needed.  This trades 6×60 = 360
+        extra surface copies at startup for zero per-frame allocation.
+        """
+        for scene in self.scenes:
+            for i in range(len(scene)):
+                scene[i].blit(self.clip_mask, (0, 0),
+                              special_flags=pygame.BLEND_RGBA_MULT)
 
     def update(self, anim_frame):
         """Called every render frame (60fps) by the player.
@@ -478,10 +493,8 @@ class HologramOverlay:
         surf = surfaces[holo_frame]
 
         if self.state == 'normal':
-            # Direct render with clip mask only
-            clipped = surf.copy()
-            clipped.blit(self.clip_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-            screen.blit(clipped, (screen_x, screen_y))
+            # Clip mask pre-applied during prepare() — single blit.
+            screen.blit(surf, (screen_x, screen_y))
 
         else:
             # fade_in or fade_out: render with materialization grid
@@ -508,13 +521,24 @@ class HologramOverlay:
 
     def _render_with_transition(self, surf, screen, screen_x, screen_y):
         """Render hologram with materialization mask overlay."""
-        mask = pygame.Surface((SCENE_WIDTH, SCENE_HEIGHT), pygame.SRCALPHA)
+        # Reuse persistent mask surfaces instead of allocating every frame.
+        if not hasattr(self, '_transition_mask') or self._transition_mask is None:
+            self._transition_mask = pygame.Surface(
+                (SCENE_WIDTH, SCENE_HEIGHT), pygame.SRCALPHA)
+        if not hasattr(self, '_combined_mask') or self._combined_mask is None:
+            self._combined_mask = pygame.Surface(
+                (SCENE_WIDTH, SCENE_HEIGHT), pygame.SRCALPHA)
+
+        mask = self._transition_mask
+        mask.fill((0, 0, 0, 0))
 
         for i, surface in enumerate(SURFACES):
             draw_surface_quads(surface, self.surface_matrices[i], mask,
                               self._glitch_cache)
 
-        combined_mask = self.clip_mask.copy()
+        combined_mask = self._combined_mask
+        combined_mask.fill((0, 0, 0, 0))
+        combined_mask.blit(self.clip_mask, (0, 0))
         combined_mask.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
 
         clipped = surf.copy()
