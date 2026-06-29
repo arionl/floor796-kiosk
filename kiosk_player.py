@@ -121,11 +121,15 @@ class StatusDisplay:
 
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
 
-def prepare_strips(tiles_meta, status=None):
-    """Decode each tile MP4 to a full-res frame strip PNG via ffmpeg.
+def prepare_strips(tiles_meta, status=None, display_depth=16):
+    """Decode each tile MP4 to a full-res frame strip via ffmpeg, then
+    convert to display_depth-bit for minimal memory and zero runtime
+    conversion cost.
 
     Animated tiles → 1024×(820*60) vertical strip; static → single frame.
-    Skips tiles that are already decoded.
+    Strips are saved as BMP at the target depth so pygame.image.load()
+    produces a surface at the correct depth with no conversion needed.
+    Skips tiles that are already decoded at the correct depth.
     """
     os.makedirs(STRIP_DIR, exist_ok=True)
     tiles = list(tiles_meta["tiles"].items())
@@ -134,42 +138,56 @@ def prepare_strips(tiles_meta, status=None):
     skipped = 0
 
     for tile_id, info in tiles:
-        strip_path = os.path.join(STRIP_DIR, f"{tile_id}.png")
-        if os.path.exists(strip_path) and os.path.getsize(strip_path) > 1000:
-            try:
-                with open(strip_path, "rb") as f:
-                    f.seek(16)
-                    w_bytes = f.read(4)
-                    if len(w_bytes) == 4:
-                        import struct
-                        strip_w = struct.unpack(">I", w_bytes)[0]
-                        if strip_w == TILE_W:
-                            decoded += 1
-                            skipped += 1
-                            continue
-            except Exception:
-                pass
+        # We use .bmp for pre-converted strips, .png for ffmpeg-decoded.
+        strip_bmp = os.path.join(STRIP_DIR, f"{tile_id}.bmp")
+        strip_png = os.path.join(STRIP_DIR, f"{tile_id}.png")
 
-        mp4_path = os.path.join(TILE_DIR, info["mp4"])
-        if not os.path.exists(mp4_path):
+        # Check if 16-bit BMP already exists
+        if os.path.exists(strip_bmp) and os.path.getsize(strip_bmp) > 1000:
             decoded += 1
+            skipped += 1
             continue
 
-        animated = info.get("animated", False)
-        if animated:
-            vf = f"scale={TILE_W}:{TILE_H}:flags=neighbor,tile=1x{TILE_FRAMES}"
-            cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vf", vf,
-                   "-frames", "1", "-compression_level", "3", strip_path]
-        else:
-            cmd = ["ffmpeg", "-y", "-i", mp4_path, "-frames", "1",
-                   "-an", "-vf", f"scale={TILE_W}:{TILE_H}:flags=neighbor",
-                   "-compression_level", "3", strip_path]
+        # Need to create the strip. Do we have a PNG from a previous run?
+        need_ffmpeg = True
+        if os.path.exists(strip_png) and os.path.getsize(strip_png) > 1000:
+            need_ffmpeg = False
 
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            cmd_fb = ["ffmpeg", "-y", "-i", mp4_path, "-frames", "1",
-                      "-an", strip_path]
-            subprocess.run(cmd_fb, capture_output=True, timeout=30)
+        if need_ffmpeg:
+            mp4_path = os.path.join(TILE_DIR, info["mp4"])
+            if not os.path.exists(mp4_path):
+                decoded += 1
+                continue
+
+            animated = info.get("animated", False)
+            if animated:
+                vf = f"scale={TILE_W}:{TILE_H}:flags=neighbor,tile=1x{TILE_FRAMES}"
+                cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vf", vf,
+                       "-frames", "1", "-compression_level", "3", strip_png]
+            else:
+                cmd = ["ffmpeg", "-y", "-i", mp4_path, "-frames", "1",
+                       "-an", "-vf", f"scale={TILE_W}:{TILE_H}:flags=neighbor",
+                       "-compression_level", "3", strip_png]
+
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+            if result.returncode != 0:
+                cmd_fb = ["ffmpeg", "-y", "-i", mp4_path, "-frames", "1",
+                          "-an", strip_png]
+                subprocess.run(cmd_fb, capture_output=True, timeout=30)
+
+        # Convert PNG strip to target-depth BMP
+        if os.path.exists(strip_png):
+            try:
+                surf = pygame.image.load(strip_png)
+                if display_depth != 32:
+                    s16 = pygame.Surface(surf.get_size(), 0, display_depth)
+                    s16.blit(surf, (0, 0))
+                    surf = s16
+                pygame.image.save(surf, strip_bmp)
+                # Remove the PNG to save disk space
+                os.remove(strip_png)
+            except Exception:
+                pass
 
         decoded += 1
         if status and (decoded % 5 == 0 or decoded == total):
@@ -216,20 +234,21 @@ class TileCache:
                 time.sleep(0.05)
                 continue
 
-            strip_path = os.path.join(self.strip_dir, f"{tid}.png")
+            strip_path = os.path.join(self.strip_dir, f"{tid}.bmp")
+            if not os.path.exists(strip_path):
+                # Fall back to PNG (pre-conversion or older format)
+                strip_path = os.path.join(self.strip_dir, f"{tid}.png")
             if not os.path.exists(strip_path):
                 continue
             try:
-                # Load only — do NOT call .convert() here, as it contends
-                # with the render loop for the SDL display surface.
-                # Conversion happens in poll_results() on the main thread.
+                # Load 16-bit pre-converted strip from disk. No runtime
+                # conversion needed — prepare_strips() saved them as 16-bit.
                 surf = pygame.image.load(strip_path)
                 _, h = surf.get_size()
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
                     self._results[tid] = (surf, num_frames)
-                # Yield CPU to the render loop after each tile load
-                time.sleep(0.02)
+                time.sleep(0.05)
             except Exception:
                 pass
 
@@ -275,11 +294,7 @@ class TileCache:
             ready = dict(self._results)
             self._results.clear()
         for tid, (surf, num_frames) in ready.items():
-            # Convert to 16-bit depth to halve memory usage on 4 GB Pi.
-            try:
-                surf = self._convert_to_depth(surf)
-            except Exception:
-                pass
+            # Surface is already converted to 16-bit by the background thread.
             self.cache[tid] = (surf, num_frames)
             self.load_count += 1
 
@@ -287,11 +302,14 @@ class TileCache:
         total = len(tile_ids)
         for i, tid in enumerate(tile_ids):
             if tid not in self.cache:
-                strip_path = os.path.join(self.strip_dir, f"{tid}.png")
+                strip_path = os.path.join(self.strip_dir, f"{tid}.bmp")
+                if not os.path.exists(strip_path):
+                    strip_path = os.path.join(self.strip_dir, f"{tid}.png")
                 if os.path.exists(strip_path):
                     try:
                         surf = pygame.image.load(strip_path)
-                        surf = self._convert_to_depth(surf)
+                        if surf.get_bitsize() != self.display_depth:
+                            surf = self._convert_to_depth(surf)
                         _, h = surf.get_size()
                         num_frames = max(1, h // TILE_H)
                         self.cache[tid] = (surf, num_frames)
@@ -542,8 +560,9 @@ def main():
 
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
-    flags = pygame.FULLSCREEN | pygame.DOUBLEBUF if args.fullscreen else pygame.DOUBLEBUF
-    screen = pygame.display.set_mode((args.width, args.height), flags)
+    # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
+    flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+    screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
@@ -605,7 +624,7 @@ def main():
 
     # ── Decode strips ──
     status.show("Checking tile strips...")
-    prepare_strips(tiles_meta, status=status)
+    prepare_strips(tiles_meta, status=status, display_depth=16)
 
     # ── Build tile grid lookup ──
     tile_grid = {}
@@ -663,8 +682,8 @@ def main():
 
     running = True
     while running:
-        dt = clock.tick(60) / 1000.0
-        dt = min(dt, 1 / 30)
+        dt = clock.tick(30) / 1000.0
+        dt = min(dt, 1 / 15)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
