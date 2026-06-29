@@ -10,10 +10,13 @@ A flat 805×646 image is placed at a fixed map position and clipped to a
 4-point polygon defining the visible hologram area.
 
 The 6 holograms cycle automatically. Each hologram cycle (10 seconds):
-  - 3s gap:      empty room (no overlay)
-  - 1s fade in:  materialize effect (cells fade in with glitch colors)
-  - 5s normal:   one full play of the 60-frame scene (frames 0-59)
-  - 1s fade out: dematerialize effect (cells fade out)
+  - 1s gap:       empty room (no overlay)
+  - 2s fade in:   materialize effect (cells fade in with glitch colors)
+  - 5s normal:    one full play of the 60-frame scene (frames 0-59)
+  - 2s fade out:  dematerialize effect (cells fade out)
+
+All timing is at 12fps (animation frames), including transitions.
+Glitch colors are cached per animation frame to avoid 60fps flicker.
 """
 import os
 import random
@@ -223,11 +226,13 @@ def update_surface_matrix(mat, direction=1):
                     row[c] -= 1
 
 
-def draw_surface_quads(surface, mat, mask_surf):
+def draw_surface_quads(surface, mat, mask_surf, glitch_cache=None):
     """Draw the surface grid cells onto the mask surface.
 
     Cells with value 0 are skipped. Higher values = more opaque.
     At max value, cells are solid white. Lower values use glitch colors.
+    glitch_cache: optional dict {(r,c): color} to keep colors stable across
+    render frames within the same animation frame (12fps, not 60fps).
     """
     p1, p2, p3 = surface['points']
     x_dir = 1 if p2[0] >= p1[0] else -1
@@ -275,7 +280,13 @@ def draw_surface_quads(surface, mat, mask_surf):
             if val == SURFACE_FADE_LEVELS:
                 color = (255, 255, 255, 255)
             else:
-                gc = random.choice(GLITCH_COLORS)
+                if glitch_cache is not None:
+                    key = (r, c)
+                    if key not in glitch_cache:
+                        glitch_cache[key] = random.choice(GLITCH_COLORS)
+                    gc = glitch_cache[key]
+                else:
+                    gc = random.choice(GLITCH_COLORS)
                 color = (gc[0], gc[1], gc[2], alpha)
 
             quad = [
@@ -309,6 +320,7 @@ class HologramOverlay:
         self.state = 'gap'
         self.state_frame = 0
         self.surface_matrices = []
+        self._glitch_cache = {}  # stable glitch colors per animation frame
 
         # Pre-compute clip polygon relative to hologram image top-left
         self.clip_poly_local = []
@@ -369,6 +381,7 @@ class HologramOverlay:
         if anim_frame != self._prev_anim_frame:
             self._prev_anim_frame = anim_frame
             self.state_frame += 1
+            self._glitch_cache = {}  # new random colors this animation frame
             self._tick()
 
     def cycle_next(self):
@@ -378,7 +391,11 @@ class HologramOverlay:
         pass
 
     def _tick(self):
-        """Advance the state machine by one animation frame."""
+        """Advance the state machine by one animation frame (12fps)."""
+        # Update transition matrices at 12fps, not 60fps
+        if self.state in ('fade_in', 'fade_out'):
+            self._update_transition_matrices()
+
         if self.state == 'gap':
             if self.state_frame >= GAP_FRAMES:
                 self._enter_fade_in()
@@ -468,11 +485,12 @@ class HologramOverlay:
 
         else:
             # fade_in or fade_out: render with materialization grid
-            self._update_transition_matrices()
+            # Matrix updates happen in _tick() at 12fps
             self._render_with_transition(surf, screen, screen_x, screen_y)
 
     def _update_transition_matrices(self):
         """Update surface matrices for the current fade direction.
+        Called once per animation frame (12fps) from _tick().
         Spreads the fade evenly across the fade duration."""
         if self.state == 'fade_in':
             direction = 1
@@ -481,7 +499,8 @@ class HologramOverlay:
             direction = -1
             fade_len = FADE_OUT_FRAMES
 
-        # Update every N frames to spread SURFACE_FADE_LEVELS steps across fade_len
+        # Update every N animation frames to spread SURFACE_FADE_LEVELS steps
+        # across the full fade duration
         skip = max(1, fade_len // SURFACE_FADE_LEVELS)
         if self.state_frame % skip == 0:
             for mat in self.surface_matrices:
@@ -492,7 +511,8 @@ class HologramOverlay:
         mask = pygame.Surface((SCENE_WIDTH, SCENE_HEIGHT), pygame.SRCALPHA)
 
         for i, surface in enumerate(SURFACES):
-            draw_surface_quads(surface, self.surface_matrices[i], mask)
+            draw_surface_quads(surface, self.surface_matrices[i], mask,
+                              self._glitch_cache)
 
         combined_mask = self.clip_mask.copy()
         combined_mask.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
