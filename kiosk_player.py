@@ -67,7 +67,7 @@ SPACING_H = int(812 * SCALE)       # 812
 
 DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
-CACHE_MARGIN = 1               # prefetch 1 ring beyond viewport
+CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
 BG_COLOR = (0, 0, 0)
@@ -734,6 +734,8 @@ def main():
             tiles_meta=tiles_meta,
             margin=CACHE_MARGIN, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
+            vel_x=wanderer.vx if wandering else 0,
+            vel_y=wanderer.vy if wandering else 0,
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()
@@ -805,8 +807,13 @@ def _compute_content_bounds(tiles_meta):
 
 def _visible_and_margin_tile_ids(pos_x, pos_y, view_w, view_h,
                                   grid_cols, grid_rows, tiles_meta, margin,
-                                  tile_grid=None):
-    """Return (visible_ids, margin_ids) — two sets of tile IDs."""
+                                  tile_grid=None, vel_x=0, vel_y=0):
+    """Return (visible_ids, margin_ids) — two sets of tile IDs.
+
+    When vel_x/vel_y are provided (non-zero), margin tiles are filtered
+    to only those in the forward direction of travel. This avoids wasting
+    loads on tiles behind the viewport that will never scroll in.
+    """
     if tile_grid is None:
         tile_grid = {}
         for tile_id, info in tiles_meta["tiles"].items():
@@ -827,13 +834,41 @@ def _visible_and_margin_tile_ids(pos_x, pos_y, view_w, view_h,
     vis_row_end = min(grid_rows, int((pos_y + view_h) // SPACING_H) + 1)
     visible_ids = _tiles_in_range(vis_col_start, vis_col_end,
                                   vis_row_start, vis_row_end)
-    margin_ids = _tiles_in_range(
+
+    # Full margin ring (fallback for low velocity or startup)
+    all_margin = _tiles_in_range(
         max(0, vis_col_start - margin),
         min(grid_cols, vis_col_end + margin),
         max(0, vis_row_start - margin),
         min(grid_rows, vis_row_end + margin),
     )
-    margin_ids -= visible_ids
+    all_margin -= visible_ids
+
+    # If velocity is near-zero, keep full ring (startup, paused, turning)
+    speed = math.hypot(vel_x, vel_y)
+    if speed < 1.0:
+        margin_ids = all_margin
+    else:
+        # Directional filtering: only keep margin tiles ahead of us.
+        # Use the viewport center as the reference point.
+        vcx = pos_x + view_w / 2
+        vcy = pos_y + view_h / 2
+        dx = vel_x / speed
+        dy = vel_y / speed
+
+        margin_ids = set()
+        for tid in all_margin:
+            info = tiles_meta["tiles"].get(tid)
+            if not info:
+                continue
+            # Tile center in pixel space
+            tcx = info["col"] * SPACING_W + SPACING_W / 2
+            tcy = info["row"] * SPACING_H + SPACING_H / 2
+            # Dot product: positive = tile is ahead of viewport center
+            forward = (tcx - vcx) * dx + (tcy - vcy) * dy
+            if forward > 0:
+                margin_ids.add(tid)
+
     return visible_ids, margin_ids
 
 
