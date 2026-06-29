@@ -18,8 +18,7 @@ fi
 
 # X server starts as root (needs VT7 access).
 # The player runs via the launch script as the kiosk user.
-# -depth 16 halves video memory usage (critical on 4 GB Pi to avoid swap).
 xinit "${SCRIPT_DIR}/kiosk-launch.sh" \
     -- \
     /usr/bin/X :0 vt7 \
-    -nolisten tcp -noreset -dpms -s 0 -depth 16
+    -nolisten tcp -noreset -dpms -s 0
