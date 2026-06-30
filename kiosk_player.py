@@ -442,8 +442,15 @@ class Wanderer:
         target_rc = candidates[0][1]
 
         row, col = target_rc
-        tx = (col + 0.5) * SPACING_W + random.uniform(-TILE_W * 0.3, TILE_W * 0.3)
-        ty = (row + 0.5) * SPACING_H + random.uniform(-TILE_H * 0.3, TILE_H * 0.3)
+        # Target the viewport position that centers the tile on screen,
+        # not the tile center pixel itself.  Without this offset, every
+        # tile appears at the top-left corner of the viewport and the
+        # right/bottom half always shows the next tile over — creating
+        # a coverage bias toward bottom-left content.
+        tx = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
+        ty = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
+        tx += random.uniform(-TILE_W * 0.3, TILE_W * 0.3)
+        ty += random.uniform(-TILE_H * 0.3, TILE_H * 0.3)
         tx = max(self.min_x, min(self.max_x, tx))
         ty = max(self.min_y, min(self.max_y, ty))
 
