@@ -126,18 +126,30 @@ editing constants at the top of `kiosk_player.py`:
 
 | Setting             | Default | Description                              |
 |---------------------|---------|------------------------------------------|
-| `DEFAULT_WIDTH`     | 1920    | Display width                            |
-| `DEFAULT_HEIGHT`    | 1080    | Display height                           |
+| `DEFAULT_WIDTH`     | 0       | Display width (0 = auto-detect)          |
+| `DEFAULT_HEIGHT`    | 0       | Display height (0 = auto-detect)         |
 | `SCALE`             | 1.0     | Tile scale (must be 1.0 — see warnings) |
 | `DEFAULT_WANDER_SPEED` | 15.0 | Pan speed in pixels/sec                  |
-| `CACHE_MARGIN`      | 0       | Extra tile ring to prefetch              |
+| `CACHE_MARGIN`      | 2       | Extra tile ring to prefetch              |
 | `COVERAGE_LOG_INTERVAL` | 300 | Seconds between coverage log lines     |
 
 ### Display Resolution
 
-To match your display, edit the `KIOSK_WIDTH` and `KIOSK_HEIGHT` environment
-variables in the systemd service, or pass `--width` and `--height` to the
-player directly.
+The player **auto-detects** the native resolution of the connected display via
+pygame's `display.Info()`. No configuration is needed — the code defaults to
+`0` (auto-detect), and the launch script passes `--width 0 --height 0` to
+enable this.
+
+If auto-detection fails (e.g., no display connected at boot), it falls back to
+1920×1080.
+
+To override with a specific resolution, set the `KIOSK_WIDTH` and
+`KIOSK_HEIGHT` environment variables, or pass `--width` and `--height` directly:
+
+```bash
+# Override to 1920×1200 via environment
+KIOSK_WIDTH=1920 KIOSK_HEIGHT=1200
+```
 
 ---
 

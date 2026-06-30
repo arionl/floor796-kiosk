@@ -20,7 +20,8 @@ Controls (for maintenance/testing only):
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
-Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 display.
+Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display.
+The player auto-detects the native display resolution at startup.
 """
 
 import argparse
@@ -44,8 +45,9 @@ TILE_DIR = os.path.join(BASE_DIR, "tiles")
 TILE_META_PATH = os.path.join(BASE_DIR, "tiles_meta.json")
 STRIP_DIR = os.path.join(BASE_DIR, "strips")
 
-DEFAULT_WIDTH = 1920
-DEFAULT_HEIGHT = 1080
+# 0 means auto-detect from the connected display.
+DEFAULT_WIDTH = 0
+DEFAULT_HEIGHT = 0
 
 # Source tile dimensions (from floor796.com)
 SRC_TILE_W = 1024
@@ -526,6 +528,23 @@ class Wanderer:
             self.vy = -abs(self.vy) * 0.5
             self._pick_new_waypoint()
 
+    def heading(self):
+        """Return the instantaneous heading unit vector toward the current waypoint.
+
+        Unlike self.vx/vy (which are smoothed and lag 2-3 s behind a waypoint
+        change), this returns the raw direction the wanderer is trying to move
+        *right now*.  The render loop uses this to seed tile prefetch so that a
+        direction change at an edge immediately starts loading tiles in the new
+        direction instead of waiting for the smoothed velocity to rotate.
+        """
+        if self.current_waypoint:
+            wx, wy = self.current_waypoint
+            dx, dy = wx - self.x, wy - self.y
+            dist = math.hypot(dx, dy)
+            if dist > 0.5:
+                return (dx / dist * self.speed, dy / dist * self.speed)
+        return (self.vx, self.vy)
+
     def coverage_stats(self):
         """Return (visited, total, min_visits, max_visits, current_blank)."""
         if not self.visit_counts:
@@ -573,6 +592,25 @@ def main():
 
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
+
+    # ── Auto-detect native display resolution ──
+    # If width/height are 0 (the default), query the connected display
+    # and use its native mode.  This avoids letterboxing bands that occur
+    # when a hardcoded 16:9 virtual surface is scaled to a 16:10 panel.
+    if args.width <= 0 or args.height <= 0:
+        info = pygame.display.Info()
+        detected_w = info.current_w
+        detected_h = info.current_h
+        if detected_w > 0 and detected_h > 0:
+            args.width = detected_w
+            args.height = detected_h
+            log.info("Auto-detected display: %dx%d", args.width, args.height)
+        else:
+            args.width = 1920
+            args.height = 1080
+            log.warning("Could not detect display resolution; falling back to 1920x1080")
+
+    log.info("Display: %dx%d", args.width, args.height)
     # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
     flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
@@ -741,8 +779,8 @@ def main():
             tiles_meta=tiles_meta,
             margin=CACHE_MARGIN, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
-            vel_x=wanderer.vx if wandering else 0,
-            vel_y=wanderer.vy if wandering else 0,
+            vel_x=wanderer.heading()[0] if wandering else 0,
+            vel_y=wanderer.heading()[1] if wandering else 0,
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()

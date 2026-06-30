@@ -7,8 +7,10 @@ export SDL_VIDEODRIVER=x11
 export DISPLAY=:0
 
 INSTALL_DIR=/opt/floor796-kiosk
-WIDTH="${KIOSK_WIDTH:-1920}"
-HEIGHT="${KIOSK_HEIGHT:-1080}"
+# KIOSK_WIDTH / KIOSK_HEIGHT default to 0, which means auto-detect
+# the native resolution of the connected display via pygame.
+WIDTH="${KIOSK_WIDTH:-0}"
+HEIGHT="${KIOSK_HEIGHT:-0}"
 
 cd "${INSTALL_DIR}"
 
