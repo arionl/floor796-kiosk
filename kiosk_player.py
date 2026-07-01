@@ -72,6 +72,12 @@ ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
+# Memory budget on 4 GB Pi:
+#   Each animated strip: 96 MB (1024x49200x2 at 16-bit)
+#   Hologram: ~120 MB per scene (60 frames x 805x646 x 4 bytes)
+#   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
+MAX_TILES = 15
+
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
 ACCENT_COLOR = (0, 200, 100)
@@ -723,7 +729,7 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    cache = TileCache(STRIP_DIR)
+    cache = TileCache(STRIP_DIR, max_tiles=MAX_TILES)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
