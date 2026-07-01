@@ -745,6 +745,7 @@ def main():
         holo_cache = os.path.join(BASE_DIR, "holo_cache")
         hologram = HologramOverlay(holo_cache)
         hologram.prepare()
+        hologram.start_decoder()
     except Exception as e:
         log.warning("Hologram overlay failed: %s", e)
         hologram = None
@@ -857,12 +858,15 @@ def main():
 
         # ── Hologram overlay ──
         if hologram:
+            hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
 
         pygame.display.flip()
 
     cache.stop()
+    if hologram:
+        hologram.stop_decoder()
     pygame.quit()
     log.info("Player stopped. Total tile loads: %d", cache.load_count)
     wanderer.print_coverage()
