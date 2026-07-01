@@ -417,7 +417,16 @@ class Wanderer:
         return 1.0 - (animated_count / total_count)
 
     def _pick_new_waypoint(self):
-        """Select next destination — least-visited animated tile wins."""
+        """Select next destination via weighted-random from least-visited tiles.
+
+        Instead of always picking the absolute least-visited tile (which
+        creates a feedback loop where edge tiles that can't accumulate
+        visits are targeted forever), this uses a weighted-random selection
+        across all candidates.  Lower visit counts get higher weights, but
+        every tile has a nonzero chance of being selected.  Scores are
+        normalized to 0-1 so the recent-target penalty and blank-ratio
+        penalty are meaningful regardless of how many visits have accrued.
+        """
         if not self.animated_tiles:
             self.current_waypoint = (
                 random.uniform(self.min_x, self.max_x),
@@ -425,23 +434,42 @@ class Wanderer:
             )
             return
 
-        candidates = []
+        max_visits = max(self.visit_counts.values()) if self.visit_counts else 1
+
+        scored = []
         for rc in self.animated_tiles:
             row, col = rc
             vp_x = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
             vp_y = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
             blank = self._blank_ratio(vp_x, vp_y)
 
-            score = self.visit_counts.get(rc, 0)
+            # Normalize visit count to 0-1 so penalties are scale-invariant.
+            norm_visits = self.visit_counts.get(rc, 0) / max(1, max_visits)
+            score = norm_visits
             if rc in self.recent_targets:
-                score += 50
+                score += 0.3          # 30% penalty on normalized scale
+            # Soft blank-ratio preference — don't strongly exclude edge
+            # tiles.  The blank-ratio guard in update() already prevents
+            # the wanderer from stopping in blank areas; here we only add
+            # a mild nudge so central tiles are slightly preferred.
             if blank > self.max_blank_ratio:
-                score += (blank - self.max_blank_ratio) * 1000
-            score += random.uniform(0, 5)
-            candidates.append((score, rc))
+                score += (blank - self.max_blank_ratio) * 0.3
+            score += random.uniform(0, 0.05)  # tiny jitter to break ties
+            scored.append((score, rc))
 
-        candidates.sort()
-        target_rc = candidates[0][1]
+        # Weighted random selection: weight = 1 / (score + epsilon).
+        # Least-visited tiles get the highest weight, but every tile
+        # has a nonzero probability of being picked.
+        weights = [1.0 / (s + 0.01) for s, _ in scored]
+        total_w = sum(weights)
+        r = random.uniform(0, total_w)
+        cumulative = 0.0
+        target_rc = scored[-1][1]  # fallback
+        for (score, rc), w in zip(scored, weights):
+            cumulative += w
+            if r <= cumulative:
+                target_rc = rc
+                break
 
         row, col = target_rc
         # Target the viewport position that centers the tile on screen,
