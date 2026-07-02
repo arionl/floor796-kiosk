@@ -286,22 +286,35 @@ class TileCache:
             self._queue.extend(sorted(new_pending & visible_ids))
             self._queue.extend(sorted(new_pending & margin_ids))
 
-            # Evict tiles no longer needed
-            for tid in [t for t in self.cache if t not in needed]:
-                del self.cache[tid]
+            # Graceful eviction: don't evict old-direction tiles immediately.
+            # When the wanderer changes direction, the needed set shifts to
+            # the new direction.  Immediately evicting old-direction tiles
+            # creates a gap where neither old nor new tiles are available
+            # (new tiles take ~1s each to load serially).  Instead, only
+            # evict when we exceed max_tiles capacity — and even then,
+            # evict tiles not in the needed set first (old direction),
+            # preserving visible and margin tiles.
+            #
+            # Also cancel pending loads for tiles no longer needed
+            # (don't waste load queue slots on tiles behind us).
             self._queue = [t for t in self._queue if t in needed]
             for t in [t for t in self._results if t not in needed]:
                 del self._results[t]
 
-            # If still over capacity, evict outer-ring tiles first.
-            # visible tiles are never evicted; ring-1 margin tiles survive
-            # longer than ring-2+ tiles.
+            # Only evict if over capacity.
+            # Evict non-needed tiles first (old direction), then
+            # non-visible margin tiles, preserving visible tiles.
             if len(self.cache) > self.max_tiles:
-                # Sort: evict non-margin before margin
-                evictable = [t for t in self.cache if t not in visible_ids]
-                evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
+                # Priority 1: evict tiles not in needed set at all
+                evictable = [t for t in self.cache if t not in needed]
                 while len(self.cache) > self.max_tiles and evictable:
-                    del self.cache[evictable.pop()]
+                    del self.cache[evictable.pop(0)]
+                # Priority 2: evict non-visible margin tiles
+                if len(self.cache) > self.max_tiles:
+                    evictable = [t for t in self.cache if t not in visible_ids]
+                    evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
+                    while len(self.cache) > self.max_tiles and evictable:
+                        del self.cache[evictable.pop()]
 
     def poll_results(self):
         with self._lock:
