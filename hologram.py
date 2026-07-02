@@ -22,6 +22,8 @@ import os
 import random
 import struct
 import logging
+import threading
+import time
 from urllib.request import urlopen
 
 import pygame
@@ -311,7 +313,10 @@ class HologramOverlay:
 
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
-        self.scenes = []        # list of [pygame.Surface, ...] (60 frames each)
+        # scenes: dict of scene_idx -> [pygame.Surface, ...] (60 frames each)
+        # Only 2 scenes are held in memory at a time (current + next) to
+        # keep memory usage manageable on 4 GB Pi (each scene ~120 MB).
+        self.scenes = {}
         self.clip_mask = None   # pygame.Surface for clipping polygon
         self.current_holo = 0
         self._prev_anim_frame = -1  # detect animation frame changes
@@ -329,46 +334,186 @@ class HologramOverlay:
             ly = my - HOLO_MAP_Y
             self.clip_poly_local.append((lx, ly))
 
+        # ── Background decoder ───────────────────────────────────────
+        # Scene decoding (brotli decompress + RLE decode + surface creation)
+        # is moved off the render thread to avoid 2-6s hiccups every ~12s.
+        # The worker runs at low OS priority (nice +10) so it never starves
+        # the render loop.
+        self._decode_queue = []          # scene indices waiting to be decoded
+        self._decode_results = {}        # {scene_idx: [Surface, ...]}
+        self._decode_lock = threading.Lock()
+        self._decode_worker = None
+        self._decode_stop = False
+
     def prepare(self):
-        """Download (if needed) and decode all hologram scenes."""
+        """Download (if needed) and decode the first 2 hologram scenes.
+
+        Only the current and next scene are held in memory.  Subsequent
+        scenes are lazy-loaded during the gap phase (1s of idle time) when
+        the previous scene is no longer needed.
+        """
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
 
-            for i, holo_file in enumerate(HOLOGRAM_FILES):
-                cache_path = os.path.join(self.cache_dir, holo_file + '.decoded')
-
-                if os.path.exists(cache_path):
-                    with open(cache_path, 'rb') as f:
-                        raw = f.read()
-                    log.info(f'Hologram {i+1}/6: cached {holo_file}')
-                else:
-                    url = CDN_BASE + holo_file
-                    log.info(f'Hologram {i+1}/6: downloading {holo_file}...')
-                    raw = urlopen(url, timeout=30).read()
-                    with open(cache_path, 'wb') as f:
-                        f.write(raw)
-
-                frames = decode_f796_br(raw)
-                surfaces = []
-                for frame_data in frames:
-                    surf = pygame.image.frombuffer(
-                        frame_data, (SCENE_WIDTH, SCENE_HEIGHT), 'RGBA'
-                    ).convert_alpha()
-                    surfaces.append(surf)
-                self.scenes.append(surfaces)
-                log.info(f'  Decoded {len(frames)} frames')
+            # Pre-decode first 2 scenes (current + next)
+            for i in range(2):
+                self._load_scene(i)
 
             self._build_clip_mask()
-            # Pre-apply clip mask to all frames so normal rendering is a
+            # Pre-apply clip mask to all loaded frames so normal rendering is a
             # single blit (no per-frame surf.copy() + BLEND_RGBA_MULT).
             self._apply_clip_to_all_frames()
             self.surface_matrices = [create_surface_matrix(s) for s in SURFACES]
-            log.info(f'Hologram overlay ready: {len(self.scenes)} scenes')
+            log.info(f'Hologram overlay ready: {len(self.scenes)} scenes loaded')
             return True
 
         except Exception as e:
             log.warning(f'Hologram overlay unavailable: {e}')
             return False
+
+    def _load_scene(self, idx):
+        """Synchronously decode scene idx and store in self.scenes.
+
+        Used only for the initial prepare() of the first 2 scenes.
+        Subsequent scenes are decoded asynchronously via the background
+        worker (see _request_scene / _decode_worker_loop).
+        """
+        if idx in self.scenes:
+            return
+        frame_data = self._read_and_decode(idx)
+        if frame_data is None:
+            return
+        surfaces = self._build_surfaces(frame_data)
+        self.scenes[idx] = surfaces
+        if self.clip_mask is not None:
+            for surf in surfaces:
+                surf.blit(self.clip_mask, (0, 0),
+                          special_flags=pygame.BLEND_RGBA_MULT)
+
+    def _read_and_decode(self, idx):
+        """Download/cache .f796.br file and decode to raw RGBA frame bytes.
+
+        This is the CPU-intensive part (brotli decompress + RLE decode).
+        Thread-safe — no pygame calls.
+        Returns list of bytes objects (one per frame), or None on error.
+        """
+        holo_file = HOLOGRAM_FILES[idx]
+        cache_path = os.path.join(self.cache_dir, holo_file + '.decoded')
+
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                raw = f.read()
+            log.info(f'Hologram scene {idx+1}: cached {holo_file}')
+        else:
+            url = CDN_BASE + holo_file
+            log.info(f'Hologram scene {idx+1}: downloading {holo_file}...')
+            raw = urlopen(url, timeout=30).read()
+            with open(cache_path, 'wb') as f:
+                f.write(raw)
+
+        frames = decode_f796_br(raw)
+        log.info(f'  Decoded {len(frames)} frames (scene {idx+1})')
+        return frames
+
+    def _build_surfaces(self, frame_data):
+        """Convert raw RGBA frame bytes to pygame surfaces with alpha.
+
+        Must be called on the main thread (after pygame.init()).
+        """
+        surfaces = []
+        for frame_bytes in frame_data:
+            surf = pygame.image.frombuffer(
+                frame_bytes, (SCENE_WIDTH, SCENE_HEIGHT), 'RGBA'
+            ).convert_alpha()
+            surfaces.append(surf)
+        return surfaces
+
+    # ── Background scene decoder ─────────────────────────────────────
+
+    def start_decoder(self):
+        """Start the background decoder thread. Call after prepare()."""
+        self._decode_stop = False
+        self._decode_worker = threading.Thread(
+            target=self._decode_worker_loop, daemon=True)
+        self._decode_worker.start()
+
+    def stop_decoder(self):
+        """Signal the background decoder to stop and wait briefly."""
+        self._decode_stop = True
+        if self._decode_worker:
+            self._decode_worker.join(timeout=3)
+
+    def _decode_worker_loop(self):
+        """Background worker: decode scenes at low OS priority.
+
+        The heavy CPU work (brotli + RLE) happens here. The resulting
+        raw frame bytes are placed in _decode_results for the main thread
+        to pick up and convert to pygame surfaces (which must happen on
+        the main thread).
+        """
+        # Deprioritize so we never starve the render loop
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, 10)
+        except OSError:
+            pass
+
+        while not self._decode_stop:
+            idx = None
+            with self._decode_lock:
+                if self._decode_queue:
+                    idx = self._decode_queue.pop(0)
+
+            if idx is None:
+                time.sleep(0.05)  # idle — imported via time module in kiosk_player
+                continue
+
+            try:
+                frames = self._read_and_decode(idx)
+                if frames is not None:
+                    with self._decode_lock:
+                        self._decode_results[idx] = frames
+            except Exception as e:
+                log.warning(f'Background decode failed for scene {idx+1}: {e}')
+
+    def _request_scene(self, idx):
+        """Queue scene idx for background decoding (non-blocking)."""
+        if idx in self.scenes:
+            return  # already loaded
+        with self._decode_lock:
+            if idx in self._decode_results:
+                return  # already decoded, waiting for surface creation
+            if idx in self._decode_queue:
+                return  # already queued
+            self._decode_queue.append(idx)
+
+    def poll_scenes(self):
+        """Move decoded scenes from background results into self.scenes.
+
+        Called from the main render loop. Converts raw bytes → pygame
+        surfaces and applies clip mask. Returns True if any scene was
+        promoted.
+        """
+        if not self._decode_results:
+            # Check under lock without copying if empty (fast path)
+            return False
+
+        promoted = False
+        with self._decode_lock:
+            pending = dict(self._decode_results)
+            self._decode_results.clear()
+
+        for idx, frame_data in pending.items():
+            if idx in self.scenes:
+                continue
+            surfaces = self._build_surfaces(frame_data)
+            if self.clip_mask is not None:
+                for surf in surfaces:
+                    surf.blit(self.clip_mask, (0, 0),
+                              special_flags=pygame.BLEND_RGBA_MULT)
+            self.scenes[idx] = surfaces
+            promoted = True
+
+        return promoted
 
     def _build_clip_mask(self):
         """Create a mask surface for the clip polygon."""
@@ -377,13 +522,13 @@ class HologramOverlay:
         self.clip_mask = mask
 
     def _apply_clip_to_all_frames(self):
-        """Pre-multiply clip mask into every frame of every scene.
+        """Pre-multiply clip mask into every frame of every loaded scene.
 
         After this, normal rendering is a single blit — no per-frame
-        surf.copy() + BLEND_RGBA_MULT needed.  This trades 6×60 = 360
-        extra surface copies at startup for zero per-frame allocation.
+        surf.copy() + BLEND_RGBA_MULT needed.  This trades extra surface
+        copies at startup for zero per-frame allocation.
         """
-        for scene in self.scenes:
+        for scene in self.scenes.values():
             for i in range(len(scene)):
                 scene[i].blit(self.clip_mask, (0, 0),
                               special_flags=pygame.BLEND_RGBA_MULT)
@@ -430,10 +575,28 @@ class HologramOverlay:
     # ─── State transitions ─────────────────────────────────────────────────
 
     def _enter_gap(self):
-        """Transition to empty room gap; advance to next hologram."""
+        """Transition to empty room gap; advance to next hologram.
+
+        Evict the scene we just finished (2 cycles ago) to keep only
+        2 scenes in memory, and lazy-load the upcoming scene.
+        """
         self.state = 'gap'
         self.state_frame = 0
-        self.current_holo = (self.current_holo + 1) % len(self.scenes)
+        self.current_holo = (self.current_holo + 1) % len(HOLOGRAM_FILES)
+
+        # Evict the scene that is now 2 positions behind (no longer needed).
+        # Keep current_holo and current_holo-1 (for fade_out tail).
+        # The scene at current_holo-2 can be freed.
+        prev_prev = (self.current_holo - 2) % len(HOLOGRAM_FILES)
+        if prev_prev in self.scenes and prev_prev != self.current_holo:
+            del self.scenes[prev_prev]
+
+        # Pre-load the next scene (current_holo + 1) during the 1s gap.
+        # This is now non-blocking — the background decoder handles it.
+        # If it's not ready in time, the scene will pop in when poll_scenes()
+        # promotes it (usually within a second or two).
+        next_idx = (self.current_holo + 1) % len(HOLOGRAM_FILES)
+        self._request_scene(next_idx)
 
     def _enter_fade_in(self):
         """Begin materializing the next hologram."""
@@ -462,6 +625,10 @@ class HologramOverlay:
 
         # During gap, render nothing (empty room shows through)
         if self.state == 'gap':
+            return
+
+        # Ensure current scene is loaded
+        if self.current_holo not in self.scenes:
             return
 
         # Position on screen

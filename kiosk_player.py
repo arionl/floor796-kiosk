@@ -20,7 +20,8 @@ Controls (for maintenance/testing only):
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
-Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 display.
+Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display.
+The player auto-detects the native display resolution at startup.
 """
 
 import argparse
@@ -44,8 +45,9 @@ TILE_DIR = os.path.join(BASE_DIR, "tiles")
 TILE_META_PATH = os.path.join(BASE_DIR, "tiles_meta.json")
 STRIP_DIR = os.path.join(BASE_DIR, "strips")
 
-DEFAULT_WIDTH = 1920
-DEFAULT_HEIGHT = 1080
+# 0 means auto-detect from the connected display.
+DEFAULT_WIDTH = 0
+DEFAULT_HEIGHT = 0
 
 # Source tile dimensions (from floor796.com)
 SRC_TILE_W = 1024
@@ -69,6 +71,12 @@ DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
+
+# Memory budget on 4 GB Pi:
+#   Each animated strip: 96 MB (1024x49200x2 at 16-bit)
+#   Hologram: ~120 MB per scene (60 frames x 805x646 x 4 bytes)
+#   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
+MAX_TILES = 15
 
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
@@ -278,22 +286,35 @@ class TileCache:
             self._queue.extend(sorted(new_pending & visible_ids))
             self._queue.extend(sorted(new_pending & margin_ids))
 
-            # Evict tiles no longer needed
-            for tid in [t for t in self.cache if t not in needed]:
-                del self.cache[tid]
+            # Graceful eviction: don't evict old-direction tiles immediately.
+            # When the wanderer changes direction, the needed set shifts to
+            # the new direction.  Immediately evicting old-direction tiles
+            # creates a gap where neither old nor new tiles are available
+            # (new tiles take ~1s each to load serially).  Instead, only
+            # evict when we exceed max_tiles capacity — and even then,
+            # evict tiles not in the needed set first (old direction),
+            # preserving visible and margin tiles.
+            #
+            # Also cancel pending loads for tiles no longer needed
+            # (don't waste load queue slots on tiles behind us).
             self._queue = [t for t in self._queue if t in needed]
             for t in [t for t in self._results if t not in needed]:
                 del self._results[t]
 
-            # If still over capacity, evict outer-ring tiles first.
-            # visible tiles are never evicted; ring-1 margin tiles survive
-            # longer than ring-2+ tiles.
+            # Only evict if over capacity.
+            # Evict non-needed tiles first (old direction), then
+            # non-visible margin tiles, preserving visible tiles.
             if len(self.cache) > self.max_tiles:
-                # Sort: evict non-margin before margin
-                evictable = [t for t in self.cache if t not in visible_ids]
-                evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
+                # Priority 1: evict tiles not in needed set at all
+                evictable = [t for t in self.cache if t not in needed]
                 while len(self.cache) > self.max_tiles and evictable:
-                    del self.cache[evictable.pop()]
+                    del self.cache[evictable.pop(0)]
+                # Priority 2: evict non-visible margin tiles
+                if len(self.cache) > self.max_tiles:
+                    evictable = [t for t in self.cache if t not in visible_ids]
+                    evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
+                    while len(self.cache) > self.max_tiles and evictable:
+                        del self.cache[evictable.pop()]
 
     def poll_results(self):
         with self._lock:
@@ -415,7 +436,16 @@ class Wanderer:
         return 1.0 - (animated_count / total_count)
 
     def _pick_new_waypoint(self):
-        """Select next destination — least-visited animated tile wins."""
+        """Select next destination via weighted-random from least-visited tiles.
+
+        Instead of always picking the absolute least-visited tile (which
+        creates a feedback loop where edge tiles that can't accumulate
+        visits are targeted forever), this uses a weighted-random selection
+        across all candidates.  Lower visit counts get higher weights, but
+        every tile has a nonzero chance of being selected.  Scores are
+        normalized to 0-1 so the recent-target penalty and blank-ratio
+        penalty are meaningful regardless of how many visits have accrued.
+        """
         if not self.animated_tiles:
             self.current_waypoint = (
                 random.uniform(self.min_x, self.max_x),
@@ -423,27 +453,53 @@ class Wanderer:
             )
             return
 
-        candidates = []
+        max_visits = max(self.visit_counts.values()) if self.visit_counts else 1
+
+        scored = []
         for rc in self.animated_tiles:
             row, col = rc
             vp_x = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
             vp_y = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
             blank = self._blank_ratio(vp_x, vp_y)
 
-            score = self.visit_counts.get(rc, 0)
+            # Normalize visit count to 0-1 so penalties are scale-invariant.
+            norm_visits = self.visit_counts.get(rc, 0) / max(1, max_visits)
+            score = norm_visits
             if rc in self.recent_targets:
-                score += 50
+                score += 0.3          # 30% penalty on normalized scale
+            # Soft blank-ratio preference — don't strongly exclude edge
+            # tiles.  The blank-ratio guard in update() already prevents
+            # the wanderer from stopping in blank areas; here we only add
+            # a mild nudge so central tiles are slightly preferred.
             if blank > self.max_blank_ratio:
-                score += (blank - self.max_blank_ratio) * 1000
-            score += random.uniform(0, 5)
-            candidates.append((score, rc))
+                score += (blank - self.max_blank_ratio) * 0.3
+            score += random.uniform(0, 0.05)  # tiny jitter to break ties
+            scored.append((score, rc))
 
-        candidates.sort()
-        target_rc = candidates[0][1]
+        # Weighted random selection: weight = 1 / (score + epsilon).
+        # Least-visited tiles get the highest weight, but every tile
+        # has a nonzero probability of being picked.
+        weights = [1.0 / (s + 0.01) for s, _ in scored]
+        total_w = sum(weights)
+        r = random.uniform(0, total_w)
+        cumulative = 0.0
+        target_rc = scored[-1][1]  # fallback
+        for (score, rc), w in zip(scored, weights):
+            cumulative += w
+            if r <= cumulative:
+                target_rc = rc
+                break
 
         row, col = target_rc
-        tx = (col + 0.5) * SPACING_W + random.uniform(-TILE_W * 0.3, TILE_W * 0.3)
-        ty = (row + 0.5) * SPACING_H + random.uniform(-TILE_H * 0.3, TILE_H * 0.3)
+        # Target the viewport position that centers the tile on screen,
+        # not the tile center pixel itself.  Without this offset, every
+        # tile appears at the top-left corner of the viewport and the
+        # right/bottom half always shows the next tile over — creating
+        # a coverage bias toward bottom-left content.
+        tx = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
+        ty = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
+        tx += random.uniform(-TILE_W * 0.3, TILE_W * 0.3)
+        ty += random.uniform(-TILE_H * 0.3, TILE_H * 0.3)
         tx = max(self.min_x, min(self.max_x, tx))
         ty = max(self.min_y, min(self.max_y, ty))
 
@@ -519,6 +575,23 @@ class Wanderer:
             self.vy = -abs(self.vy) * 0.5
             self._pick_new_waypoint()
 
+    def heading(self):
+        """Return the instantaneous heading unit vector toward the current waypoint.
+
+        Unlike self.vx/vy (which are smoothed and lag 2-3 s behind a waypoint
+        change), this returns the raw direction the wanderer is trying to move
+        *right now*.  The render loop uses this to seed tile prefetch so that a
+        direction change at an edge immediately starts loading tiles in the new
+        direction instead of waiting for the smoothed velocity to rotate.
+        """
+        if self.current_waypoint:
+            wx, wy = self.current_waypoint
+            dx, dy = wx - self.x, wy - self.y
+            dist = math.hypot(dx, dy)
+            if dist > 0.5:
+                return (dx / dist * self.speed, dy / dist * self.speed)
+        return (self.vx, self.vy)
+
     def coverage_stats(self):
         """Return (visited, total, min_visits, max_visits, current_blank)."""
         if not self.visit_counts:
@@ -566,6 +639,25 @@ def main():
 
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
+
+    # ── Auto-detect native display resolution ──
+    # If width/height are 0 (the default), query the connected display
+    # and use its native mode.  This avoids letterboxing bands that occur
+    # when a hardcoded 16:9 virtual surface is scaled to a 16:10 panel.
+    if args.width <= 0 or args.height <= 0:
+        info = pygame.display.Info()
+        detected_w = info.current_w
+        detected_h = info.current_h
+        if detected_w > 0 and detected_h > 0:
+            args.width = detected_w
+            args.height = detected_h
+            log.info("Auto-detected display: %dx%d", args.width, args.height)
+        else:
+            args.width = 1920
+            args.height = 1080
+            log.warning("Could not detect display resolution; falling back to 1920x1080")
+
+    log.info("Display: %dx%d", args.width, args.height)
     # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
     flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
@@ -650,7 +742,7 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    cache = TileCache(STRIP_DIR)
+    cache = TileCache(STRIP_DIR, max_tiles=MAX_TILES)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
@@ -666,6 +758,7 @@ def main():
         holo_cache = os.path.join(BASE_DIR, "holo_cache")
         hologram = HologramOverlay(holo_cache)
         hologram.prepare()
+        hologram.start_decoder()
     except Exception as e:
         log.warning("Hologram overlay failed: %s", e)
         hologram = None
@@ -734,8 +827,8 @@ def main():
             tiles_meta=tiles_meta,
             margin=CACHE_MARGIN, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
-            vel_x=wanderer.vx if wandering else 0,
-            vel_y=wanderer.vy if wandering else 0,
+            vel_x=wanderer.heading()[0] if wandering else 0,
+            vel_y=wanderer.heading()[1] if wandering else 0,
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()
@@ -778,12 +871,15 @@ def main():
 
         # ── Hologram overlay ──
         if hologram:
+            hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
 
         pygame.display.flip()
 
     cache.stop()
+    if hologram:
+        hologram.stop_decoder()
     pygame.quit()
     log.info("Player stopped. Total tile loads: %d", cache.load_count)
     wanderer.print_coverage()
