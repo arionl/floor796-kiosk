@@ -282,28 +282,44 @@ class TileCache:
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
-            # Queue visible tiles first, then margin tiles
-            self._queue.extend(sorted(new_pending & visible_ids))
-            self._queue.extend(sorted(new_pending & margin_ids))
+            new_visible = new_pending & visible_ids
+            new_margin = new_pending & margin_ids
 
-            # Graceful eviction: don't evict old-direction tiles immediately.
-            # When the wanderer changes direction, the needed set shifts to
-            # the new direction.  Immediately evicting old-direction tiles
-            # creates a gap where neither old nor new tiles are available
-            # (new tiles take ~1s each to load serially).  Instead, only
-            # evict when we exceed max_tiles capacity — and even then,
-            # evict tiles not in the needed set first (old direction),
-            # preserving visible and margin tiles.
+            # Priority queue: new visible tiles go to the FRONT of the
+            # queue (they're on screen right now), margin tiles go to
+            # the back (they're prefetch for the near future).
             #
-            # Also cancel pending loads for tiles no longer needed
+            # When the wanderer changes direction, new tiles enter the
+            # viewport immediately.  Without this reprioritization, they'd
+            # wait behind margin tiles queued for the old direction that
+            # are no longer relevant.  By inserting visible tiles at the
+            # front, the worker picks them up on its very next iteration.
+            if new_visible:
+                self._queue = list(new_visible) + self._queue
+            if new_margin:
+                self._queue.extend(sorted(new_margin))
+
+            # Cancel pending loads for tiles no longer needed
             # (don't waste load queue slots on tiles behind us).
             self._queue = [t for t in self._queue if t in needed]
             for t in [t for t in self._results if t not in needed]:
                 del self._results[t]
 
-            # Only evict if over capacity.
-            # Evict non-needed tiles first (old direction), then
-            # non-visible margin tiles, preserving visible tiles.
+            # Reprioritize: any queued tile that is now visible gets
+            # moved to the front of the queue.  This handles direction
+            # changes where a previously-queued margin tile enters the
+            # viewport — it gets promoted ahead of other margin loads.
+            promoted = []
+            remaining = []
+            for t in self._queue:
+                if t in visible_ids:
+                    promoted.append(t)
+                else:
+                    remaining.append(t)
+            if promoted:
+                self._queue = promoted + remaining
+
+            # Graceful eviction: don't evict old-direction tiles immediately.
             if len(self.cache) > self.max_tiles:
                 # Priority 1: evict tiles not in needed set at all
                 evictable = [t for t in self.cache if t not in needed]

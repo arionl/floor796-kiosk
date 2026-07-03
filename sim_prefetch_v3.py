@@ -350,6 +350,48 @@ class SimTileCacheV3:
             while len(self.cache) > self.max_tiles and excess:
                 self.cache.discard(excess.pop(0))
 
+    def set_needed_priority(self, visible_ids, margin_ids):
+        """PROPOSED: graceful eviction + priority queue.
+
+        Visible tiles go to the front of the load queue; margin tiles
+        go to the back.  Queued tiles that become visible get promoted
+        to the front.  Models the real set_needed() with reprioritization.
+        """
+        needed = visible_ids | margin_ids
+
+        # Queue new tiles — visible to front, margin to back
+        already = self.cache | set(self._pending.keys()) | set(self._queue)
+        new_visible = (needed - already) & visible_ids
+        new_margin = (needed - already) & margin_ids
+
+        if new_visible:
+            self._queue = list(new_visible) + self._queue
+        if new_margin:
+            self._queue.extend(sorted(new_margin))
+
+        # Cancel pending loads for tiles no longer needed
+        self._queue = [t for t in self._queue if t in needed]
+        for t in list(self._pending.keys()):
+            if t not in needed and self._pending[t] < 0:
+                del self._pending[t]
+
+        # Reprioritize: queued tiles that are now visible go to front
+        promoted = []
+        remaining = []
+        for t in self._queue:
+            if t in visible_ids:
+                promoted.append(t)
+            else:
+                remaining.append(t)
+        if promoted:
+            self._queue = promoted + remaining
+
+        # Graceful eviction
+        if len(self.cache) > self.max_tiles:
+            excess = [t for t in self.cache if t not in needed]
+            while len(self.cache) > self.max_tiles and excess:
+                self.cache.discard(excess.pop(0))
+
     def tick(self):
         # Process load queue one at a time
         if self._queue:
@@ -369,8 +411,8 @@ class SimTileCacheV3:
 
 
 def run_sim(label, tiles_meta, grid, content_bounds, duration_s=600,
-            use_expanded=False, use_graceful=False, extra_margin=2,
-            load_latency=30, seed=42):
+            use_expanded=False, use_graceful=False, use_priority=False,
+            extra_margin=2, load_latency=30, seed=42):
     random.seed(seed)
     wanderer = SimWanderer(tiles_meta, content_bounds)
     cache = SimTileCacheV3(max_tiles=MAX_TILES, load_latency_steps=load_latency)
@@ -417,7 +459,9 @@ def run_sim(label, tiles_meta, grid, content_bounds, duration_s=600,
                 vel_x=hx, vel_y=hy)
 
         needed = vis | margin
-        if use_graceful:
+        if use_priority:
+            cache.set_needed_priority(vis, margin)
+        elif use_graceful:
             cache.set_needed_graceful(needed)
         else:
             cache.set_needed(needed)
@@ -470,13 +514,10 @@ def main():
         scenarios = [
             run_sim("CURRENT", tiles_meta, grid, content_bounds,
                     seed=seed, load_latency=LATENCY),
-            run_sim("EXPANDED +2", tiles_meta, grid, content_bounds,
-                    use_expanded=True, extra_margin=2, seed=seed, load_latency=LATENCY),
             run_sim("GRACEFUL EVICT", tiles_meta, grid, content_bounds,
                     use_graceful=True, seed=seed, load_latency=LATENCY),
-            run_sim("EXPANDED +2 + GRACEFUL", tiles_meta, grid, content_bounds,
-                    use_expanded=True, extra_margin=2, use_graceful=True,
-                    seed=seed, load_latency=LATENCY),
+            run_sim("PRIORITY QUEUE", tiles_meta, grid, content_bounds,
+                    use_priority=True, seed=seed, load_latency=LATENCY),
         ]
         results.append((seed, scenarios))
 
@@ -502,7 +543,7 @@ def main():
     print("\n" + "=" * 100)
     print("AGGREGATE (5 seeds x 10 min = 50 min each)")
     print("=" * 100)
-    labels = ["CURRENT", "EXPANDED +2", "GRACEFUL EVICT", "EXPANDED +2 + GRACEFUL"]
+    labels = ["CURRENT", "GRACEFUL EVICT", "PRIORITY QUEUE"]
     for idx, label in enumerate(labels):
         agg = [s[idx] for _, s in results]
         te = sum(r["total_entered"] for r in agg)
@@ -593,8 +634,8 @@ class SimTileCacheV3:
 
 
 def run_sim(label, tiles_meta, grid, content_bounds, duration_s=600,
-            use_expanded=False, use_graceful=False, extra_margin=2,
-            load_latency=30, seed=42):
+            use_expanded=False, use_graceful=False, use_priority=False,
+            extra_margin=2, load_latency=30, seed=42):
     random.seed(seed)
     wanderer = SimWanderer(tiles_meta, content_bounds)
     cache = SimTileCacheV3(max_tiles=MAX_TILES, load_latency_steps=load_latency)
@@ -639,7 +680,9 @@ def run_sim(label, tiles_meta, grid, content_bounds, duration_s=600,
                 vel_x=hx, vel_y=hy)
 
         needed = vis | margin
-        if use_graceful:
+        if use_priority:
+            cache.set_needed_priority(vis, margin)
+        elif use_graceful:
             cache.set_needed_graceful(needed)
         else:
             cache.set_needed(needed)
@@ -722,7 +765,7 @@ def main():
     print("\n" + "=" * 100)
     print("AGGREGATE (5 seeds x 10 min = 50 min each)")
     print("=" * 100)
-    labels = ["CURRENT", "EXPANDED +2", "GRACEFUL EVICT", "EXP+2+GRACEFUL"]
+    labels = ["CURRENT", "GRACEFUL EVICT", "PRIORITY QUEUE"]
     for idx, label in enumerate(labels):
         agg = [s[idx] for _, s in results]
         te = sum(r["total_entered"] for r in agg)
