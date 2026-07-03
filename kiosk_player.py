@@ -1124,7 +1124,23 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
-    log.info("Display: %dx%d", args.width, args.height)
+    # ── 4K downscale ──
+    # The Pi 5 doesn't have enough memory (4 GB) or GPU power to render
+    # full 4K in real time.  When a 4K-class display (>3000px wide) is
+    # attached, render at half resolution and let pygame's SCALED flag
+    # upscale to the physical display via the GPU.  The aspect ratio is
+    # preserved (both dimensions halved), so no letterboxing.
+    physical_w = args.width
+    physical_h = args.height
+    if args.width > 3000:
+        args.width = args.width // 2
+        args.height = args.height // 2
+        log.info("4K display detected (%dx%d) — rendering at %dx%d, "
+                 "GPU upscaling to physical resolution",
+                 physical_w, physical_h, args.width, args.height)
+
+    log.info("Display: %dx%d (render), %dx%d (physical)",
+             args.width, args.height, physical_w, physical_h)
     # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
     flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
