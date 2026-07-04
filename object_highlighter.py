@@ -26,11 +26,13 @@ from collections import deque
 
 import pygame
 
+from thumbnail_cache import ThumbnailCache, classify_link
+
 log = logging.getLogger("floor796")
 
 # ── Tunable parameters ───────────────────────────────────────────────────────
 
-HIGHLIGHT_DURATION = 5.0   # seconds an object is shown
+HIGHLIGHT_DURATION = 10.0  # seconds an object is shown
 PAUSE_DURATION = 2.0       # seconds between objects
 RECENT_MEMORY = 60         # don't repeat objects in the last N shown
 MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
@@ -60,6 +62,44 @@ PULSE_SPEED = 5.0                # Hz — oscillations per second
 PULSE_GLOW_MAX = 8               # max glow radius in pixels
 PULSE_INTENSITY_MIN = 0.35       # brightness floor (0=dim, 1=full)
 PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha
+
+# ── Thumbnail panel layout ───────────────────────────────────────────────────
+# The corner panel becomes vertical to accommodate a thumbnail image.
+# When a thumbnail is present, the panel is taller.  When no thumbnail
+# (YouTube-only links still get one via mqdefault), the panel is compact.
+
+THUMB_W = 320             # thumbnail width (matches ThumbnailCache output)
+THUMB_H = 200             # thumbnail height
+PANEL_MARGIN = 20         # gap from screen edge
+PANEL_PADDING = 16        # inner padding
+PANEL_BORDER_RADIUS = 0   # square corners (pygame default)
+
+# Panel widths
+PANEL_W = THUMB_W + PANEL_PADDING * 2  # 352px
+PANEL_W_NO_THUMB = 360                 # compact panel when no image
+
+# Panel heights
+PANEL_H_TITLE_BAR = 34   # title line + date line
+PANEL_H_THUMB = THUMB_H + 10   # image + small gap
+PANEL_H_FOOTER = 28      # link type + progress bar
+PANEL_H_WITH_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_THUMB +
+                      PANEL_H_FOOTER + PANEL_PADDING)   # ~288
+PANEL_H_NO_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_FOOTER +
+                    PANEL_PADDING * 2)                   # ~78
+
+# Link type display metadata: (label, color)
+LINK_TYPE_META = {
+    "youtube":     ("\u25b6 YouTube",       (255, 70, 70)),    # red
+    "image":       ("\u25a0 Image",         (100, 200, 100)),  # green
+    "video":       ("\u25a0 Video",         (255, 160, 60)),   # orange
+    "wiki":        ("\u25a0 Wikipedia",     (80, 160, 240)),   # blue
+    "web":         ("\u25a0 Web",           (160, 160, 160)),  # gray
+    "interactive": ("\u25a0 Interactive",   (180, 130, 220)),  # purple
+    "none":        ("",                     (100, 100, 100)),  # dim
+}
+
+# Placeholder animation for loading thumbnails
+PLACEHOLDER_PULSE_SPEED = 2.0  # Hz
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -296,10 +336,14 @@ class ObjectHighlighter:
         # Track recently shown object IDs to avoid repetition
         self._recent = deque(maxlen=RECENT_MEMORY)
 
+        # Thumbnail cache
+        self._thumbs = ThumbnailCache()
+
         # Fonts (lazily initialized when first render is called)
         self._font_title = None
         self._font_body = None
         self._font_small = None
+        self._font_link = None
         self._fonts_ready = False
 
         # Counters for stats
@@ -308,9 +352,10 @@ class ObjectHighlighter:
     def _init_fonts(self):
         if self._fonts_ready:
             return
-        self._font_title = pygame.font.Font(None, 22)
+        self._font_title = pygame.font.Font(None, 24)
         self._font_body = pygame.font.Font(None, 18)
-        self._font_small = pygame.font.Font(None, 15)
+        self._font_small = pygame.font.Font(None, 16)
+        self._font_link = pygame.font.Font(None, 15)
         self._fonts_ready = True
 
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2):
@@ -383,6 +428,8 @@ class ObjectHighlighter:
                 self._state = STATE_HIGHLIGHT
                 self._timer = 0.0
                 self.highlights_shown += 1
+                # Prefetch thumbnail for the new object
+                self._thumbs.get(seg.obj_id, seg.link)
 
         elif self._state == STATE_HIGHLIGHT:
             if self._timer >= HIGHLIGHT_DURATION:
@@ -553,21 +600,35 @@ class ObjectHighlighter:
         self._render_corner_panel(screen, seg)
 
     def _render_corner_panel(self, screen, seg):
-        """Draw the lower-right info panel."""
+        """Draw the lower-right info panel with optional thumbnail."""
 
-        # Panel dimensions
-        panel_w = min(400, self._screen_w // 3)
-        panel_h = 80
-        panel_x = self._screen_w - panel_w - 20
-        panel_y = self._screen_h - panel_h - 20
+        link_type, _ = classify_link(seg.link)
+        has_thumb = link_type not in ("none", "video", "interactive", "wiki")
+        # YouTube and image links can have thumbnails
+        if link_type not in ("youtube", "image"):
+            has_thumb = False
 
-        # Title text
+        # Try to get the thumbnail surface
+        thumb_surf = None
+        if has_thumb:
+            thumb_surf = self._thumbs.get(seg.obj_id, seg.link)
+
+        # Determine panel dimensions
+        if has_thumb:
+            panel_w = PANEL_W
+            # If thumbnail isn't loaded yet, still use full height
+            # so the panel doesn't jump when it arrives
+            panel_h = PANEL_H_WITH_THUMB
+        else:
+            panel_w = PANEL_W_NO_THUMB
+            panel_h = PANEL_H_NO_THUMB
+
+        panel_x = self._screen_w - panel_w - PANEL_MARGIN
+        panel_y = self._screen_h - panel_h - PANEL_MARGIN
+
+        # ── Title text (truncate if needed) ──
+        max_title_w = panel_w - PANEL_PADDING * 2
         title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
-        date_surf = self._font_small.render(
-            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
-
-        # Truncate long titles
-        max_title_w = panel_w - 24
         if title_surf.get_width() > max_title_w:
             truncated = seg.title
             while truncated and title_surf.get_width() > max_title_w:
@@ -575,7 +636,10 @@ class ObjectHighlighter:
                 title_surf = self._font_title.render(
                     truncated + "...", True, LABEL_TEXT)
 
-        # Draw panel background
+        date_surf = self._font_small.render(
+            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
+
+        # ── Draw panel background ──
         panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
         panel_surf.fill(CORNER_PANEL_BG)
         pygame.draw.rect(panel_surf, CORNER_PANEL_BORDER,
@@ -586,21 +650,70 @@ class ObjectHighlighter:
 
         screen.blit(panel_surf, (panel_x, panel_y))
 
-        # Text
-        tx = panel_x + 16
-        ty = panel_y + 10
+        # ── Title + date ──
+        tx = panel_x + PANEL_PADDING
+        ty = panel_y + 8
         screen.blit(title_surf, (tx, ty))
-        ty += title_surf.get_height() + 4
+        ty += title_surf.get_height() + 2
         screen.blit(date_surf, (tx, ty))
 
-        # Progress indicator
+        # ── Thumbnail ──
+        if has_thumb:
+            img_x = tx
+            img_y = panel_y + PANEL_H_TITLE_BAR + 4
+
+            if thumb_surf is not None:
+                # Draw the thumbnail
+                screen.blit(thumb_surf, (img_x, img_y))
+            else:
+                # Draw loading placeholder
+                self._render_placeholder(screen, img_x, img_y, THUMB_W, THUMB_H)
+
+        # ── Footer: link type + progress bar ──
+        footer_y = panel_y + panel_h - PANEL_H_FOOTER
+        self._render_footer(screen, seg, link_type,
+                            panel_x + PANEL_PADDING, footer_y,
+                            panel_w - PANEL_PADDING * 2)
+
+    def _render_placeholder(self, screen, x, y, w, h):
+        """Draw an animated loading placeholder for the thumbnail."""
+        # Dark background
+        ph_surf = pygame.Surface((w, h))
+        ph_surf.fill((25, 25, 35))
+        screen.blit(ph_surf, (x, y))
+
+        # Pulsing border
+        t = time.time()
+        pulse = (math.sin(t * PLACEHOLDER_PULSE_SPEED * 2 * math.pi) + 1) / 2
+        border_color = (
+            int(40 + pulse * 60),
+            int(40 + pulse * 60),
+            int(55 + pulse * 80),
+        )
+        pygame.draw.rect(screen, border_color, (x, y, w, h), 1)
+
+        # "Loading..." text
+        load_surf = self._font_small.render("Loading...", True, (80, 80, 100))
+        lx = x + (w - load_surf.get_width()) // 2
+        ly = y + (h - load_surf.get_height()) // 2
+        screen.blit(load_surf, (lx, ly))
+
+    def _render_footer(self, screen, seg, link_type, fx, fy, fw):
+        """Draw link type indicator and progress bar in the footer area."""
+        label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
+
+        # Link type indicator (left side)
+        if label:
+            type_surf = self._font_link.render(label, True, color)
+            screen.blit(type_surf, (fx, fy))
+
+        # Progress bar (right side, takes remaining width)
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
-        bar_y = panel_y + panel_h - 8
-        bar_w = panel_w - 32
-        pygame.draw.rect(screen, (40, 40, 50),
-                         (panel_x + 16, bar_y, bar_w, 3))
+        bar_h = 3
+        bar_y = fy + 16
+        pygame.draw.rect(screen, (40, 40, 50), (fx, bar_y, fw, bar_h))
         pygame.draw.rect(screen, LABEL_ACCENT,
-                         (panel_x + 16, bar_y, int(bar_w * progress), 3))
+                         (fx, bar_y, int(fw * progress), bar_h))
 
     def cycle_label_mode(self):
         """Switch between inline and corner label modes."""
