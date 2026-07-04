@@ -83,7 +83,13 @@ class ObjectSegment:
 
 
 def _parse_position_field(p_str):
-    """Parse the 'p' field: 'tileRef,x,y;tileRef,x,y;...'
+    """Parse the 'p' field: 'tileRef,Y,X;tileRef,Y,X;...'
+
+    NOTE: The floor796.com data format is tileRef,Y,X (Y first, X second),
+    confirmed by the website's JS (parsePositionCode assigns i[2] to Y
+    axis and i[3] to X axis) and by field range analysis (field 2 max=811
+    which fits tile height 820; field 3 max=1015 which fits tile width 1024).
+
     Returns list of (tile_ref, local_x, local_y).
     """
     points = []
@@ -94,8 +100,8 @@ def _parse_position_field(p_str):
         if len(fields) >= 3:
             tile_ref = fields[0]
             try:
-                x = int(fields[1])
-                y = int(fields[2])
+                y = int(fields[1])  # first number = Y
+                x = int(fields[2])  # second number = X
                 points.append((tile_ref, x, y))
             except ValueError:
                 pass
