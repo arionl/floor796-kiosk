@@ -8,7 +8,7 @@ rendering.  Zero cost when disabled (the main loop skips it entirely).
 Toggled by 'S' key or via POST /overlay on the stats HTTP server.
 Time window cycled by 'T' key or POST /overlay/window.
 
-Layout (right ~35% of screen):
+Layout (left ~35% of screen):
   ┌─────────────────────────────┐
   │ FLOOR796 KIOSK    [30min]  │
   │ uptime: 2h 15m              │
@@ -78,10 +78,11 @@ class StatsOverlay:
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
 
-        # Panel dimensions (right side of screen)
+        # Panel dimensions (left side of screen, avoids the highlighter
+        # panel which lives in the bottom-right corner)
         self.panel_w = min(420, screen_w // 3)
         self.panel_h = screen_h
-        self.panel_x = screen_w - self.panel_w
+        self.panel_x = 0
         self.panel_y = 0
 
         # Fonts (created lazily — caller must ensure pygame.font is init'd)
