@@ -329,28 +329,27 @@ def load_objects(tiles_meta, spacing_w=1016, spacing_h=812,
         date = item.get("d", "")
         link = item.get("l", "")
 
-        # Trace polygon edges and collect all points per-tile.
-        # For single-tile objects (most common), this is equivalent to
-        # the old approach.  For multi-tile objects like Godzilla, the
-        # edges between vertices in different tiles cross through the
-        # intermediate tiles, and we need to sample those edges to get
-        # accurate per-tile bounding boxes.
-        per_tile_points = _trace_polygon_per_tile(
-            abs_verts, spacing_w, spacing_h, tile_rc)
-
-        for tile_ref, (ax_min, ay_min, ax_max, ay_max) in per_tile_points.items():
-            # Skip degenerate segments (single vertex, no area).
-            # These arise when a polygon has one vertex on a tile but no
-            # edges pass through it — the vertex alone doesn't define a
-            # meaningful bounding box.
-            seg_w = ax_max - ax_min
-            seg_h = ay_max - ay_min
-            if seg_w < 2 and seg_h < 2:
-                continue
-            seg = ObjectSegment(
-                obj_id, title, date, link, tile_ref,
-                ax_min, ay_min, ax_max, ay_max)
-            segments.append(seg)
+        # Compute one bounding box for the entire object using all
+        # polygon vertices.  We no longer split into per-tile segments
+        # because that fragments multi-tile objects (e.g. Pocahontas
+        # showed only a 112x134 top strip instead of the full 162x196
+        # character).  All objects are small enough to fit in the
+        # viewport (largest is ~488x492 = 25% of 1920x1080).
+        xs = [v[1] for v in abs_verts]
+        ys = [v[2] for v in abs_verts]
+        ax_min = min(xs)
+        ay_min = min(ys)
+        ax_max = max(xs)
+        ay_max = max(ys)
+        seg_w = ax_max - ax_min
+        seg_h = ay_max - ay_min
+        if seg_w < 2 and seg_h < 2:
+            skipped += 1
+            continue
+        seg = ObjectSegment(
+            obj_id, title, date, link, "all",
+            ax_min, ay_min, ax_max, ay_max)
+        segments.append(seg)
 
     log.info("ObjectHighlighter: %d segments from %d objects (%d skipped)",
              len(segments), len(raw_data) - skipped, skipped)
