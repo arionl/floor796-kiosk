@@ -298,6 +298,28 @@ class StatsCollector:
         """Attach the ObjectHighlighter for object telemetry queries."""
         self._highlighter = highlighter
 
+    @staticmethod
+    def _window_to_seconds(window_name):
+        """Convert a heatmap window name ('30min', '1h', 'all') to seconds.
+
+        'all' returns 0, which the highlighter treats as "no cutoff"
+        (include entire history).
+        """
+        if not window_name or window_name == "all":
+            return 0
+        name = window_name.lower()
+        multipliers = {"min": 60, "h": 3600, "s": 1}
+        for suffix, mult in multipliers.items():
+            if name.endswith(suffix):
+                try:
+                    return int(name[:-len(suffix)]) * mult
+                except ValueError:
+                    pass
+        try:
+            return int(name)
+        except ValueError:
+            return 0
+
     @property
     def start_time(self):
         return self._start_time
@@ -480,6 +502,19 @@ class StatsCollector:
                 result["hl_never_viewed"] = obj_stats["never_viewed"]
                 result["hl_coverage_pct"] = round(obj_stats["coverage_pct"], 1)
 
+                # Windowed summary (scoped to the overlay's time window)
+                win_secs = self._window_to_seconds(self.overlay_window)
+                wl = hl.get_windowed_summary(win_secs)
+                result["hl_window"] = {
+                    "viewed": wl["viewed_in_window"],
+                    "total": wl["total_objects"],
+                    "total_views": wl["total_views"],
+                    "coverage_pct": round(wl["coverage_pct"], 1),
+                    "most_viewed": wl["most_viewed"],
+                    "least_viewed": wl["least_viewed"],
+                    "recent": wl["recent"],
+                }
+
             return result
 
     def get_heatmap(self, window_name="all"):
@@ -494,6 +529,12 @@ class StatsCollector:
         if self._highlighter is None:
             return None
         return self._highlighter.get_object_stats()
+
+    def get_windowed_hl_summary(self, window_seconds):
+        """Return windowed highlighter summary from the highlighter."""
+        if self._highlighter is None:
+            return None
+        return self._highlighter.get_windowed_summary(window_seconds)
 
     def get_recent_highlights(self, n=20):
         """Return N most recently highlighted objects."""

@@ -967,6 +967,74 @@ class ObjectHighlighter:
             "objects": objects,
         }
 
+    def get_windowed_summary(self, window_seconds):
+        """Return highlighter stats scoped to a time window.
+
+        Filters view histories to only counts within the window, then
+        computes:
+          - viewed_in_window: unique objects shown
+          - total_views: total highlight events
+          - coverage_pct: viewed_in_window / total_objects
+          - most_viewed: top 3 objects by view count (with titles)
+          - least_viewed: bottom 3 viewed objects
+          - recent: last 3 highlighted objects (within window)
+        """
+        now = time.time()
+        cutoff = now - window_seconds if window_seconds else 0
+
+        # Per-object view counts within window
+        window_counts = {}  # obj_id -> count
+        window_last = {}    # obj_id -> most recent timestamp in window
+        for obj_id, history in self._view_history.items():
+            in_window = [t for t in history if t >= cutoff]
+            if in_window:
+                window_counts[obj_id] = len(in_window)
+                window_last[obj_id] = max(in_window)
+
+        total = len(self._all_obj_ids)
+        viewed = len(window_counts)
+        total_views = sum(window_counts.values())
+
+        # Most/least viewed (only among objects that were viewed)
+        sorted_by_count = sorted(window_counts.items(),
+                                 key=lambda x: x[1], reverse=True)
+        most = []
+        for oid, cnt in sorted_by_count[:3]:
+            most.append({
+                "id": oid,
+                "title": self._obj_titles.get(oid, "")[:24],
+                "views": cnt,
+            })
+
+        least = []
+        for oid, cnt in reversed(sorted_by_count[-3:]):
+            least.append({
+                "id": oid,
+                "title": self._obj_titles.get(oid, "")[:24],
+                "views": cnt,
+            })
+
+        # Most recent (sorted by last shown time, newest first)
+        recent = []
+        sorted_by_time = sorted(window_last.items(),
+                                key=lambda x: x[1], reverse=True)
+        for oid, ts in sorted_by_time[:3]:
+            recent.append({
+                "id": oid,
+                "title": self._obj_titles.get(oid, "")[:24],
+                "ago": now - ts,
+            })
+
+        return {
+            "viewed_in_window": viewed,
+            "total_objects": total,
+            "total_views": total_views,
+            "coverage_pct": (viewed / total * 100) if total else 0,
+            "most_viewed": most,
+            "least_viewed": least,
+            "recent": recent,
+        }
+
     def get_recent_highlights(self, n=20):
         """Return the N most recently highlighted objects.
 

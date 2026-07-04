@@ -287,6 +287,60 @@ class StatsOverlay:
             self._draw_coverage_grid(x, y, visits, snapshot)
             y += min(grid_area_h, 150)
 
+        # Labels (highlighter windowed stats)
+        hl_window = snapshot.get("hl_window")
+        if hl_window:
+            y = self._draw_section(f"Labels{win_tag}", x, y)
+            wv = hl_window.get("viewed", 0)
+            wt = hl_window.get("total", 0)
+            wpct = hl_window.get("coverage_pct", 0)
+            tv = hl_window.get("total_views", 0)
+            self._draw_row(x, y, "Shown", f"{wv}/{wt}",
+                           f"({wpct:.0f}%)")
+            y += 18
+            self._draw_row(x, y, "Views", f"{tv}")
+            y += 18
+
+            # Most viewed
+            most = hl_window.get("most_viewed", [])
+            if most:
+                self._draw_row(x, y, "Top", "",
+                               color=TEXT_ACCENT)
+                y += 16
+                for item in most[:2]:
+                    title = item.get("title", "?")[:18]
+                    cnt = item.get("views", 0)
+                    s = self._font_data.render(
+                        f"  {title}", True, TEXT_PRIMARY)
+                    self._cached_panel.blit(s, (x, y))
+                    cnt_s = self._font_data.render(
+                        f"{cnt}x", True, TEXT_SECONDARY)
+                    self._cached_panel.blit(
+                        cnt_s, (x + self.panel_w - 36, y))
+                    y += 16
+
+            # Most recent
+            recent = hl_window.get("recent", [])
+            if recent:
+                y += 4
+                self._draw_row(x, y, "Last", "",
+                               color=TEXT_ACCENT)
+                y += 16
+                for item in recent[:2]:
+                    title = item.get("title", "?")[:18]
+                    ago = item.get("ago", 0)
+                    ago_str = self._format_uptime(ago)
+                    s = self._font_data.render(
+                        f"  {title}", True, TEXT_PRIMARY)
+                    self._cached_panel.blit(s, (x, y))
+                    ago_s = self._font_data.render(
+                        ago_str, True, TEXT_SECONDARY)
+                    self._cached_panel.blit(
+                        ago_s, (x + self.panel_w - 50, y))
+                    y += 16
+
+            y += 8
+
         # Hints
         y = self.panel_h - 22
         hint = self._font_hint.render("[S] toggle   [T] time window",
