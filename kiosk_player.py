@@ -1141,9 +1141,13 @@ def main():
                 capture_output=True, timeout=5,
             )
             time.sleep(1.0)
-            # Force pygame to re-read the display after the mode switch
+            # Force pygame to re-read the display after the mode switch.
+            # display.quit() invalidates the font module's rendering
+            # context, so we must re-init it too — otherwise status/
+            # loading text renders garbled.
             pygame.display.quit()
             pygame.display.init()
+            pygame.font.init()
             info = pygame.display.Info()
             args.width = info.current_w
             args.height = info.current_h
