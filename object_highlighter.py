@@ -22,7 +22,6 @@ import math
 import os
 import time
 import urllib.request
-from collections import deque
 
 import pygame
 
@@ -34,10 +33,19 @@ log = logging.getLogger("floor796")
 
 HIGHLIGHT_DURATION = 10.0  # seconds an object is shown
 PAUSE_DURATION = 2.0       # seconds between objects
-RECENT_MEMORY = 60         # don't repeat objects in the last N shown
 MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
 EDGE_MARGIN = 0.15         # fraction of viewport — objects within this
                            # fraction of any edge are deprioritized
+
+# Recency-weighted selection: prefer objects not recently viewed.
+# After RECENCY_HALFLIFE seconds, a previously-viewed object's penalty
+# decays by half.  Objects within RECENT_BLACKLIST seconds are never
+# re-selected (hard cooldown).  Never-viewed objects get a bonus.
+RECENCY_HALFLIFE = 600.0   # 10 minutes
+RECENT_BLACKLIST = 45.0    # hard cooldown (> HIGHLIGHT + PAUSE)
+RECENT_PENALTY = 0.90      # max score reduction for just-viewed (90%)
+NEVER_VIEWED_BONUS = 1.15  # 15% score boost for never-viewed objects
+MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
 CHANGELOG_URL = "https://floor796.com/data/changelog.json"
 CHANGELOG_CACHE = "changelog.json"  # local cache filename
@@ -419,8 +427,10 @@ class ObjectHighlighter:
         self._timer = 0.0
         self._current_seg = None
 
-        # Track recently shown object IDs to avoid repetition
-        self._recent = deque(maxlen=RECENT_MEMORY)
+        # Timestamped view history: obj_id -> [timestamps]
+        # Used for recency-weighted selection and stats reporting.
+        self._view_history = {}  # obj_id -> list of float timestamps
+        self._last_shown = {}    # obj_id -> most recent timestamp (cache)
 
         # Thumbnail cache
         self._thumbs = ThumbnailCache()
@@ -434,6 +444,13 @@ class ObjectHighlighter:
 
         # Counters for stats
         self.highlights_shown = 0
+        # Track all known object IDs (from segments) for coverage stats
+        self._all_obj_ids = set()
+        self._obj_titles = {}  # obj_id -> title (for stats)
+        for seg in segments:
+            self._all_obj_ids.add(seg.obj_id)
+            if seg.obj_id not in self._obj_titles:
+                self._obj_titles[seg.obj_id] = seg.title
 
     def _init_fonts(self):
         if self._fonts_ready:
@@ -444,17 +461,39 @@ class ObjectHighlighter:
         self._font_link = pygame.font.Font(None, 15)
         self._fonts_ready = True
 
+    def _recency_score(self, obj_id, now):
+        """Return a multiplier (0..~1.15) for how preferable this object is.
+
+        - Never viewed: NEVER_VIEWED_BONUS (1.15)
+        - Viewed recently: decaying penalty (down to ~0.1 at t=0)
+        - After RECENCY_HALFLIFE: penalty halves again each halflife
+        """
+        last = self._last_shown.get(obj_id)
+        if last is None:
+            return NEVER_VIEWED_BONUS
+        elapsed = now - last
+        # Exponential decay: penalty = RECENT_PENALTY * 0.5^(elapsed/halflife)
+        penalty = RECENT_PENALTY * (0.5 ** (elapsed / RECENCY_HALFLIFE))
+        return max(0.05, 1.0 - penalty)
+
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2):
         """Select the best segment to highlight in the current viewport.
 
-        Biases toward segments near the center of the viewport.  Objects
-        are treated equally regardless of size.  Segments near the edge
-        (within EDGE_MARGIN) are skipped to prevent scroll-off.
+        Scoring combines two factors:
+          1. Spatial: bias toward segments near the viewport center,
+             deprioritize segments near edges.
+          2. Recency: prefer objects not recently viewed. Never-viewed
+             objects get a bonus; recently-viewed objects get a penalty
+             that decays exponentially over RECENCY_HALFLIFE.
+
+        Objects within RECENT_BLACKLIST seconds are skipped entirely
+        (hard cooldown) to prevent immediate repeats.
         """
         candidates = self._index.query_viewport(vp_x1, vp_y1, vp_x2, vp_y2)
         if not candidates:
             return None
 
+        now = time.time()
         vp_cx = (vp_x1 + vp_x2) / 2
         vp_cy = (vp_y1 + vp_y2) / 2
         vp_w = vp_x2 - vp_x1
@@ -474,8 +513,9 @@ class ObjectHighlighter:
             if seg.width < MIN_BBOX_SIZE and seg.height < MIN_BBOX_SIZE:
                 continue
 
-            # Skip recently shown (by object ID, not segment)
-            if seg.obj_id in self._recent:
+            # Hard cooldown: skip if shown within RECENT_BLACKLIST seconds
+            last = self._last_shown.get(seg.obj_id)
+            if last is not None and (now - last) < RECENT_BLACKLIST:
                 continue
 
             # Skip segments that aren't within the edge-safe zone
@@ -483,11 +523,16 @@ class ObjectHighlighter:
                     seg.abs_y2 < edge_safe_y1 or seg.abs_y1 > edge_safe_y2):
                 continue
 
-            # Score purely by distance from viewport center
+            # Spatial score: 1.0 at center, 0.0 at viewport corners
             dx = (seg.cx - vp_cx) / vp_w
             dy = (seg.cy - vp_cy) / vp_h
             dist_sq = dx * dx + dy * dy
-            score = 1.0 - dist_sq
+            spatial_score = 1.0 - dist_sq
+
+            # Recency multiplier
+            recency = self._recency_score(seg.obj_id, now)
+
+            score = spatial_score * recency
 
             if score > best_score:
                 best_score = score
@@ -514,12 +559,19 @@ class ObjectHighlighter:
                 self._state = STATE_HIGHLIGHT
                 self._timer = 0.0
                 self.highlights_shown += 1
+                # Record view timestamp
+                now = time.time()
+                self._last_shown[seg.obj_id] = now
+                history = self._view_history.setdefault(seg.obj_id, [])
+                history.append(now)
+                # Cap history length for memory
+                if len(history) > MAX_HISTORY_PER_OBJ:
+                    del history[:-MAX_HISTORY_PER_OBJ]
                 # Prefetch thumbnail for the new object
                 self._thumbs.get(seg.obj_id, seg.link)
 
         elif self._state == STATE_HIGHLIGHT:
             if self._timer >= HIGHLIGHT_DURATION:
-                self._recent.append(self._current_seg.obj_id)
                 self._current_seg = None
                 self._state = STATE_PAUSE
                 self._timer = 0.0
@@ -879,3 +931,53 @@ class ObjectHighlighter:
             "hl_label_mode": self.label_mode,
             "hl_enabled": self.enabled,
         }
+
+    def get_object_stats(self):
+        """Return per-object view statistics for telemetry.
+
+        Returns a dict with:
+          - total_objects: count of all known objects
+          - viewed_objects: count of objects viewed at least once
+          - never_viewed: count of objects never viewed
+          - coverage_pct: percentage of objects viewed at least once
+          - objects: list of {id, title, views, last_shown, last_shown_ago}
+        """
+        now = time.time()
+        objects = []
+        viewed = 0
+        for obj_id in sorted(self._all_obj_ids):
+            history = self._view_history.get(obj_id, [])
+            views = len(history)
+            last = self._last_shown.get(obj_id)
+            if views > 0:
+                viewed += 1
+            objects.append({
+                "id": obj_id,
+                "title": self._obj_titles.get(obj_id, ""),
+                "views": views,
+                "last_shown": last,
+                "last_shown_ago": (now - last) if last else None,
+            })
+
+        total = len(self._all_obj_ids)
+        return {
+            "total_objects": total,
+            "viewed_objects": viewed,
+            "never_viewed": total - viewed,
+            "coverage_pct": (viewed / total * 100) if total else 0,
+            "objects": objects,
+        }
+
+    def get_recent_highlights(self, n=20):
+        """Return the N most recently highlighted objects.
+
+        Returns list of {id, views, last_shown_ago} sorted by recency.
+        """
+        now = time.time()
+        recent = sorted(self._last_shown.items(),
+                        key=lambda x: x[1], reverse=True)[:n]
+        return [{
+            "id": oid,
+            "views": len(self._view_history.get(oid, [])),
+            "last_shown_ago": now - ts,
+        } for oid, ts in recent]

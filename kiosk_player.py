@@ -1336,6 +1336,10 @@ def main():
             log.warning("Object highlighter unavailable: %s", e)
             object_highlighter = None
 
+    # Wire highlighter into stats collector for telemetry
+    if stats_collector and object_highlighter:
+        stats_collector.set_highlighter(object_highlighter)
+
     running = True
     while running:
         dt = clock.tick(30) / 1000.0

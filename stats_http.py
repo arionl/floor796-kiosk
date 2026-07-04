@@ -10,6 +10,8 @@ Endpoints:
   GET  /health                 JSON health metrics with 24h trends
   GET  /heatmap[?window=1h]    PNG image of viewport visit heatmap
   GET  /coverage[?window=30m]  JSON tile coverage grid
+  GET  /objects                JSON per-object view stats (all objects)
+  GET  /objects/recent?n=20    JSON N most recently highlighted objects
   POST /overlay                {"enabled": true} or {"enabled": false}
   PATCH/POST /overlay/window   {"window": "30min"} cycle overlay time window
 
@@ -205,6 +207,23 @@ class StatsHandler(BaseHTTPRequestHandler):
                 "blank_avg": snap.get("blank_avg", 0),
                 "visits": {str(k): v for k, v in visits.items()},
             })
+
+        elif path == "/objects":
+            # Full per-object view statistics
+            obj_stats = collector.get_object_stats()
+            if obj_stats is None:
+                self._send_json({"error": "highlighter not available"}, 503)
+            else:
+                self._send_json(obj_stats)
+
+        elif path == "/objects/recent":
+            # N most recently highlighted objects
+            try:
+                n = int(params.get("n", "20"))
+            except ValueError:
+                n = 20
+            recent = collector.get_recent_highlights(n)
+            self._send_json({"recent": recent, "count": len(recent)})
 
         elif path == "/windows":
             self._send_json({"windows": collector.get_heatmap_windows()})
