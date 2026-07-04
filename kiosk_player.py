@@ -49,6 +49,13 @@ try:
 except ImportError:
     STATS_AVAILABLE = False
 
+try:
+    from object_highlighter import (load_objects, ObjectHighlighter,
+                                    LABEL_INLINE, LABEL_CORNER)
+    HIGHLIGHTER_AVAILABLE = True
+except ImportError:
+    HIGHLIGHTER_AVAILABLE = False
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1311,6 +1318,24 @@ def main():
             log.warning("Stats system unavailable: %s", e)
             stats_collector = None
 
+    # ── Object highlighter ──
+    object_highlighter = None
+    if HIGHLIGHTER_AVAILABLE:
+        try:
+            hl_objects = load_objects(
+                tiles_meta,
+                spacing_w=SPACING_W, spacing_h=SPACING_H,
+                data_dir=BASE_DIR)
+            if hl_objects:
+                object_highlighter = ObjectHighlighter(
+                    hl_objects, args.width, args.height,
+                    spacing_w=SPACING_W, spacing_h=SPACING_H)
+                log.info("Object highlighter: %d objects loaded",
+                         len(hl_objects))
+        except Exception as e:
+            log.warning("Object highlighter unavailable: %s", e)
+            object_highlighter = None
+
     running = True
     while running:
         dt = clock.tick(30) / 1000.0
@@ -1336,6 +1361,16 @@ def main():
                 elif event.key == pygame.K_t:
                     if stats_collector:
                         stats_collector.cycle_overlay_window()
+                elif event.key == pygame.K_o:
+                    if object_highlighter:
+                        object_highlighter.enabled = \
+                            not object_highlighter.enabled
+                        log.info("Object highlighter: %s",
+                                 "ON" if object_highlighter.enabled else "OFF")
+                elif event.key == pygame.K_l:
+                    if object_highlighter:
+                        mode = object_highlighter.cycle_label_mode()
+                        log.info("Object highlighter label: %s", mode)
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
                     wandering = False
                     speed = 500
@@ -1351,6 +1386,10 @@ def main():
 
         pos_x = max(0, min(map_w - args.width, pos_x))
         pos_y = max(0, min(map_h - args.height, pos_y))
+
+        # Object highlighter state machine
+        if object_highlighter:
+            object_highlighter.update(dt, pos_x, pos_y)
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
@@ -1445,6 +1484,10 @@ def main():
             hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
+
+        # ── Object highlighter ──
+        if object_highlighter:
+            object_highlighter.render(screen, pos_x, pos_y)
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
         if stats_collector and stats_collector.overlay_enabled:
