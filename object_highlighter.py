@@ -18,6 +18,7 @@ Toggled by 'O' key.  Label mode switched by 'L' key.
 
 import json
 import logging
+import math
 import os
 import time
 import urllib.request
@@ -49,6 +50,16 @@ LABEL_TEXT = (255, 255, 255)
 LABEL_ACCENT = (255, 220, 80)
 CORNER_PANEL_BG = (15, 15, 20, 230)
 CORNER_PANEL_BORDER = (60, 60, 80)
+
+# Pulse animation for drawing attention to the highlight box.
+# For the first PULSE_DURATION seconds of each highlight, the border
+# pulses with a glow effect — expanding/halos and intensity oscillation.
+# After that it settles into a steady outline so it's not distracting.
+PULSE_DURATION = 1.8             # seconds of pulsing at start
+PULSE_SPEED = 5.0                # Hz — oscillations per second
+PULSE_GLOW_MAX = 8               # max glow radius in pixels
+PULSE_INTENSITY_MIN = 0.35       # brightness floor (0=dim, 1=full)
+PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -406,17 +417,75 @@ class ObjectHighlighter:
         else:
             self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh)
 
+    def _pulse_envelope(self):
+        """Return (intensity, glow_px) for the current timer position.
+
+        During the first PULSE_DURATION seconds the box pulses to draw
+        attention.  After that it settles to a steady outline.  intensity
+        is 0..1 (how bright the inner box is), glow_px is how far the
+        surrounding glow extends.
+        """
+        t = self._timer
+        if t >= PULSE_DURATION:
+            return 1.0, 0
+        # Envelope: starts at peak, decays linearly over PULSE_DURATION
+        env = 1.0 - (t / PULSE_DURATION)  # 1.0 → 0.0
+        # Oscillation: 0..1 sinusoidal at PULSE_SPEED Hz
+        osc = (math.sin(t * PULSE_SPEED * 2 * math.pi) + 1) / 2
+        # Combined intensity never drops below PULSE_INTENSITY_MIN
+        intensity = PULSE_INTENSITY_MIN + (1.0 - PULSE_INTENSITY_MIN) * (
+            env * osc + (1 - env))
+        glow_px = int(PULSE_GLOW_MAX * env * (0.5 + 0.5 * osc))
+        return intensity, glow_px
+
+    def _draw_pulse_glow(self, screen, sx1, sy1, sx2, sy2, intensity, glow_px):
+        """Draw expanding glow halos around the highlight box during pulse."""
+        if glow_px <= 0:
+            return
+        bw = sx2 - sx1
+        bh = sy2 - sy1
+        # Draw 2-3 concentric expanding outlines at decreasing alpha
+        for i in range(glow_px, 0, -2):
+            alpha = int(PULSE_BOX_ALPHA_MAX * intensity *
+                        (1 - i / (glow_px + 1)) ** 2)
+            if alpha < 8:
+                continue
+            pad = i
+            gw = int(bw + pad * 2)
+            gh = int(bh + pad * 2)
+            if gw <= 0 or gh <= 0:
+                continue
+            glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+            pygame.draw.rect(glow_surf, (*BOX_COLOR, alpha),
+                             (0, 0, gw, gh), 2)
+            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
+
+    def _box_color_at(self, intensity):
+        """Return BOX_COLOR scaled by intensity (toward black)."""
+        return (
+            int(BOX_COLOR[0] * intensity),
+            int(BOX_COLOR[1] * intensity),
+            int(BOX_COLOR[2] * intensity),
+        )
+
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
         """Draw bounding box with label text next to it."""
+
+        intensity, glow_px = self._pulse_envelope()
+        box_color = self._box_color_at(intensity)
+
+        # Expanding glow halos during pulse phase
+        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
 
         # Semi-transparent fill
         fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
                                     pygame.SRCALPHA)
-        fill_surf.fill(BOX_FILL)
+        fill_alpha = int(BOX_FILL[3] * intensity)
+        fill_surf.fill((*BOX_COLOR[:3], fill_alpha))
         screen.blit(fill_surf, (int(sx1), int(sy1)))
 
         # Bright outline
-        pygame.draw.rect(screen, BOX_COLOR,
+        pygame.draw.rect(screen, box_color,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          BOX_OUTLINE)
 
@@ -456,8 +525,14 @@ class ObjectHighlighter:
     def _render_corner(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
         """Draw bounding box outline + info panel in lower-right corner."""
 
+        intensity, glow_px = self._pulse_envelope()
+        box_color = self._box_color_at(intensity)
+
+        # Expanding glow halos during pulse phase
+        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
+
         # Bright outline
-        pygame.draw.rect(screen, BOX_COLOR,
+        pygame.draw.rect(screen, box_color,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          BOX_OUTLINE)
 
@@ -467,10 +542,10 @@ class ObjectHighlighter:
             (sx1, sy1, 1, 1), (sx2, sy1, -1, 1),
             (sx1, sy2, 1, -1), (sx2, sy2, -1, -1)
         ]:
-            pygame.draw.line(screen, BOX_COLOR,
+            pygame.draw.line(screen, box_color,
                              (int(cx), int(cy)),
                              (int(cx + dx * cl), int(cy)), BOX_OUTLINE)
-            pygame.draw.line(screen, BOX_COLOR,
+            pygame.draw.line(screen, box_color,
                              (int(cx), int(cy)),
                              (int(cx), int(cy + dy * cl)), BOX_OUTLINE)
 
@@ -482,7 +557,7 @@ class ObjectHighlighter:
 
         # Panel dimensions
         panel_w = min(400, self._screen_w // 3)
-        panel_h = 100
+        panel_h = 80
         panel_x = self._screen_w - panel_w - 20
         panel_y = self._screen_h - panel_h - 20
 
@@ -490,8 +565,6 @@ class ObjectHighlighter:
         title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
-        tile_surf = self._font_small.render(
-            f"Tile: {seg.tile_ref}", True, LABEL_ACCENT)
 
         # Truncate long titles
         max_title_w = panel_w - 24
@@ -519,8 +592,6 @@ class ObjectHighlighter:
         screen.blit(title_surf, (tx, ty))
         ty += title_surf.get_height() + 4
         screen.blit(date_surf, (tx, ty))
-        ty += date_surf.get_height() + 2
-        screen.blit(tile_surf, (tx, ty))
 
         # Progress indicator
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
