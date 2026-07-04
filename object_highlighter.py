@@ -159,6 +159,76 @@ def _parse_position_field(p_str):
     return points
 
 
+def _trace_polygon_per_tile(abs_verts, spacing_w, spacing_h, tile_rc):
+    """Trace a polygon's edges and collect per-tile bounding boxes.
+
+    abs_verts is a list of (tile_ref, abs_x, abs_y) tuples in polygon
+    order.  The polygon is traced by connecting consecutive vertices
+    (and the last back to the first), sampling points along each edge.
+
+    This correctly handles objects that span multiple tiles where edges
+    between vertices in different tiles pass through intermediate tile
+    areas — without tracing, those areas would be missing from the
+    per-tile bounding boxes.
+
+    tile_rc is the full {tile_ref: (row, col)} lookup from tiles_meta,
+    used to assign sampled edge points to the correct tile.
+
+    Returns: { tile_ref: (ax_min, ay_min, ax_max, ay_max) }
+    """
+    # Build (row, col) -> tile_ref lookup from tiles_meta
+    rc_to_tile = {}
+    for tile_ref, (row, col) in tile_rc.items():
+        rc_to_tile[(row, col)] = tile_ref
+
+    per_tile_points = {}  # tile_ref -> [(ax, ay), ...]
+
+    def add_point(ax, ay):
+        r = int(ay // spacing_h)
+        c = int(ax // spacing_w)
+        tile_ref = rc_to_tile.get((r, c))
+        if tile_ref is None:
+            return  # tile not in our grid
+        per_tile_points.setdefault(tile_ref, []).append((ax, ay))
+
+    # Add vertex points themselves
+    for tile_ref, ax, ay in abs_verts:
+        add_point(ax, ay)
+
+    # Trace edges between consecutive vertices
+    n = len(abs_verts)
+    if n >= 2:
+        for i in range(n):
+            _, x1, y1 = abs_verts[i]
+            _, x2, y2 = abs_verts[(i + 1) % n]
+
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.sqrt(dx * dx + dy * dy)
+
+            if length < 1:
+                continue
+
+            # Sample step: small enough to catch tiles edges pass through
+            step = min(spacing_w, spacing_h) / 4  # ~250px
+            n_samples = max(2, int(length / step))
+
+            for t in range(1, n_samples):  # skip endpoints (already added)
+                frac = t / n_samples
+                px = x1 + frac * dx
+                py = y1 + frac * dy
+                add_point(px, py)
+
+    # Compute bounding box per tile
+    result = {}
+    for tile_ref, pts in per_tile_points.items():
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        result[tile_ref] = (min(xs), min(ys), max(xs), max(ys))
+
+    return result
+
+
 def load_objects(tiles_meta, spacing_w=1016, spacing_h=812,
                  cache_path=None, data_dir="."):
     """Load and index all highlightable objects from changelog.json.
@@ -231,31 +301,39 @@ def load_objects(tiles_meta, spacing_w=1016, spacing_h=812,
             skipped += 1
             continue
 
-        # Group points by tile_ref
-        per_tile = {}
+        # Convert all vertices to absolute coordinates, keeping only
+        # those whose tile_ref is in our grid.
+        abs_verts = []
         for tile_ref, lx, ly in points:
             rc = tile_rc.get(tile_ref)
             if rc is None:
-                continue  # tile not in our grid
-            per_tile.setdefault(tile_ref, []).append((lx, ly, rc))
+                continue
+            row, col = rc
+            abs_verts.append((tile_ref, col * spacing_w + lx,
+                              row * spacing_h + ly))
 
-        if not per_tile:
+        if not abs_verts:
             skipped += 1
             continue
 
-        # Create one segment per tile
         obj_id = item["id"]
         title = item.get("t", "")
         date = item.get("d", "")
         link = item.get("l", "")
 
-        for tile_ref, pts in per_tile.items():
-            row, col = pts[0][2]  # (row, col) from first point
-            abs_xs = [col * spacing_w + p[0] for p in pts]
-            abs_ys = [row * spacing_h + p[1] for p in pts]
+        # Trace polygon edges and collect all points per-tile.
+        # For single-tile objects (most common), this is equivalent to
+        # the old approach.  For multi-tile objects like Godzilla, the
+        # edges between vertices in different tiles cross through the
+        # intermediate tiles, and we need to sample those edges to get
+        # accurate per-tile bounding boxes.
+        per_tile_points = _trace_polygon_per_tile(
+            abs_verts, spacing_w, spacing_h, tile_rc)
+
+        for tile_ref, (ax_min, ay_min, ax_max, ay_max) in per_tile_points.items():
             seg = ObjectSegment(
                 obj_id, title, date, link, tile_ref,
-                min(abs_xs), min(abs_ys), max(abs_xs), max(abs_ys))
+                ax_min, ay_min, ax_max, ay_max)
             segments.append(seg)
 
     log.info("ObjectHighlighter: %d segments from %d objects (%d skipped)",
