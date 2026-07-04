@@ -755,8 +755,10 @@ class ObjectHighlighter:
         title_total_h = sum(s.get_height() for s in title_surfaces)
 
         # Determine panel dimensions
-        # Title bar height adapts to whether title is 1 or 2 lines
-        title_bar_h = max(PANEL_H_TITLE_BAR, title_total_h + 14)
+        # Title bar includes title lines + date line + padding.
+        # Must be tall enough that the date doesn't get covered by the thumbnail.
+        date_h = self._font_small.get_height()
+        title_bar_h = title_total_h + date_h + 16  # title + date + margins
 
         if has_thumb:
             panel_w = PANEL_W
