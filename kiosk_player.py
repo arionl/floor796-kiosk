@@ -40,6 +40,15 @@ from collections import deque
 import numpy as np
 import pygame
 
+# Stats telemetry (optional — degrades gracefully if unavailable)
+try:
+    from stats_collector import StatsCollector
+    from stats_http import start_stats_server
+    from stats_overlay import StatsOverlay
+    STATS_AVAILABLE = True
+except ImportError:
+    STATS_AVAILABLE = False
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1286,6 +1295,22 @@ def main():
     log.info("Animation: %d fps, %d-frame loop (%.1fs).",
              args.fps, TILE_FRAMES, TILE_FRAMES / args.fps)
 
+    # ── Stats telemetry ──
+    stats_collector = None
+    stats_server = None
+    stats_overlay = None
+    if STATS_AVAILABLE:
+        try:
+            stats_collector = StatsCollector(
+                sorted(wanderer.animated_tiles), map_w, map_h)
+            stats_server = start_stats_server(stats_collector)
+            stats_overlay = StatsOverlay(
+                args.width, args.height, grid_rows, grid_cols)
+            log.info("Stats server: http://127.0.0.1:8796/stats")
+        except Exception as e:
+            log.warning("Stats system unavailable: %s", e)
+            stats_collector = None
+
     running = True
     while running:
         dt = clock.tick(30) / 1000.0
@@ -1304,6 +1329,13 @@ def main():
                         wanderer.y = pos_y
                 elif event.key == pygame.K_v:
                     wanderer.print_coverage()
+                elif event.key == pygame.K_s:
+                    if stats_collector:
+                        stats_collector.set_overlay(
+                            not stats_collector.overlay_enabled)
+                elif event.key == pygame.K_t:
+                    if stats_collector:
+                        stats_collector.cycle_overlay_window()
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
                     wandering = False
                     speed = 500
@@ -1352,6 +1384,38 @@ def main():
                      wanderer.waypoints_picked)
             last_coverage_log = now
 
+        # ── Stats collection (once per frame) ──
+        if stats_collector:
+            heading = wanderer.heading() if wandering else (0, 0)
+            visited, total_t, mn, mx, blank = wanderer.coverage_stats()
+            holo_scene = 0
+            if hologram:
+                holo_scene = getattr(hologram, "_scene_idx", 0)
+            stats_collector.update({
+                "x": pos_x, "y": pos_y,
+                "vx": heading[0], "vy": heading[1],
+                "fps": clock.get_fps(),
+                "cache_loaded": len(cache.cache),
+                "cache_max": cache.max_tiles,
+                "cache_pending": cache.pending_count,
+                "cache_total_loads": cache.load_count,
+                "tiles_visited": visited,
+                "tiles_total": total_t,
+                "tiles_fully_viewed": len(wanderer.fully_viewed),
+                "visit_counts": dict(wanderer.visit_counts),
+                "blank_ratio": blank,
+                "current_target": wanderer.target_rc,
+                "waypoints_picked": wanderer.waypoints_picked,
+                "frame_idx": frame_idx,
+                "anim_fps": args.fps,
+                "holo_scene": holo_scene,
+                "render_w": args.width,
+                "render_h": args.height,
+                "physical_w": physical_w,
+                "physical_h": physical_h,
+                "scale_mode": "native" if physical_w == args.width else "4k-xrandr",
+            })
+
         # ── Render ──
         screen.fill(BG_COLOR)
 
@@ -1382,11 +1446,18 @@ def main():
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
 
+        # ── Stats overlay (alpha-blended, zero cost when off) ──
+        if stats_collector and stats_collector.overlay_enabled:
+            snap = stats_collector.snapshot()
+            stats_overlay.render(screen, snap)
+
         pygame.display.flip()
 
     cache.stop()
     if hologram:
         hologram.stop_decoder()
+    if stats_server:
+        stats_server.shutdown()
     pygame.quit()
     log.info("Player stopped. Total tile loads: %d", cache.load_count)
     wanderer.print_coverage()
