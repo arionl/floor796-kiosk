@@ -331,6 +331,14 @@ def load_objects(tiles_meta, spacing_w=1016, spacing_h=812,
             abs_verts, spacing_w, spacing_h, tile_rc)
 
         for tile_ref, (ax_min, ay_min, ax_max, ay_max) in per_tile_points.items():
+            # Skip degenerate segments (single vertex, no area).
+            # These arise when a polygon has one vertex on a tile but no
+            # edges pass through it — the vertex alone doesn't define a
+            # meaningful bounding box.
+            seg_w = ax_max - ax_min
+            seg_h = ay_max - ay_min
+            if seg_w < 2 and seg_h < 2:
+                continue
             seg = ObjectSegment(
                 obj_id, title, date, link, tile_ref,
                 ax_min, ay_min, ax_max, ay_max)
