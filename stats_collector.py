@@ -470,6 +470,9 @@ class StatsCollector:
             self.overlay_enabled = enabled
             if window:
                 self.overlay_window = window
+            elif enabled and self.overlay_window == "all":
+                # Default to 30m when first toggling on
+                self.overlay_window = "30m"
 
     def cycle_overlay_window(self):
         with self._lock:

@@ -63,7 +63,14 @@ BLANK_BAD = (255, 80, 80)
 
 
 class StatsOverlay:
-    """Alpha-blended stats overlay rendered on the pygame screen."""
+    """Alpha-blended stats overlay rendered on the pygame screen.
+
+    Performance: the panel is rebuilt at most every 500ms (2 Hz) and the
+    cached surface is blitted in between, so the per-frame cost when the
+    overlay is on is a single blit rather than dozens of font.render() calls.
+    """
+
+    REBUILD_INTERVAL = 0.5  # seconds between full panel rebuilds
 
     def __init__(self, screen_w, screen_h, grid_rows, grid_cols):
         self.screen_w = screen_w
@@ -84,9 +91,10 @@ class StatsOverlay:
         self._font_grid = pygame.font.Font(None, 14)
         self._font_hint = pygame.font.Font(None, 15)
 
-        # Pre-create the panel surface (alpha)
-        self._panel_surf = pygame.Surface((self.panel_w, self.panel_h),
-                                           pygame.SRCALPHA)
+        # Throttle: cache the rendered panel and only rebuild periodically.
+        self._cached_panel = None       # pygame.Surface or None
+        self._last_rebuild = 0.0        # monotonic timestamp
+        self._last_window = None        # detect window change to force rebuild
 
         # Cache for grid rendering
         self._grid_tile_w = 0
@@ -100,30 +108,30 @@ class StatsOverlay:
         return BLANK_BAD
 
     def _heading_arrow(self, vx, vy):
-        """Simple arrow representation for wanderer heading."""
+        """Simple ASCII arrow representation for wanderer heading."""
         speed = (vx ** 2 + vy ** 2) ** 0.5
         if speed < 0.5:
-            return "·"
+            return "*"
         import math
         angle = math.atan2(vy, vx)
-        # 8-direction arrows
+        # 8-direction arrows (ASCII-safe)
         deg = math.degrees(angle)
         if -22.5 <= deg < 22.5:
-            return "→"
+            return "->"
         elif 22.5 <= deg < 67.5:
-            return "↘"
+            return "v"
         elif 67.5 <= deg < 112.5:
-            return "↓"
+            return "v"
         elif 112.5 <= deg < 157.5:
-            return "↙"
+            return "<-"
         elif deg >= 157.5 or deg < -157.5:
-            return "←"
+            return "<-"
         elif -157.5 <= deg < -112.5:
-            return "↖"
+            return "<-"
         elif -112.5 <= deg < -67.5:
-            return "↑"
+            return "^"
         else:
-            return "↗"
+            return "^"
 
     def _format_uptime(self, seconds):
         if seconds < 60:
@@ -136,7 +144,7 @@ class StatsOverlay:
 
     def _format_mb(self, mb):
         if mb is None:
-            return "—"
+            return "n/a"
         if mb >= 1024:
             return f"{mb/1024:.1f} GB"
         return f"{mb:.0f} MB"
@@ -144,37 +152,59 @@ class StatsOverlay:
     def render(self, screen, snapshot):
         """Render the overlay onto the screen surface.
 
+        The panel content is rebuilt at most every REBUILD_INTERVAL seconds;
+        in between, the cached panel is blitted directly (cheap).
+
         Args:
           screen: the main pygame Surface (will be blitted onto)
           snapshot: dict from StatsCollector.snapshot()
         """
-        self._panel_surf.fill((0, 0, 0, 0))
+        now = time.monotonic()
+        cur_window = snapshot.get("overlay_window", "all")
+
+        # Force a rebuild if the window changed (so 'T' is responsive)
+        force = cur_window != self._last_window
+
+        if force or self._cached_panel is None or \
+           (now - self._last_rebuild) >= self.REBUILD_INTERVAL:
+            self._build_panel(snapshot)
+            self._last_rebuild = now
+            self._last_window = cur_window
+
+        screen.blit(self._cached_panel, (self.panel_x, self.panel_y))
+
+    def _build_panel(self, snapshot):
+        """Rebuild the full panel content onto self._cached_panel."""
+        if self._cached_panel is None:
+            self._cached_panel = pygame.Surface(
+                (self.panel_w, self.panel_h), pygame.SRCALPHA)
+        self._cached_panel.fill((0, 0, 0, 0))
 
         # Draw panel background
-        pygame.draw.rect(self._panel_surf, PANEL_BG,
+        pygame.draw.rect(self._cached_panel, PANEL_BG,
                          (0, 0, self.panel_w, self.panel_h))
-        pygame.draw.rect(self._panel_surf, PANEL_BORDER,
+        pygame.draw.rect(self._cached_panel, PANEL_BORDER,
                          (0, 0, self.panel_w, self.panel_h), 1)
 
         y = 12
         x = 14
 
-        # ── Title ──
+        # Title
         title = self._font_title.render("FLOOR796 KIOSK", True, TEXT_PRIMARY)
-        self._panel_surf.blit(title, (x, y))
+        self._cached_panel.blit(title, (x, y))
         y += title.get_height() + 2
 
         window_label = snapshot.get("overlay_window", "all")
         win_surf = self._font_hint.render(f"[{window_label}]", True, TEXT_ACCENT)
-        self._panel_surf.blit(win_surf, (x, y))
+        self._cached_panel.blit(win_surf, (x, y))
         y += win_surf.get_height() + 4
 
         uptime = self._format_uptime(snapshot.get("uptime", 0))
         up_surf = self._font_data.render(f"uptime: {uptime}", True, TEXT_SECONDARY)
-        self._panel_surf.blit(up_surf, (x, y))
+        self._cached_panel.blit(up_surf, (x, y))
         y += up_surf.get_height() + 8
 
-        # ── Performance ──
+        # Performance
         y = self._draw_section("Performance", x, y)
         fps = snapshot.get("fps", 0)
         fps_avg = snapshot.get("fps_avg") or fps
@@ -199,10 +229,10 @@ class StatsOverlay:
             cpu_color = TEXT_WARN if cpu > 200 else TEXT_PRIMARY
             self._draw_row(x, y, "CPU", f"{cpu:.0f}%", color=cpu_color)
         else:
-            self._draw_row(x, y, "CPU", "—")
+            self._draw_row(x, y, "CPU", "n/a")
         y += 18 + 8
 
-        # ── Tile Cache ──
+        # Tile Cache
         y = self._draw_section("Tile Cache", x, y)
         loaded = snapshot.get("cache_loaded", 0)
         max_c = snapshot.get("cache_max", 0)
@@ -215,7 +245,7 @@ class StatsOverlay:
         self._draw_row(x, y, "Loads", f"{total_loads}")
         y += 18 + 8
 
-        # ── Wanderer ──
+        # Wanderer
         y = self._draw_section("Wanderer", x, y)
         px = snapshot.get("pos_x", 0)
         py = snapshot.get("pos_y", 0)
@@ -229,7 +259,7 @@ class StatsOverlay:
         y += 18
 
         target = snapshot.get("current_target")
-        target_str = f"({target[0]},{target[1]})" if target else "—"
+        target_str = f"({target[0]},{target[1]})" if target else "n/a"
         self._draw_row(x, y, "Target", target_str)
         y += 18
 
@@ -237,7 +267,7 @@ class StatsOverlay:
         self._draw_row(x, y, "Waypoint", f"#{wpt}")
         y += 18 + 8
 
-        # ── Coverage ──
+        # Coverage
         win_tag = f" [{window_label}]"
         y = self._draw_section(f"Coverage{win_tag}", x, y)
         visited = snapshot.get("tiles_visited", 0)
@@ -255,39 +285,35 @@ class StatsOverlay:
         grid_area_h = self.panel_h - y - 30
         if grid_area_h > 40 and total > 0:
             self._draw_coverage_grid(x, y, visits)
-            # grid takes up a fixed area
             y += min(grid_area_h, 150)
 
-        # ── Hints ──
+        # Hints
         y = self.panel_h - 22
         hint = self._font_hint.render("[S] toggle   [T] time window",
                                        True, TEXT_SECONDARY)
-        self._panel_surf.blit(hint, (x, y))
-
-        # Blit the panel onto the screen
-        screen.blit(self._panel_surf, (self.panel_x, self.panel_y))
+        self._cached_panel.blit(hint, (x, y))
 
     def _draw_section(self, label, x, y):
-        hdr = self._font_section.render(f"── {label} ──", True, SECTION_HEADER)
-        self._panel_surf.blit(hdr, (x, y))
+        hdr = self._font_section.render(f"== {label} ==", True, SECTION_HEADER)
+        self._cached_panel.blit(hdr, (x, y))
         return y + hdr.get_height() + 3
 
     def _draw_row(self, x, y, label, value, detail="", color=None):
         lbl = self._font_data.render(f"{label}:", True, TEXT_SECONDARY)
-        self._panel_surf.blit(lbl, (x, y))
+        self._cached_panel.blit(lbl, (x, y))
 
         val_color = color or TEXT_PRIMARY
         val = self._font_data.render(value, True, val_color)
-        self._panel_surf.blit(val, (x + 65, y))
+        self._cached_panel.blit(val, (x + 65, y))
 
         if detail:
             det = self._font_data.render(detail, True, TEXT_SECONDARY)
-            self._panel_surf.blit(det, (x + 65 + val.get_width() + 10, y))
+            self._cached_panel.blit(det, (x + 65 + val.get_width() + 10, y))
 
     def _draw_coverage_grid(self, x, y, visits):
-        """Draw a mini ASCII-style coverage grid.
+        """Draw a mini coverage grid.
 
-        visits: dict of "r,c" → visit count
+        visits: dict of "r,c" -> visit count
         """
         # Parse visits
         visit_map = {}
@@ -315,8 +341,8 @@ class StatsOverlay:
                     intensity = min(1.0, count / 10.0)
                     green = int(100 + 155 * intensity)
                     color = (0, green, 50)
-                    pygame.draw.rect(self._panel_surf, color,
+                    pygame.draw.rect(self._cached_panel, color,
                                      (cx, cy, cell_w - 1, cell_h - 1))
                 else:
-                    pygame.draw.rect(self._panel_surf, (30, 30, 40),
+                    pygame.draw.rect(self._cached_panel, (30, 30, 40),
                                      (cx, cy, cell_w - 1, cell_h - 1))
