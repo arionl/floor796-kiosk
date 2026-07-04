@@ -25,6 +25,7 @@ The player auto-detects the native display resolution at startup.
 """
 
 import argparse
+import heapq
 import json
 import logging
 import math
@@ -36,6 +37,7 @@ import threading
 import time
 from collections import deque
 
+import numpy as np
 import pygame
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -43,6 +45,10 @@ import pygame
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TILE_DIR = os.path.join(BASE_DIR, "tiles")
 TILE_META_PATH = os.path.join(BASE_DIR, "tiles_meta.json")
+CONTENT_MASK_PATH = os.path.join(BASE_DIR, "content_mask.npz")
+# Resolution of the per-tile content-density mask (must match build_content_mask.py)
+MASK_COLS = 32
+MASK_ROWS = 26
 STRIP_DIR = os.path.join(BASE_DIR, "strips")
 
 # 0 means auto-detect from the connected display.
@@ -282,28 +288,44 @@ class TileCache:
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
-            # Queue visible tiles first, then margin tiles
-            self._queue.extend(sorted(new_pending & visible_ids))
-            self._queue.extend(sorted(new_pending & margin_ids))
+            new_visible = new_pending & visible_ids
+            new_margin = new_pending & margin_ids
 
-            # Graceful eviction: don't evict old-direction tiles immediately.
-            # When the wanderer changes direction, the needed set shifts to
-            # the new direction.  Immediately evicting old-direction tiles
-            # creates a gap where neither old nor new tiles are available
-            # (new tiles take ~1s each to load serially).  Instead, only
-            # evict when we exceed max_tiles capacity — and even then,
-            # evict tiles not in the needed set first (old direction),
-            # preserving visible and margin tiles.
+            # Priority queue: new visible tiles go to the FRONT of the
+            # queue (they're on screen right now), margin tiles go to
+            # the back (they're prefetch for the near future).
             #
-            # Also cancel pending loads for tiles no longer needed
+            # When the wanderer changes direction, new tiles enter the
+            # viewport immediately.  Without this reprioritization, they'd
+            # wait behind margin tiles queued for the old direction that
+            # are no longer relevant.  By inserting visible tiles at the
+            # front, the worker picks them up on its very next iteration.
+            if new_visible:
+                self._queue = list(new_visible) + self._queue
+            if new_margin:
+                self._queue.extend(sorted(new_margin))
+
+            # Cancel pending loads for tiles no longer needed
             # (don't waste load queue slots on tiles behind us).
             self._queue = [t for t in self._queue if t in needed]
             for t in [t for t in self._results if t not in needed]:
                 del self._results[t]
 
-            # Only evict if over capacity.
-            # Evict non-needed tiles first (old direction), then
-            # non-visible margin tiles, preserving visible tiles.
+            # Reprioritize: any queued tile that is now visible gets
+            # moved to the front of the queue.  This handles direction
+            # changes where a previously-queued margin tile enters the
+            # viewport — it gets promoted ahead of other margin loads.
+            promoted = []
+            remaining = []
+            for t in self._queue:
+                if t in visible_ids:
+                    promoted.append(t)
+                else:
+                    remaining.append(t)
+            if promoted:
+                self._queue = promoted + remaining
+
+            # Graceful eviction: don't evict old-direction tiles immediately.
             if len(self.cache) > self.max_tiles:
                 # Priority 1: evict tiles not in needed set at all
                 evictable = [t for t in self.cache if t not in needed]
@@ -358,13 +380,181 @@ class TileCache:
 
 # ─── Coverage-Weighted Wander Navigation ─────────────────────────────────────
 
-class Wanderer:
-    """Coverage-weighted waypoint navigator with blank-ratio guard.
+# Resolution of the viewport-position grid for safe-region precomputation.
+# 100px steps → manageable grid size for A* pathfinding.
+NAV_GRID_RES = 100
+# Maximum blank ratio allowed during transit between tiles.
+NAV_TRANSIT_BLANK = 0.30
+# Minimum content density (actual pixel-art fraction) for a viewport position.
+# Below this, the position is considered "too sparse" for transit.
+NAV_MIN_CONTENT = 0.40
 
-    Picks destination tiles based on a visit heat map — least-visited
-    animated tiles get priority, with a random factor for organic variation.
-    A blank-ratio penalty ensures the viewport stays on animated content
-    and never drifts into static / empty areas.
+
+def _blank_ratio_px(x, y, view_w, view_h, grid_rows, grid_cols,
+                     content_mask, content_density=None):
+    """Pixel-accurate fraction of viewport area that is visually blank.
+
+    If content_density is provided (dict of (r, c) -> 2-D float array),
+    the blank fraction for animated tiles accounts for the actual
+    pixel-art content (isometric diamonds are ~34% filled, not 100%).
+    Otherwise falls back to binary animated/blank.
+    """
+    total_area = 0.0
+    blank_area = 0.0
+    vp_right = x + view_w
+    vp_bottom = y + view_h
+    col_start = max(0, int(x // SPACING_W))
+    col_end = min(grid_cols, int(vp_right // SPACING_W) + 1)
+    row_start = max(0, int(y // SPACING_H))
+    row_end = min(grid_rows, int(vp_bottom // SPACING_H) + 1)
+    for r in range(row_start, row_end):
+        tile_top = r * SPACING_H
+        tile_bottom = tile_top + TILE_H
+        ov_top = max(tile_top, y)
+        ov_bottom = min(tile_bottom, vp_bottom)
+        if ov_bottom <= ov_top:
+            continue
+        h = ov_bottom - ov_top
+        for c in range(col_start, col_end):
+            tile_left = c * SPACING_W
+            tile_right = tile_left + TILE_W
+            ov_left = max(tile_left, x)
+            ov_right = min(tile_right, vp_right)
+            if ov_right <= ov_left:
+                continue
+            area = (ov_right - ov_left) * h
+            total_area += area
+            if content_density and (r, c) in content_density:
+                # Pixel-level density: sum content fraction across the
+                # overlapping sub-blocks of this tile's density mask.
+                dmask = content_density[(r, c)]
+                # Tile-local overlap rectangle
+                lx0 = ov_left - tile_left
+                ly0 = ov_top - tile_top
+                lx1 = ov_right - tile_left
+                ly1 = ov_bottom - tile_top
+                # Convert to mask cell indices
+                cx0 = max(0, int(lx0 / TILE_W * MASK_COLS))
+                cx1 = min(MASK_COLS, int(lx1 / TILE_W * MASK_COLS) + 1)
+                cy0 = max(0, int(ly0 / TILE_H * MASK_ROWS))
+                cy1 = min(MASK_ROWS, int(ly1 / TILE_H * MASK_ROWS) + 1)
+                region = dmask[cy0:cy1, cx0:cx1]
+                if region.size > 0:
+                    fill = float(np.mean(region))
+                else:
+                    fill = 0.0
+                blank_area += area * (1.0 - fill)
+            elif not content_mask.get((r, c), False):
+                blank_area += area
+    return blank_area / total_area if total_area > 0 else 1.0
+
+
+def _bfs_safe_region(safe_grid, sx, sy, gx_max, gy_max):
+    """BFS to find all cells connected to (sx, sy) in the safe grid."""
+    visited = {(sx, sy)}
+    queue = deque([(sx, sy)])
+    while queue:
+        cx, cy = queue.popleft()
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < gx_max and 0 <= ny < gy_max and (nx, ny) not in visited:
+                if safe_grid[ny, nx]:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+    return visited
+
+
+def _astar_path(safe_cells, blank_grid, start_px, goal_px,
+                grid_res, gx_max, gy_max):
+    """A* through the safe grid from start to goal (pixel coords)."""
+    sx = max(0, min(gx_max - 1, int(start_px[0] / grid_res)))
+    sy = max(0, min(gy_max - 1, int(start_px[1] / grid_res)))
+    gx = max(0, min(gx_max - 1, int(goal_px[0] / grid_res)))
+    gy = max(0, min(gy_max - 1, int(goal_px[1] / grid_res)))
+
+    # Snap start/goal to nearest safe cell
+    if (sx, sy) not in safe_cells:
+        best_d = float('inf')
+        best = (sx, sy)
+        for (nx, ny) in safe_cells:
+            d = (nx - sx) ** 2 + (ny - sy) ** 2
+            if d < best_d:
+                best_d = d
+                best = (nx, ny)
+        sx, sy = best
+    if (gx, gy) not in safe_cells:
+        best_d = float('inf')
+        best = (gx, gy)
+        for (nx, ny) in safe_cells:
+            d = (nx - gx) ** 2 + (ny - gy) ** 2
+            if d < best_d:
+                best_d = d
+                best = (nx, ny)
+        gx, gy = best
+
+    if sx == gx and sy == gy:
+        return [(goal_px[0], goal_px[1])]
+
+    def h(x, y):
+        return math.hypot(x - gx, y - gy)
+
+    open_heap = [(h(sx, sy), 0.0, sx, sy, None)]
+    came_from = {}
+    g_score = {(sx, sy): 0.0}
+    closed = set()
+    while open_heap:
+        f, g, cx, cy, parent = heapq.heappop(open_heap)
+        if (cx, cy) in closed:
+            continue
+        closed.add((cx, cy))
+        came_from[(cx, cy)] = parent
+        if cx == gx and cy == gy:
+            path = []
+            node = (cx, cy)
+            while node is not None:
+                path.append(node)
+                node = came_from.get(node)
+            path.reverse()
+            pixel_path = [(pgx * grid_res, pgy * grid_res) for pgx, pgy in path]
+            # Simplify collinear points
+            if len(pixel_path) > 2:
+                simplified = [pixel_path[0]]
+                for i in range(1, len(pixel_path) - 1):
+                    prev = simplified[-1]
+                    curr = pixel_path[i]
+                    nxt = pixel_path[i + 1]
+                    d1 = (curr[0] - prev[0], curr[1] - prev[1])
+                    d2 = (nxt[0] - curr[0], nxt[1] - curr[1])
+                    if d1 != d2:
+                        simplified.append(curr)
+                simplified.append(pixel_path[-1])
+                pixel_path = simplified
+            return pixel_path
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nx, ny = cx + dx, cy + dy
+            if (nx, ny) not in safe_cells or (nx, ny) in closed:
+                continue
+            step_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+            blank_penalty = blank_grid[ny, nx] * 2.0
+            new_g = g + step_cost + blank_penalty
+            if (nx, ny) not in g_score or new_g < g_score[(nx, ny)]:
+                g_score[(nx, ny)] = new_g
+                f_val = new_g + h(nx, ny)
+                heapq.heappush(open_heap, (f_val, new_g, nx, ny, (cx, cy)))
+    return None
+
+
+class Wanderer:
+    """Edge-hugging safe-region navigator with coverage-weighted touring.
+
+    Precomputes a grid of safe viewport positions (blank ratio ≤ threshold),
+    then navigates via A* pathfinding through that grid.  Plans multi-tile
+    nearest-neighbor tours to maximise coverage while minimising transit.
+
+    A tile is "fully viewed" when its entire content rectangle has been
+    inside the viewport at some point.
     """
 
     def __init__(self, map_w, map_h, view_w, view_h,
@@ -375,41 +565,115 @@ class Wanderer:
         self.speed = speed
         self.view_w = view_w
         self.view_h = view_h
-        self.max_blank_ratio = max_blank_ratio
 
         # Build animated-tile set and reverse lookup from metadata.
         self.animated_tiles = set()
         self.tile_id_to_rc = {}
+        self._grid_rows = tiles_meta.get("grid_rows", 11) if tiles_meta else 11
+        self._grid_cols = tiles_meta.get("grid_cols", 10) if tiles_meta else 10
+        self.content_mask = {}
+        self.content_density = None
         if tiles_meta:
             for tid, info in tiles_meta["tiles"].items():
                 rc = (info["row"], info["col"])
                 self.tile_id_to_rc[tid] = rc
-                if info.get("animated"):
+                is_anim = info.get("animated", False)
+                self.content_mask[rc] = is_anim
+                if is_anim:
                     self.animated_tiles.add(rc)
 
-        # Hard bounds for viewport position (top-left corner).
-        if content_bounds:
-            cx_min, cy_min, cx_max, cy_max = content_bounds
-            self.min_x = cx_min
-            self.max_x = max(cx_min + 1, cx_max - view_w)
-            self.min_y = cy_min
-            self.max_y = max(cy_min + 1, cy_max - view_h)
+        # Load pixel-level content density mask if available
+        try:
+            if os.path.exists(CONTENT_MASK_PATH):
+                npz = np.load(CONTENT_MASK_PATH)
+                map_mask = npz["map_mask"]  # (grid_rows*MASK_ROWS, grid_cols*MASK_COLS)
+                gr = tiles_meta.get("grid_rows", 11) if tiles_meta else 11
+                gc = tiles_meta.get("grid_cols", 10) if tiles_meta else 10
+                self.content_density = {}
+                for tid, info in tiles_meta["tiles"].items():
+                    if not info.get("animated"):
+                        continue
+                    r, c = info["row"], info["col"]
+                    self.content_density[(r, c)] = map_mask[
+                        r*MASK_ROWS:(r+1)*MASK_ROWS,
+                        c*MASK_COLS:(c+1)*MASK_COLS].copy()
+                # Compute content bounds per tile (tight box around actual
+                # pixel-art content, derived from the density mask).
+                # A tile is 'viewed' when all its content pixels have been
+                # inside the viewport — NOT when the full tile rectangle fits.
+                self.content_bounds = {}
+                for (r, c), dmask in self.content_density.items():
+                    rows_wc = np.any(dmask > 0, axis=1)
+                    cols_wc = np.any(dmask > 0, axis=0)
+                    if np.any(rows_wc):
+                        rmin = int(np.argmax(rows_wc))
+                        rmax = int(len(rows_wc) - np.argmax(rows_wc[::-1]) - 1)
+                        cmin = int(np.argmax(cols_wc))
+                        cmax = int(len(cols_wc) - np.argmax(cols_wc[::-1]) - 1)
+                        cb_x0 = cmin * TILE_W / MASK_COLS
+                        cb_y0 = rmin * TILE_H / MASK_ROWS
+                        cb_x1 = (cmax + 1) * TILE_W / MASK_COLS
+                        cb_y1 = (rmax + 1) * TILE_H / MASK_ROWS
+                    else:
+                        cb_x0 = cb_y0 = 0
+                        cb_x1 = TILE_W
+                        cb_y1 = TILE_H
+                    self.content_bounds[(r, c)] = (cb_x0, cb_y0, cb_x1, cb_y1)
+
+                avg_dens = float(np.mean(
+                    [np.mean(v) for v in self.content_density.values()]))
+                log.info("Loaded content density mask: %d tiles, "
+                         "avg density %.0f%%",
+                         len(self.content_density), avg_dens * 100.0)
+        except Exception as e:
+            log.warning("Could not load content_mask.npz (%s) - "
+                       "using binary animated/blank", e)
+            self.content_bounds = None
+
+        self.map_w = map_w
+        self.map_h = map_h
+        self.min_x = 0
+        self.max_x = max(1, map_w - view_w)
+        self.min_y = 0
+        self.max_y = max(1, map_h - view_h)
+
+        # ── Precompute safe region and optimal positions ──
+        log.info("Precomputing navigation grid...")
+        t0 = time.time()
+        self._precompute_safe_region()
+        self._precompute_optimal_positions()
+        self._classify_tiles()
+        log.info("Navigation grid ready (%.1fs): %d safe cells, "
+                 "%d normal tiles, %d tip tiles",
+                 time.time() - t0, len(self._reachable_cells),
+                 len(self.normal_tiles), len(self.tip_tiles))
+
+        # Start at center of animated content
+        if self.animated_tiles:
+            avg_col = sum(c for _, c in self.animated_tiles) / len(self.animated_tiles)
+            avg_row = sum(r for r, _ in self.animated_tiles) / len(self.animated_tiles)
         else:
-            self.min_x = 0
-            self.max_x = max(1, map_w - view_w)
-            self.min_y = 0
-            self.max_y = max(1, map_h - view_h)
+            avg_col, avg_row = self._grid_cols / 2, self._grid_rows / 2
+        self.x = avg_col * SPACING_W + SPACING_W / 2 - view_w / 2
+        self.y = avg_row * SPACING_H + SPACING_H / 2 - view_h / 2
+        self.x = max(self.min_x, min(self.max_x, self.x))
+        self.y = max(self.min_y, min(self.max_y, self.y))
 
-        self.x = (self.min_x + self.max_x) / 2
-        self.y = (self.min_y + self.max_y) / 2
-
+        # Coverage tracking
         self.visit_counts = {rc: 0 for rc in self.animated_tiles}
+        self.fully_viewed = set()
+        self.viewed_steps = {rc: 0 for rc in self.animated_tiles}
+
+        # Navigation state
         self.current_waypoint = None
+        self.path_points = []
+        self.path_idx = 0
         self.target_rc = None
-        self.recent_targets = deque(maxlen=4)
+        self.recent_targets = deque(maxlen=6)
         self.waypoint_start_time = time.time()
-        self.waypoint_timeout = 90.0
+        self.waypoint_timeout = 120.0
         self.waypoints_picked = 0
+        self._attempted = set()
 
         self.angle = random.uniform(0, 2 * math.pi)
         self.vx = math.cos(self.angle) * self.speed
@@ -417,173 +681,367 @@ class Wanderer:
 
         self._pick_new_waypoint()
 
-    def _blank_ratio(self, x, y):
-        """Fraction of viewport covered by non-animated tiles (0.0–1.0)."""
-        col_start = max(0, int(x // SPACING_W))
-        col_end = int((x + self.view_w) // SPACING_W) + 1
-        row_start = max(0, int(y // SPACING_H))
-        row_end = int((y + self.view_h) // SPACING_H) + 1
+    # ── Precomputation ─────────────────────────────────────────────────
 
-        animated_count = 0
-        total_count = 0
+    def _precompute_safe_region(self):
+        """Build boolean grid of safe viewport positions."""
+        gx_max = int(self.max_x / NAV_GRID_RES) + 1
+        gy_max = int(self.max_y / NAV_GRID_RES) + 1
+        self.gx_max = gx_max
+        self.gy_max = gy_max
+        self.safe_grid = np.zeros((gy_max, gx_max), dtype=bool)
+        self.blank_grid = np.ones((gy_max, gx_max), dtype=np.float32)
+        for gy in range(gy_max):
+            py = gy * NAV_GRID_RES
+            for gx in range(gx_max):
+                px = gx * NAV_GRID_RES
+                b = _blank_ratio_px(px, py, self.view_w, self.view_h,
+                                    self._grid_rows, self._grid_cols,
+                                    self.content_mask, self.content_density)
+                self.blank_grid[gy, gx] = b
+                if b <= NAV_TRANSIT_BLANK:
+                    self.safe_grid[gy, gx] = True
+
+    def _precompute_optimal_positions(self):
+        """For each animated tile, find the viewport position that gets
+        all of the tile's CONTENT PIXELS inside the viewport while
+        minimizing blank ratio.  Uses content bounds (tight box around
+        pixel art), NOT the full tile rectangle."""
+        self._optimal_positions = {}
+        for (r, c) in self.animated_tiles:
+            tile_left = c * SPACING_W
+            tile_top = r * SPACING_H
+
+            if self.content_bounds and (r, c) in self.content_bounds:
+                cb = self.content_bounds[(r, c)]
+                # Content bounds in absolute map coordinates
+                cb_abs_x0 = tile_left + cb[0]
+                cb_abs_y0 = tile_top + cb[1]
+                cb_abs_x1 = tile_left + cb[2]
+                cb_abs_y1 = tile_top + cb[3]
+            else:
+                # Fallback: full tile rectangle
+                cb_abs_x0 = tile_left
+                cb_abs_y0 = tile_top
+                cb_abs_x1 = tile_left + TILE_W
+                cb_abs_y1 = tile_top + TILE_H
+
+            # Viewing window: viewport must contain ALL content pixels
+            x_min = max(self.min_x, cb_abs_x1 - self.view_w)
+            x_max = min(self.max_x, cb_abs_x0)
+            y_min = max(self.min_y, cb_abs_y1 - self.view_h)
+            y_max = min(self.max_y, cb_abs_y0)
+            if x_min > x_max:
+                x_min = x_max = max(self.min_x, min(self.max_x, (x_min + x_max) / 2))
+            if y_min > y_max:
+                y_min = y_max = max(self.min_y, min(self.max_y, (y_min + y_max) / 2))
+
+            cx = (x_min + x_max) / 2
+            cy = (y_min + y_max) / 2
+            best_x, best_y = cx, cy
+            best_score = float('inf')
+            n = 9
+            x_range = x_max - x_min
+            y_range = y_max - y_min
+            for i in range(n + 1):
+                for j in range(n + 1):
+                    sx = x_min + x_range * i / n
+                    sy = y_min + y_range * j / n
+                    b = _blank_ratio_px(sx, sy, self.view_w, self.view_h,
+                                       self._grid_rows, self._grid_cols,
+                                       self.content_mask, self.content_density)
+                    dx_norm = abs(sx - cx) / max(1, x_range / 2)
+                    dy_norm = abs(sy - cy) / max(1, y_range / 2)
+                    center_dist = math.hypot(dx_norm, dy_norm)
+                    score = b * 0.7 + center_dist * 0.3
+                    if score < best_score:
+                        best_score = score
+                        best_x, best_y = sx, sy
+            best_blank = _blank_ratio_px(best_x, best_y, self.view_w, self.view_h,
+                                        self._grid_rows, self._grid_cols,
+                                        self.content_mask, self.content_density)
+            self._optimal_positions[(r, c)] = (best_x, best_y, best_blank)
+
+    def _classify_tiles(self):
+        """Classify tiles as normal (safe-reachable) or tip (needs excursion)."""
+        self.tip_tiles = set()
+        self.normal_tiles = set()
+        # Find a safe starting cell near center
+        cx_g = max(0, min(self.gx_max - 1,
+                          int((self.min_x + self.max_x) / 2) // NAV_GRID_RES))
+        cy_g = max(0, min(self.gy_max - 1,
+                          int((self.min_y + self.max_y) / 2) // NAV_GRID_RES))
+        if not self.safe_grid[cy_g, cx_g]:
+            found = False
+            for r in range(self.gy_max):
+                for c in range(self.gx_max):
+                    if self.safe_grid[r, c]:
+                        cx_g, cy_g = c, r
+                        found = True
+                        break
+                if found:
+                    break
+        self._reachable_cells = _bfs_safe_region(
+            self.safe_grid, cx_g, cy_g, self.gx_max, self.gy_max)
+        for (r, c) in self.animated_tiles:
+            opt = self._optimal_positions[(r, c)]
+            gx = max(0, min(self.gx_max - 1, int(opt[0] / NAV_GRID_RES)))
+            gy = max(0, min(self.gy_max - 1, int(opt[1] / NAV_GRID_RES)))
+            if (gx, gy) in self._reachable_cells:
+                self.normal_tiles.add((r, c))
+            else:
+                self.tip_tiles.add((r, c))
+
+    # ── Blank ratio (for compatibility) ────────────────────────────────
+
+    def _blank_ratio(self, x, y):
+        return _blank_ratio_px(x, y, self.view_w, self.view_h,
+                              self._grid_rows, self._grid_cols,
+                              self.content_mask, self.content_density)
+
+    def _tiles_fully_visible(self, x, y):
+        """Animated tiles whose entire CONTENT is inside the viewport.
+
+        Uses content bounds (tight box around pixel art) when available,
+        not the full tile rectangle.  This means an edge tile can be
+        'fully viewed' from deep inside the content-safe zone without
+        pushing the viewport out into blank space.
+        """
+        result = set()
+        vp_right = x + self.view_w
+        vp_bottom = y + self.view_h
+        col_start = max(0, int(x // SPACING_W))
+        col_end = min(self._grid_cols, int(vp_right // SPACING_W) + 1)
+        row_start = max(0, int(y // SPACING_H))
+        row_end = min(self._grid_rows, int(vp_bottom // SPACING_H) + 1)
         for r in range(row_start, row_end):
+            tile_top_y = r * SPACING_H
             for c in range(col_start, col_end):
-                total_count += 1
-                if (r, c) in self.animated_tiles:
-                    animated_count += 1
-        if total_count == 0:
-            return 1.0
-        return 1.0 - (animated_count / total_count)
+                if not self.content_mask.get((r, c), False):
+                    continue
+                tile_left = c * SPACING_W
+                if self.content_bounds and (r, c) in self.content_bounds:
+                    cb = self.content_bounds[(r, c)]
+                    cb_abs_x0 = tile_left + cb[0]
+                    cb_abs_y0 = tile_top_y + cb[1]
+                    cb_abs_x1 = tile_left + cb[2]
+                    cb_abs_y1 = tile_top_y + cb[3]
+                    if cb_abs_x0 >= x and cb_abs_x1 <= vp_right and \
+                       cb_abs_y0 >= y and cb_abs_y1 <= vp_bottom:
+                        result.add((r, c))
+                else:
+                    tile_right = tile_left + TILE_W
+                    tile_bottom = tile_top_y + TILE_H
+                    if tile_left >= x and tile_right <= vp_right and \
+                       tile_top_y >= y and tile_bottom <= vp_bottom:
+                        result.add((r, c))
+        return result
+
+    # ── Waypoint selection ─────────────────────────────────────────────
 
     def _pick_new_waypoint(self):
-        """Select next destination via weighted-random from least-visited tiles.
+        """Build a nearest-neighbor tour through unviewed tiles.
 
-        Instead of always picking the absolute least-visited tile (which
-        creates a feedback loop where edge tiles that can't accumulate
-        visits are targeted forever), this uses a weighted-random selection
-        across all candidates.  Lower visit counts get higher weights, but
-        every tile has a nonzero chance of being selected.  Scores are
-        normalized to 0-1 so the recent-target penalty and blank-ratio
-        penalty are meaningful regardless of how many visits have accrued.
+        Tours tiles in content-density order: CORE (dense interior) first,
+        EDGE next, sparse TIP tiles last.  This ensures the viewport stays
+        in low-blank territory for the majority of the tour.
         """
         if not self.animated_tiles:
-            self.current_waypoint = (
-                random.uniform(self.min_x, self.max_x),
-                random.uniform(self.min_y, self.max_y),
-            )
+            self.path_points = [(self.x, self.y)]
+            self.path_idx = 0
+            self.current_waypoint = self.path_points[0]
             return
 
-        max_visits = max(self.visit_counts.values()) if self.visit_counts else 1
+        unviewed = self.animated_tiles - self.fully_viewed
+        if unviewed and unviewed <= self._attempted:
+            self._attempted.clear()
+        unviewed -= self._attempted
 
-        scored = []
-        for rc in self.animated_tiles:
-            row, col = rc
-            vp_x = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
-            vp_y = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
-            blank = self._blank_ratio(vp_x, vp_y)
+        if not unviewed:
+            self._pick_sweep_waypoint()
+            return
 
-            # Normalize visit count to 0-1 so penalties are scale-invariant.
-            norm_visits = self.visit_counts.get(rc, 0) / max(1, max_visits)
-            score = norm_visits
-            if rc in self.recent_targets:
-                score += 0.3          # 30% penalty on normalized scale
-            # Soft blank-ratio preference — don't strongly exclude edge
-            # tiles.  The blank-ratio guard in update() already prevents
-            # the wanderer from stopping in blank areas; here we only add
-            # a mild nudge so central tiles are slightly preferred.
-            if blank > self.max_blank_ratio:
-                score += (blank - self.max_blank_ratio) * 0.3
-            score += random.uniform(0, 0.05)  # tiny jitter to break ties
-            scored.append((score, rc))
+        # Classify tiles by content density for tour ordering
+        def tile_class(rc):
+            if self.content_density and rc in self.content_density:
+                d = float(np.mean(self.content_density[rc]))
+            else:
+                d = 1.0
+            if d >= 0.60: return 0  # CORE
+            if d >= 0.20: return 1  # EDGE
+            return 2                   # TIP
 
-        # Weighted random selection: weight = 1 / (score + epsilon).
-        # Least-visited tiles get the highest weight, but every tile
-        # has a nonzero probability of being picked.
-        weights = [1.0 / (s + 0.01) for s, _ in scored]
-        total_w = sum(weights)
-        r = random.uniform(0, total_w)
-        cumulative = 0.0
-        target_rc = scored[-1][1]  # fallback
-        for (score, rc), w in zip(scored, weights):
-            cumulative += w
-            if r <= cumulative:
-                target_rc = rc
-                break
+        # Nearest-neighbor within each density class
+        cur_x, cur_y = self.x, self.y
+        ordered = []
+        remaining = set(unviewed)
+        while remaining:
+            for cls in (0, 1, 2):
+                pool = [rc for rc in remaining if tile_class(rc) == cls]
+                if pool:
+                    nearest = None
+                    nearest_d = float('inf')
+                    for rc in pool:
+                        opt = self._optimal_positions[rc]
+                        d = math.hypot(opt[0] - cur_x, opt[1] - cur_y)
+                        if d < nearest_d:
+                            nearest_d = d
+                            nearest = rc
+                    ordered.append(nearest)
+                    remaining.discard(nearest)
+                    opt = self._optimal_positions[nearest]
+                    cur_x, cur_y = opt[0], opt[1]
+                    break
 
-        row, col = target_rc
-        # Target the viewport position that centers the tile on screen,
-        # not the tile center pixel itself.  Without this offset, every
-        # tile appears at the top-left corner of the viewport and the
-        # right/bottom half always shows the next tile over — creating
-        # a coverage bias toward bottom-left content.
-        tx = col * SPACING_W + SPACING_W // 2 - self.view_w // 2
-        ty = row * SPACING_H + SPACING_H // 2 - self.view_h // 2
-        tx += random.uniform(-TILE_W * 0.3, TILE_W * 0.3)
-        ty += random.uniform(-TILE_H * 0.3, TILE_H * 0.3)
-        tx = max(self.min_x, min(self.max_x, tx))
-        ty = max(self.min_y, min(self.max_y, ty))
+        # Build path: A* to first tile, direct segments between tiles
+        full_path = []
+        first_opt = self._optimal_positions[ordered[0]]
+        first_path = _astar_path(
+            self._reachable_cells, self.blank_grid,
+            (self.x, self.y), (first_opt[0], first_opt[1]),
+            NAV_GRID_RES, self.gx_max, self.gy_max)
+        if first_path and len(first_path) > 1:
+            full_path.extend(first_path[:-1])
+        for rc in ordered:
+            opt = self._optimal_positions[rc]
+            full_path.append((opt[0], opt[1]))
 
-        self.current_waypoint = (tx, ty)
-        self.target_rc = target_rc
-        self.recent_targets.append(target_rc)
-        self.waypoint_start_time = time.time()
+        self.target_rc = ordered[-1]
+        self.recent_targets.append(ordered[0])
         self.waypoints_picked += 1
+        self.path_points = full_path
+        self.path_idx = 0
+        self.current_waypoint = self.path_points[0]
+        self.waypoint_start_time = time.time()
 
-        dist = math.hypot(tx - self.x, ty - self.y)
-        travel_time = dist / max(1.0, self.speed)
-        self.waypoint_timeout = max(30.0, min(600.0, travel_time * 1.8))
+        total_dist = 0
+        prev = (self.x, self.y)
+        for pt in full_path:
+            total_dist += math.hypot(pt[0] - prev[0], pt[1] - prev[1])
+            prev = pt
+        travel_time = total_dist / max(1.0, self.speed)
+        self.waypoint_timeout = max(60.0, min(7200.0, travel_time * 3.0))
+
+    def _pick_sweep_waypoint(self):
+        """Revisit all tiles in a balanced coverage sweep."""
+        all_tiles = sorted(self.normal_tiles,
+                          key=lambda rc: (self.viewed_steps.get(rc, 0),
+                                          random.random()))
+        cur_x, cur_y = self.x, self.y
+        ordered = []
+        remaining = set(all_tiles)
+        while remaining:
+            nearest = None
+            nearest_d = float('inf')
+            for rc in remaining:
+                opt = self._optimal_positions[rc]
+                d = math.hypot(opt[0] - cur_x, opt[1] - cur_y)
+                d += self.viewed_steps.get(rc, 0) * 5
+                if d < nearest_d:
+                    nearest_d = d
+                    nearest = rc
+            ordered.append(nearest)
+            remaining.discard(nearest)
+            opt = self._optimal_positions[nearest]
+            cur_x, cur_y = opt[0], opt[1]
+
+        full_path = [(self._optimal_positions[rc][0], self._optimal_positions[rc][1])
+                     for rc in ordered]
+        self.target_rc = ordered[-1]
+        self.recent_targets.append(ordered[0])
+        self.waypoints_picked += 1
+        self.path_points = full_path
+        self.path_idx = 0
+        self.current_waypoint = self.path_points[0]
+        self.waypoint_start_time = time.time()
+
+        total_dist = sum(math.hypot(self.path_points[i+1][0] - self.path_points[i][0],
+                                    self.path_points[i+1][1] - self.path_points[i][1])
+                        for i in range(len(self.path_points) - 1))
+        travel_time = total_dist / max(1.0, self.speed)
+        self.waypoint_timeout = max(60.0, min(14400.0, travel_time * 3.0))
+
+    # ── Visit recording (called by main loop) ──────────────────────────
 
     def record_visits(self, visible_tile_ids):
-        """Increment visit counts for animated tiles in viewport."""
+        """Track fully-viewed tiles and increment visit counts."""
         for tid in visible_tile_ids:
             rc = self.tile_id_to_rc.get(tid)
             if rc and rc in self.visit_counts:
                 self.visit_counts[rc] += 1
+        # Also track fully-visible tiles at current position
+        fully = self._tiles_fully_visible(self.x, self.y)
+        for rc in fully:
+            self.fully_viewed.add(rc)
+            self.viewed_steps[rc] = self.viewed_steps.get(rc, 0) + 1
+
+    # ── Main update ────────────────────────────────────────────────────
 
     def update(self, dt):
-        """Steer toward current waypoint; pick new one when reached."""
-        if self.current_waypoint is None:
+        """Navigate along the current tour path."""
+        if not self.path_points:
             self._pick_new_waypoint()
 
-        wx, wy = self.current_waypoint
-        dx, dy = wx - self.x, wy - self.y
+        # ── Phase 1: Move toward current sub-waypoint ──
+        tx, ty = self.current_waypoint
+        dx, dy = tx - self.x, ty - self.y
         dist = math.hypot(dx, dy)
 
-        arrived = dist < max(TILE_W, TILE_H) * 0.5
-        timed_out = time.time() - self.waypoint_start_time > self.waypoint_timeout
-        if arrived or timed_out:
-            self._pick_new_waypoint()
-            wx, wy = self.current_waypoint
-            dx, dy = wx - self.x, wy - self.y
+        if dist > 1.0:
+            target_angle = math.atan2(dy, dx)
+            diff = target_angle - self.angle
+            while diff > math.pi:
+                diff -= 2 * math.pi
+            while diff < -math.pi:
+                diff += 2 * math.pi
+            self.angle += diff * min(1.0, 2.5 * dt)
+            self.vx = math.cos(self.angle) * self.speed
+            self.vy = math.sin(self.angle) * self.speed
+            step_dist = self.speed * dt
+            if step_dist > dist:
+                self.x = tx
+                self.y = ty
+            else:
+                self.x += self.vx * dt
+                self.y += self.vy * dt
+        else:
+            self.x = tx
+            self.y = ty
 
-        target_angle = math.atan2(dy, dx)
-        diff = target_angle - self.angle
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
-        self.angle += diff * min(1.0, 1.2 * dt)
+        self.x = max(self.min_x, min(self.max_x, self.x))
+        self.y = max(self.min_y, min(self.max_y, self.y))
 
-        desired_vx = math.cos(self.angle) * self.speed
-        desired_vy = math.sin(self.angle) * self.speed
-        blend = min(1.0, 2.0 * dt)
-        self.vx += (desired_vx - self.vx) * blend
-        self.vy += (desired_vy - self.vy) * blend
+        # ── Phase 2: Track fully-viewed tiles ──
+        fully = self._tiles_fully_visible(self.x, self.y)
+        for rc in fully:
+            self.fully_viewed.add(rc)
+            self.viewed_steps[rc] = self.viewed_steps.get(rc, 0) + 1
 
-        self.x += self.vx * dt
-        self.y += self.vy * dt
+        # ── Phase 3: Check arrival (max ONE advance per step) ──
+        tx, ty = self.current_waypoint
+        dx, dy = tx - self.x, ty - self.y
+        dist = math.hypot(dx, dy)
+        arrival_thresh = 30
 
-        # Blank-ratio movement guard.
-        if self._blank_ratio(self.x, self.y) > self.max_blank_ratio:
-            self._pick_new_waypoint()
+        advanced = False
+        if dist < arrival_thresh:
+            self.path_idx += 1
+            advanced = True
+            if self.path_idx < len(self.path_points):
+                self.current_waypoint = self.path_points[self.path_idx]
+            else:
+                if self.target_rc and self.target_rc not in self.fully_viewed:
+                    self._attempted.add(self.target_rc)
+                self._pick_new_waypoint()
 
-        # Hard bounds.
-        if self.x <= self.min_x:
-            self.x = self.min_x
-            self.vx = abs(self.vx) * 0.5
-            self._pick_new_waypoint()
-        elif self.x >= self.max_x:
-            self.x = self.max_x
-            self.vx = -abs(self.vx) * 0.5
-            self._pick_new_waypoint()
-        if self.y <= self.min_y:
-            self.y = self.min_y
-            self.vy = abs(self.vy) * 0.5
-            self._pick_new_waypoint()
-        elif self.y >= self.max_y:
-            self.y = self.max_y
-            self.vy = -abs(self.vy) * 0.5
+        # Timeout
+        if not advanced and time.time() - self.waypoint_start_time > self.waypoint_timeout:
+            if self.target_rc and self.target_rc not in self.fully_viewed:
+                self._attempted.add(self.target_rc)
             self._pick_new_waypoint()
 
     def heading(self):
-        """Return the instantaneous heading unit vector toward the current waypoint.
-
-        Unlike self.vx/vy (which are smoothed and lag 2-3 s behind a waypoint
-        change), this returns the raw direction the wanderer is trying to move
-        *right now*.  The render loop uses this to seed tile prefetch so that a
-        direction change at an edge immediately starts loading tiles in the new
-        direction instead of waiting for the smoothed velocity to rotate.
-        """
+        """Return instantaneous heading toward current sub-waypoint."""
         if self.current_waypoint:
             wx, wy = self.current_waypoint
             dx, dy = wx - self.x, wy - self.y
@@ -607,12 +1065,21 @@ class Wanderer:
             log.info("No animated tiles tracked.")
             return
         visited, total, mn, mx, blank = self.coverage_stats()
-        log.info("Coverage: %d/%d tiles visited | visits: min=%d max=%d | "
-                 "blank: %d%% | waypoints: %d",
-                 visited, total, mn, mx, int(blank * 100), self.waypoints_picked)
-        log.info("Recent targets: %s", list(self.recent_targets))
-        log.info("Current target: %s -> (%.0f, %.0f)",
-                 self.target_rc, self.current_waypoint[0], self.current_waypoint[1])
+        fully_count = len(self.fully_viewed)
+        log.info("Coverage: %d/%d tiles visited | fully viewed: %d/%d | "
+                 "visits: min=%d max=%d | blank: %d%% | waypoints: %d",
+                 visited, total, fully_count, total,
+                 mn, mx, int(blank * 100), self.waypoints_picked)
+        # Print fully-viewed grid
+        grid_str = ""
+        for r in range(self._grid_rows):
+            for c in range(self._grid_cols):
+                if (r, c) in self.animated_tiles:
+                    grid_str += "V" if (r, c) in self.fully_viewed else "."
+                else:
+                    grid_str += " "
+            grid_str += "\n"
+        log.info("Fully-viewed grid (V=viewed, .=unviewed):\n%s", grid_str)
 
 
 # ─── Main Player ──────────────────────────────────────────────────────────────
@@ -641,9 +1108,6 @@ def main():
     pygame.init()
 
     # ── Auto-detect native display resolution ──
-    # If width/height are 0 (the default), query the connected display
-    # and use its native mode.  This avoids letterboxing bands that occur
-    # when a hardcoded 16:9 virtual surface is scaled to a 16:10 panel.
     if args.width <= 0 or args.height <= 0:
         info = pygame.display.Info()
         detected_w = info.current_w
@@ -657,9 +1121,52 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
+    # ── 4K downscale ──
+    # The Pi 5 can't render full 4K in real time (memory + GPU limits).
+    # When a 4K display is attached, switch the X display to 1080p so the
+    # monitor's hardware scaler fills the panel.  No software scaling.
+    #
+    # After xrandr, pygame must be quit+re-init so it picks up the new
+    # display mode — otherwise set_mode() uses stale dimensions and the
+    # fullscreen window ends up positioned in a corner.
+    physical_w = args.width
+    physical_h = args.height
+    if args.width > 3000:
+        render_w = 1920
+        render_h = 1080
+        try:
+            subprocess.run(
+                ["xrandr", "-s", f"{render_w}x{render_h}"],
+                env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")},
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1.0)
+            # Force pygame to re-read the display after the mode switch.
+            # display.quit() invalidates the font module's rendering
+            # context, so we must re-init it too — otherwise status/
+            # loading text renders garbled.
+            pygame.display.quit()
+            pygame.display.init()
+            pygame.font.init()
+            info = pygame.display.Info()
+            args.width = info.current_w
+            args.height = info.current_h
+            log.info("4K display detected — switched X to %dx%d "
+                     "(monitor hardware upscales to %dx%d, pygame sees %dx%d)",
+                     render_w, render_h, physical_w, physical_h,
+                     args.width, args.height)
+        except Exception as e:
+            log.warning("Could not switch display mode: %s — "
+                       "rendering at native %dx%d", e, args.width, args.height)
+
     log.info("Display: %dx%d", args.width, args.height)
-    # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
-    flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+    # SCALED enables the GPU's hardware page-flip with vsync.  Use it for
+    # all normal (non-4K) displays.  The 4K path doesn't need it because
+    # xrandr has already switched the X display to a matching mode.
+    if physical_w > 3000:
+        flags = pygame.FULLSCREEN if args.fullscreen else 0
+    else:
+        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
