@@ -1108,9 +1108,6 @@ def main():
     pygame.init()
 
     # ── Auto-detect native display resolution ──
-    # If width/height are 0 (the default), query the connected display
-    # and use its native mode.  This avoids letterboxing bands that occur
-    # when a hardcoded 16:9 virtual surface is scaled to a 16:10 panel.
     if args.width <= 0 or args.height <= 0:
         info = pygame.display.Info()
         detected_w = info.current_w
@@ -1125,24 +1122,47 @@ def main():
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
     # ── 4K downscale ──
-    # The Pi 5 doesn't have enough memory (4 GB) or GPU power to render
-    # full 4K in real time.  When a 4K-class display (>3000px wide) is
-    # attached, render at half resolution and let pygame's SCALED flag
-    # upscale to the physical display via the GPU.  The aspect ratio is
-    # preserved (both dimensions halved), so no letterboxing.
+    # The Pi 5 can't render full 4K in real time (memory + GPU limits).
+    # When a 4K display is attached, switch the X display to 1080p so the
+    # monitor's hardware scaler fills the panel.  No software scaling.
+    #
+    # After xrandr, pygame must be quit+re-init so it picks up the new
+    # display mode — otherwise set_mode() uses stale dimensions and the
+    # fullscreen window ends up positioned in a corner.
     physical_w = args.width
     physical_h = args.height
     if args.width > 3000:
-        args.width = args.width // 2
-        args.height = args.height // 2
-        log.info("4K display detected (%dx%d) — rendering at %dx%d, "
-                 "GPU upscaling to physical resolution",
-                 physical_w, physical_h, args.width, args.height)
+        render_w = 1920
+        render_h = 1080
+        try:
+            subprocess.run(
+                ["xrandr", "-s", f"{render_w}x{render_h}"],
+                env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")},
+                capture_output=True, timeout=5,
+            )
+            time.sleep(1.0)
+            # Force pygame to re-read the display after the mode switch
+            pygame.display.quit()
+            pygame.display.init()
+            info = pygame.display.Info()
+            args.width = info.current_w
+            args.height = info.current_h
+            log.info("4K display detected — switched X to %dx%d "
+                     "(monitor hardware upscales to %dx%d, pygame sees %dx%d)",
+                     render_w, render_h, physical_w, physical_h,
+                     args.width, args.height)
+        except Exception as e:
+            log.warning("Could not switch display mode: %s — "
+                       "rendering at native %dx%d", e, args.width, args.height)
 
-    log.info("Display: %dx%d (render), %dx%d (physical)",
-             args.width, args.height, physical_w, physical_h)
-    # Use SCALED + vsync for GPU-accelerated page-flip via the Pi's V3D.
-    flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+    log.info("Display: %dx%d", args.width, args.height)
+    # SCALED enables the GPU's hardware page-flip with vsync.  Use it for
+    # all normal (non-4K) displays.  The 4K path doesn't need it because
+    # xrandr has already switched the X display to a matching mode.
+    if physical_w > 3000:
+        flags = pygame.FULLSCREEN if args.fullscreen else 0
+    else:
+        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
