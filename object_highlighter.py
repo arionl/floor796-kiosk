@@ -352,7 +352,7 @@ class ObjectHighlighter:
     def _init_fonts(self):
         if self._fonts_ready:
             return
-        self._font_title = pygame.font.Font(None, 24)
+        self._font_title = pygame.font.Font(None, 22)
         self._font_body = pygame.font.Font(None, 18)
         self._font_small = pygame.font.Font(None, 16)
         self._font_link = pygame.font.Font(None, 15)
@@ -599,13 +599,70 @@ class ObjectHighlighter:
         # Info panel in lower-right corner
         self._render_corner_panel(screen, seg)
 
+    def _wrap_title(self, title, font, max_w, max_lines=2):
+        """Word-wrap a title to fit within max_w, up to max_lines.
+
+        Returns a list of rendered surfaces.  If the title fits on one
+        line, returns a single-element list.
+        """
+        # Quick check: does it fit on one line?
+        single = font.render(title, True, LABEL_TEXT)
+        if single.get_width() <= max_w or max_lines <= 1:
+            return [single]
+
+        # Word-wrap
+        words = title.split()
+        lines = []      # list of strings
+        current = ""
+        word_idx = 0
+
+        for i, word in enumerate(words):
+            test = word if not current else current + " " + word
+            test_w = font.render(test, True, LABEL_TEXT).get_width()
+            if test_w <= max_w:
+                current = test
+                word_idx = i + 1
+            else:
+                if current:
+                    lines.append(current)
+                    current = ""
+                # If single word is too long, truncate it
+                if font.render(word, True, LABEL_TEXT).get_width() > max_w:
+                    truncated = word
+                    while truncated and font.render(
+                            truncated, True, LABEL_TEXT).get_width() > max_w:
+                        truncated = truncated[:-1]
+                    lines.append(truncated.rstrip() + "...")
+                    word_idx = i + 1
+                else:
+                    current = word
+                    word_idx = i + 1
+
+                # Stop if we've filled max_lines
+                if len(lines) >= max_lines:
+                    break
+
+        if current and len(lines) < max_lines:
+            lines.append(current)
+
+        # If there are remaining words we couldn't fit, add "..." to last line
+        has_remaining = word_idx < len(words)
+        if has_remaining and lines:
+            last_text = lines[-1]
+            ellipsis_w = font.render("...", True, LABEL_TEXT).get_width()
+            last_w = font.render(last_text, True, LABEL_TEXT).get_width()
+            if last_w + ellipsis_w <= max_w:
+                lines[-1] = last_text + "..."
+
+        return [font.render(line, True, LABEL_TEXT) for line in lines]
+
     def _render_corner_panel(self, screen, seg):
         """Draw the lower-right info panel with optional thumbnail."""
 
         link_type, _ = classify_link(seg.link)
         has_thumb = link_type not in ("none", "video", "interactive", "wiki")
         # YouTube and image links can have thumbnails
-        if link_type not in ("youtube", "image"):
+        if link_type not in ("youtube", "image", "video"):
             has_thumb = False
 
         # Try to get the thumbnail surface
@@ -613,28 +670,25 @@ class ObjectHighlighter:
         if has_thumb:
             thumb_surf = self._thumbs.get(seg.obj_id, seg.link)
 
+        # Word-wrap the title (up to 2 lines)
+        max_title_w = PANEL_W - PANEL_PADDING * 2
+        title_surfaces = self._wrap_title(seg.title, self._font_title,
+                                          max_title_w, max_lines=2)
+        title_total_h = sum(s.get_height() for s in title_surfaces)
+
         # Determine panel dimensions
+        # Title bar height adapts to whether title is 1 or 2 lines
+        title_bar_h = max(PANEL_H_TITLE_BAR, title_total_h + 14)
+
         if has_thumb:
             panel_w = PANEL_W
-            # If thumbnail isn't loaded yet, still use full height
-            # so the panel doesn't jump when it arrives
-            panel_h = PANEL_H_WITH_THUMB
+            panel_h = title_bar_h + PANEL_H_THUMB + PANEL_H_FOOTER + PANEL_PADDING
         else:
             panel_w = PANEL_W_NO_THUMB
-            panel_h = PANEL_H_NO_THUMB
+            panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
 
         panel_x = self._screen_w - panel_w - PANEL_MARGIN
         panel_y = self._screen_h - panel_h - PANEL_MARGIN
-
-        # ── Title text (truncate if needed) ──
-        max_title_w = panel_w - PANEL_PADDING * 2
-        title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
-        if title_surf.get_width() > max_title_w:
-            truncated = seg.title
-            while truncated and title_surf.get_width() > max_title_w:
-                truncated = truncated[:-1]
-                title_surf = self._font_title.render(
-                    truncated + "...", True, LABEL_TEXT)
 
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
@@ -650,17 +704,19 @@ class ObjectHighlighter:
 
         screen.blit(panel_surf, (panel_x, panel_y))
 
-        # ── Title + date ──
+        # ── Title (possibly 2 lines) + date ──
         tx = panel_x + PANEL_PADDING
         ty = panel_y + 8
-        screen.blit(title_surf, (tx, ty))
-        ty += title_surf.get_height() + 2
+        for ts in title_surfaces:
+            screen.blit(ts, (tx, ty))
+            ty += ts.get_height()
+        ty += 2
         screen.blit(date_surf, (tx, ty))
 
         # ── Thumbnail ──
         if has_thumb:
             img_x = tx
-            img_y = panel_y + PANEL_H_TITLE_BAR + 4
+            img_y = panel_y + title_bar_h + 4
 
             if thumb_surf is not None:
                 # Draw the thumbnail

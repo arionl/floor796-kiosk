@@ -79,12 +79,12 @@ def classify_link(link):
             vid = m.group(1)
             return "youtube", YT_THUMB_FMT.format(vid=vid)
 
-    # Direct video files (mp4/webm)
+    # Direct video files (mp4/webm) — extract a frame via ffmpeg
     if any(link.lower().endswith(ext) for ext in (".mp4", ".webm", ".mov")):
-        # Try to find an associated thumbnail by replacing extension
-        # floor796 stores video thumbs sometimes, but we can't be sure.
-        # Fall back to no thumbnail for videos.
-        return "video", None
+        url = link
+        if url.startswith("//"):
+            url = "https:" + url
+        return "video", url
 
     # Direct images
     if any(link.lower().endswith(ext) for ext in
@@ -119,24 +119,98 @@ def _fetch_url(url, timeout=REQUEST_TIMEOUT):
         return resp.read()
 
 
+def _extract_video_frame(url, timeout=REQUEST_TIMEOUT):
+    """Fetch a thumbnail from a video URL using ffmpeg.
+
+    Downloads the video to a temp file, extracts a representative frame,
+    and returns it as raw image bytes (PNG).
+    """
+    import subprocess
+    import tempfile
+
+    # Download video to temp file
+    raw = _fetch_url(url, timeout=timeout * 2)
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        out_path = tmp_path.replace(".mp4", "_frame.png")
+
+        # Strategy: seek to ~1 second in and grab a frame.
+        # Seeking first (-ss before -i) is fast (no full decode).
+        # If that fails (e.g., video <1s), fall back to first frame.
+        for seek_args in [
+            ["-ss", "00:00:01", "-i", tmp_path],
+            ["-i", tmp_path],  # no seek — first frame
+        ]:
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-y"] + seek_args +
+                    ["-frames:v", "1", "-vf", "scale=320:-1",
+                     "-f", "image2", out_path],
+                    capture_output=True, timeout=10
+                )
+                if result.returncode == 0 and os.path.exists(out_path):
+                    break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
+        return None
+    except Exception as e:
+        log.debug("ThumbnailCache: ffmpeg frame extraction failed for %s: %s",
+                  url, e)
+        return None
+    finally:
+        for p in (tmp_path, tmp_path.replace(".mp4", "_frame.png")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def _resize_cover(src_surf, target_w, target_h):
-    """Resize a pygame Surface to cover target dimensions, cropping excess."""
+    """Resize a pygame Surface to fit target dimensions.
+
+    Uses cover-crop (fill target, crop overflow) when the source aspect
+    ratio is close to the target.  When the aspect ratios differ
+    significantly, uses letterbox/pillarbox (fit entirely, fill margins
+    with black) to avoid chopping important content from very wide or
+    very tall images.
+    """
     sw, sh = src_surf.get_size()
     if sw == 0 or sh == 0:
         return None
 
-    # Calculate scale to cover
-    scale = max(target_w / sw, target_h / sh)
-    new_w = int(sw * scale)
-    new_h = int(sh * scale)
-    scaled = pygame.transform.smoothscale(src_surf, (new_w, new_h))
+    src_ratio = sw / sh
+    target_ratio = target_w / target_h
 
-    # Crop center
-    crop_x = (new_w - target_w) // 2
-    crop_y = (new_h - target_h) // 2
-    cropped = pygame.Surface((target_w, target_h))
-    cropped.blit(scaled, (-crop_x, -crop_y))
-    return cropped
+    if abs(src_ratio - target_ratio) < 0.2:
+        # Close enough — cover-crop
+        scale = max(target_w / sw, target_h / sh)
+        new_w = int(sw * scale)
+        new_h = int(sh * scale)
+        scaled = pygame.transform.smoothscale(src_surf, (new_w, new_h))
+        crop_x = (new_w - target_w) // 2
+        crop_y = (new_h - target_h) // 2
+        result = pygame.Surface((target_w, target_h))
+        result.blit(scaled, (-crop_x, -crop_y))
+        return result
+    else:
+        # Aspect ratios differ significantly — letterbox
+        scale = min(target_w / sw, target_h / sh)
+        new_w = max(1, int(sw * scale))
+        new_h = max(1, int(sh * scale))
+        scaled = pygame.transform.smoothscale(src_surf, (new_w, new_h))
+        result = pygame.Surface((target_w, target_h))
+        result.fill((15, 15, 20))  # dark background matching panel
+        offset_x = (target_w - new_w) // 2
+        offset_y = (target_h - new_h) // 2
+        result.blit(scaled, (offset_x, offset_y))
+        return result
 
 
 class ThumbnailCache:
@@ -245,10 +319,19 @@ class ThumbnailCache:
     def _fetch_worker(self, obj_id, url, cache_file):
         """Background fetch: download image, resize, save to disk, cache."""
         try:
-            raw = _fetch_url(url)
-            src_surf = pygame.image.load(io.BytesIO(raw))
+            link_type, _ = classify_link(url)
 
-            # Resize to cover 320×200
+            if link_type == "video":
+                # Extract a frame from the video using ffmpeg
+                frame_bytes = _extract_video_frame(url)
+                if frame_bytes is None:
+                    raise ValueError("video frame extraction failed")
+                src_surf = pygame.image.load(io.BytesIO(frame_bytes))
+            else:
+                raw = _fetch_url(url)
+                src_surf = pygame.image.load(io.BytesIO(raw))
+
+            # Resize to fit 320×200
             thumb = _resize_cover(src_surf, THUMB_W, THUMB_H)
             if thumb is None:
                 raise ValueError("resize failed")
@@ -262,7 +345,7 @@ class ThumbnailCache:
             # Store raw surface (no convert_alpha in background thread —
             # it requires the video subsystem and may fail or corrupt
             # state when called from a non-main thread).  convert_alpha
-            # is deferred to the main thread in _convert_surface().
+            # is deferred to the main thread in get().
             self._store(obj_id, thumb)
             log.debug("ThumbnailCache: fetched thumbnail for obj %s from %s",
                       obj_id, url)
