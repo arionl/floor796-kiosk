@@ -263,6 +263,8 @@ class StatsCollector:
         self._tiles = sorted(tile_rc_list)
         self._tile_index = {rc: i for i, rc in enumerate(self._tiles)}
         self._lock = threading.Lock()
+        self._map_w = map_w
+        self._map_h = map_h
 
         # Current frame reference values (updated by main loop)
         self._frame = {}
@@ -402,6 +404,8 @@ class StatsCollector:
                 "render_h": f.get("render_h", 0),
                 "physical_w": f.get("physical_w", 0),
                 "physical_h": f.get("physical_h", 0),
+                "map_w": self._map_w,
+                "map_h": self._map_h,
                 "scale_mode": f.get("scale_mode", "native"),
                 "fps": f.get("fps", 0),
                 "fps_avg": fps_stats[3],

@@ -108,30 +108,29 @@ class StatsOverlay:
         return BLANK_BAD
 
     def _heading_arrow(self, vx, vy):
-        """Simple ASCII arrow representation for wanderer heading."""
+        """Unicode arrow for wanderer heading (default pygame font supports these)."""
         speed = (vx ** 2 + vy ** 2) ** 0.5
         if speed < 0.5:
-            return "*"
+            return "\u00b7"  # middle dot
         import math
         angle = math.atan2(vy, vx)
-        # 8-direction arrows (ASCII-safe)
         deg = math.degrees(angle)
         if -22.5 <= deg < 22.5:
-            return "->"
+            return "\u2192"  # right arrow
         elif 22.5 <= deg < 67.5:
-            return "v"
+            return "\u2198"  # down-right
         elif 67.5 <= deg < 112.5:
-            return "v"
+            return "\u2193"  # down
         elif 112.5 <= deg < 157.5:
-            return "<-"
+            return "\u2199"  # down-left
         elif deg >= 157.5 or deg < -157.5:
-            return "<-"
+            return "\u2190"  # left
         elif -157.5 <= deg < -112.5:
-            return "<-"
+            return "\u2196"  # up-left
         elif -112.5 <= deg < -67.5:
-            return "^"
+            return "\u2191"  # up
         else:
-            return "^"
+            return "\u2197"  # up-right
 
     def _format_uptime(self, seconds):
         if seconds < 60:
@@ -284,7 +283,7 @@ class StatsOverlay:
         visits = snapshot.get("visit_counts", {})
         grid_area_h = self.panel_h - y - 30
         if grid_area_h > 40 and total > 0:
-            self._draw_coverage_grid(x, y, visits)
+            self._draw_coverage_grid(x, y, visits, snapshot)
             y += min(grid_area_h, 150)
 
         # Hints
@@ -294,9 +293,21 @@ class StatsOverlay:
         self._cached_panel.blit(hint, (x, y))
 
     def _draw_section(self, label, x, y):
-        hdr = self._font_section.render(f"== {label} ==", True, SECTION_HEADER)
-        self._cached_panel.blit(hdr, (x, y))
-        return y + hdr.get_height() + 3
+        """Draw a section header with a filled background bar."""
+        hdr = self._font_section.render(label, True, SECTION_HEADER)
+        tw = hdr.get_width()
+        # Draw a subtle background bar behind the header text
+        bar_x = x - 4
+        bar_y = y
+        bar_w = self.panel_w - 20
+        bar_h = hdr.get_height() + 2
+        pygame.draw.rect(self._cached_panel, (30, 35, 50),
+                         (bar_x, bar_y, bar_w, bar_h))
+        # Left accent bar
+        pygame.draw.rect(self._cached_panel, SECTION_HEADER,
+                         (bar_x, bar_y, 3, bar_h))
+        self._cached_panel.blit(hdr, (x + 6, y + 1))
+        return y + bar_h + 3
 
     def _draw_row(self, x, y, label, value, detail="", color=None):
         lbl = self._font_data.render(f"{label}:", True, TEXT_SECONDARY)
@@ -310,10 +321,11 @@ class StatsOverlay:
             det = self._font_data.render(detail, True, TEXT_SECONDARY)
             self._cached_panel.blit(det, (x + 65 + val.get_width() + 10, y))
 
-    def _draw_coverage_grid(self, x, y, visits):
-        """Draw a mini coverage grid.
+    def _draw_coverage_grid(self, x, y, visits, snapshot):
+        """Draw a heat-colored coverage grid with viewport indicator.
 
         visits: dict of "r,c" -> visit count
+        snapshot: full snapshot dict (for viewport position)
         """
         # Parse visits
         visit_map = {}
@@ -322,27 +334,103 @@ class StatsOverlay:
                 r, c = map(int, key.split(","))
                 visit_map[(r, c)] = count
             except (ValueError, AttributeError):
-                # Already a tuple? (shouldn't be after JSON, but just in case)
                 try:
                     r, c = key
                     visit_map[(r, c)] = count
                 except Exception:
                     pass
 
+        # Find max visit count for normalization
+        max_count = max(visit_map.values()) if visit_map else 1
+        if max_count == 0:
+            max_count = 1
+
+        # Grid cell dimensions
         cell_w = (self.panel_w - 28) // self.grid_cols
-        cell_h = 12
+        cell_h = 14
+
+        # Draw cells with heat-map coloring
         for r in range(self.grid_rows):
             for c in range(self.grid_cols):
                 cx = x + c * cell_w
                 cy = y + r * cell_h
                 count = visit_map.get((r, c), 0)
                 if count > 0:
-                    # Color intensity by visit count
-                    intensity = min(1.0, count / 10.0)
-                    green = int(100 + 155 * intensity)
-                    color = (0, green, 50)
+                    intensity = min(1.0, count / max_count)
+                    color = self._heat_color(intensity)
                     pygame.draw.rect(self._cached_panel, color,
                                      (cx, cy, cell_w - 1, cell_h - 1))
                 else:
-                    pygame.draw.rect(self._cached_panel, (30, 30, 40),
+                    pygame.draw.rect(self._cached_panel, (28, 28, 38),
                                      (cx, cy, cell_w - 1, cell_h - 1))
+
+        # Draw viewport indicator overlay
+        pos_x = snapshot.get("pos_x", 0)
+        pos_y = snapshot.get("pos_y", 0)
+        render_w = snapshot.get("render_w", 0)
+        render_h = snapshot.get("render_h", 0)
+        map_w = snapshot.get("map_w", 0)
+        map_h = snapshot.get("map_h", 0)
+
+        if map_w > 0 and map_h > 0 and render_w > 0 and render_h > 0:
+            # The viewport shows map region [pos_x, pos_x+render_w] x
+            # [pos_y, pos_y+render_h] (clamped to map bounds).
+            vp_x1 = max(0, pos_x) / map_w
+            vp_y1 = max(0, pos_y) / map_h
+            vp_x2 = min(map_w, pos_x + render_w) / map_w
+            vp_y2 = min(map_h, pos_y + render_h) / map_h
+
+            grid_w = self.grid_cols * cell_w
+            grid_h = self.grid_rows * cell_h
+
+            vx = x + vp_x1 * grid_w
+            vy = y + vp_y1 * grid_h
+            vw = (vp_x2 - vp_x1) * grid_w
+            vh = (vp_y2 - vp_y1) * grid_h
+
+            # Clamp to grid bounds
+            vx = max(x, min(x + grid_w, vx))
+            vy = max(y, min(y + grid_h, vy))
+
+            if vw > 2 and vh > 2:
+                # White outline with crosshair
+                pygame.draw.rect(self._cached_panel, (255, 255, 255),
+                                 (vx, vy, vw, vh), 2)
+                # Center dot
+                ccx = int(vx + vw / 2)
+                ccy = int(vy + vh / 2)
+                pygame.draw.circle(self._cached_panel, (255, 255, 0),
+                                   (ccx, ccy), 3)
+
+    def _heat_color(self, intensity):
+        """Map 0.0-1.0 intensity to a heat-map color.
+
+        0.0 = dark blue (cold), through green, yellow, to red (hot).
+        """
+        # Clamp
+        t = max(0.0, min(1.0, intensity))
+        if t < 0.25:
+            # Dark blue to blue-green
+            f = t / 0.25
+            r = int(20 + f * 0)
+            g = int(40 + f * 120)
+            b = int(80 + f * 50)
+        elif t < 0.50:
+            # Blue-green to green
+            f = (t - 0.25) / 0.25
+            r = int(20 + f * 40)
+            g = int(160 + f * 80)
+            b = int(130 - f * 80)
+        elif t < 0.75:
+            # Green to yellow
+            f = (t - 0.50) / 0.25
+            r = int(60 + f * 180)
+            g = int(240)
+            b = int(50 - f * 50)
+        else:
+            # Yellow to red
+            f = (t - 0.75) / 0.25
+            r = int(240 + f * 15)
+            g = int(240 - f * 160)
+            b = int(0)
+        return (r, g, b)
