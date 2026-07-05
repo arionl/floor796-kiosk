@@ -748,64 +748,73 @@ class ObjectHighlighter:
             return [single]
 
         # Word-wrap
-        words = title.split()
-        lines = []      # list of strings
-        current = ""
-        word_idx = 0
+        return self._wrap_text(title, font, max_w, max_lines, LABEL_TEXT)
 
-        for i, word in enumerate(words):
+    def _wrap_text(self, text, font, max_w, max_lines=3, color=None):
+        """Word-wrap arbitrary text into rendered surfaces.
+
+        Returns list of pygame surfaces, at most max_lines long.
+        """
+        if color is None:
+            color = (180, 180, 190)
+
+        words = text.split()
+        lines = []
+        current = ""
+
+        for word in words:
             test = word if not current else current + " " + word
-            test_w = font.render(test, True, LABEL_TEXT).get_width()
+            test_w = font.render(test, True, color).get_width()
             if test_w <= max_w:
                 current = test
-                word_idx = i + 1
             else:
                 if current:
                     lines.append(current)
                     current = ""
-                # If single word is too long, truncate it
-                if font.render(word, True, LABEL_TEXT).get_width() > max_w:
+                # Handle single word too long for the line
+                if font.render(word, True, color).get_width() > max_w:
                     truncated = word
                     while truncated and font.render(
-                            truncated, True, LABEL_TEXT).get_width() > max_w:
+                            truncated, True, color).get_width() > max_w:
                         truncated = truncated[:-1]
                     lines.append(truncated.rstrip() + "...")
-                    word_idx = i + 1
                 else:
                     current = word
-                    word_idx = i + 1
-
-                # Stop if we've filled max_lines
                 if len(lines) >= max_lines:
                     break
 
         if current and len(lines) < max_lines:
             lines.append(current)
 
-        # If there are remaining words we couldn't fit, add "..." to last line
-        has_remaining = word_idx < len(words)
-        if has_remaining and lines:
-            last_text = lines[-1]
-            ellipsis_w = font.render("...", True, LABEL_TEXT).get_width()
-            last_w = font.render(last_text, True, LABEL_TEXT).get_width()
+        # Add ellipsis to last line if text was truncated
+        total_words = len(words)
+        used_words = sum(len(l.split()) for l in lines)
+        if used_words < total_words and lines:
+            last = lines[-1]
+            ellipsis_w = font.render("...", True, color).get_width()
+            last_w = font.render(last, True, color).get_width()
             if last_w + ellipsis_w <= max_w:
-                lines[-1] = last_text + "..."
+                lines[-1] = last + "..."
 
-        return [font.render(line, True, LABEL_TEXT) for line in lines]
+        return [font.render(line, True, color) for line in lines]
 
     def _render_corner_panel(self, screen, seg):
         """Draw the lower-right info panel with optional thumbnail."""
 
         link_type, _ = classify_link(seg.link)
-        has_thumb = link_type not in ("none", "video", "interactive", "wiki")
-        # YouTube and image links can have thumbnails
-        if link_type not in ("youtube", "image", "video"):
-            has_thumb = False
+        # All link types that can produce a visual thumbnail:
+        # images, YouTube, video frame captures, and Wikipedia images
+        has_thumb = link_type in ("image", "youtube", "video", "wiki")
 
         # Try to get the thumbnail surface
         thumb_surf = None
         if has_thumb:
             thumb_surf = self._thumbs.get(seg.obj_id, seg.link)
+
+        # Wikipedia extract text (if available)
+        extract_text = None
+        if link_type == "wiki":
+            extract_text = self._thumbs.get_extract(seg.obj_id)
 
         # Word-wrap the title (up to 2 lines)
         max_title_w = PANEL_W - PANEL_PADDING * 2
@@ -815,13 +824,22 @@ class ObjectHighlighter:
 
         # Determine panel dimensions
         # Title bar includes title lines + date line + padding.
-        # Must be tall enough that the date doesn't get covered by the thumbnail.
         date_h = self._font_small.get_height()
-        title_bar_h = title_total_h + date_h + 16  # title + date + margins
+        title_bar_h = title_total_h + date_h + 16
+
+        # Wrap extract text to compute its height
+        extract_lines = []
+        extract_h = 0
+        if extract_text:
+            extract_lines = self._wrap_text(
+                extract_text, self._font_small,
+                max_title_w, max_lines=3)
+            extract_h = sum(s.get_height() for s in extract_lines) + 10
 
         if has_thumb:
             panel_w = PANEL_W
-            panel_h = title_bar_h + PANEL_H_THUMB + PANEL_H_FOOTER + PANEL_PADDING
+            panel_h = (title_bar_h + PANEL_H_THUMB + PANEL_H_FOOTER +
+                       PANEL_PADDING + extract_h)
         else:
             panel_w = PANEL_W_NO_THUMB
             panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
@@ -863,6 +881,13 @@ class ObjectHighlighter:
             else:
                 # Draw loading placeholder
                 self._render_placeholder(screen, img_x, img_y, THUMB_W, THUMB_H)
+
+        # ── Wikipedia extract text (below thumbnail) ──
+        if extract_lines:
+            ex_y = panel_y + title_bar_h + PANEL_H_THUMB + 4
+            for line_surf in extract_lines:
+                screen.blit(line_surf, (tx, ex_y))
+                ex_y += line_surf.get_height()
 
         # ── Footer: link type + progress bar ──
         footer_y = panel_y + panel_h - PANEL_H_FOOTER

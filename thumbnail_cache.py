@@ -17,6 +17,7 @@ thread fetches and processes the image.
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -94,8 +95,15 @@ def classify_link(link):
             url = "https:" + url
         return "image", url
 
-    # Wikipedia
-    if "wikipedia.org" in link or "wikireading.ru" in link:
+    # Wikipedia — try to get the lead image via REST API
+    if "wikipedia.org" in link:
+        thumb_url = _wikipedia_thumb_url(link)
+        if thumb_url:
+            return "wiki", thumb_url
+        return "wiki", None
+
+    # wikireading.ru — not Wikipedia, no API
+    if "wikireading.ru" in link:
         return "wiki", None
 
     # Other web links
@@ -103,6 +111,35 @@ def classify_link(link):
         return "web", None
 
     return "none", None
+
+
+# Wikipedia REST API summary endpoint.
+# Returns JSON with 'thumbnail' and 'extract' fields.
+_WP_API_FMT = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}"
+_WP_THUMB_SIZE = 320  # request 320px-wide thumbnail
+
+
+def _wikipedia_thumb_url(wiki_url):
+    """Extract the article title and lang from a Wikipedia URL, then
+    construct a REST API thumbnail URL.
+
+    Returns the thumbnail source URL, or None if the URL can't be parsed.
+    The actual fetch happens later (returns URL only, no network call here).
+    """
+    # Parse: https://en.wikipedia.org/wiki/Herrerasaurus
+    #        https://ru.wikipedia.org/wiki/Ждун (URL-encoded)
+    m = re.match(
+        r"https?://([a-z]+)\.wikipedia\.org/wiki/(.+)$", wiki_url)
+    if not m:
+        return None
+    lang = m.group(1)
+    title = urllib.parse.unquote(m.group(2))
+    # Use the REST API to get the thumbnail URL.
+    # We return a special URL that _fetch_worker knows to resolve.
+    api_url = _WP_API_FMT.format(
+        lang=lang,
+        title=urllib.parse.quote(title))
+    return f"wiki://api:{api_url}"
 
 
 def _cache_key(url):
@@ -226,11 +263,12 @@ class ThumbnailCache:
     def __init__(self, cache_dir=CACHE_DIR, max_mem=80):
         self._cache_dir = cache_dir
         self._max_mem = max_mem  # max surfaces in RAM
-        self._surfaces = OrderedDict()  # obj_id -> pygame.Surface or None
+        self._surfaces = OrderedDict()  # obj_id -> (pygame.Surface, converted)
         self._loading = set()  # obj_ids currently being fetched
         self._failed = set()  # obj_ids that failed to load
         self._lock = threading.Lock()
         self._thread_pool = []
+        self._extracts = {}  # obj_id -> Wikipedia extract text
 
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -327,6 +365,28 @@ class ThumbnailCache:
                 if frame_bytes is None:
                     raise ValueError("video frame extraction failed")
                 src_surf = pygame.image.load(io.BytesIO(frame_bytes))
+
+            elif url.startswith("wiki://api:"):
+                # Wikipedia: fetch REST API summary, get thumbnail + extract
+                api_url = url[len("wiki://api:"):]
+                raw = _fetch_url(api_url)
+                data = json.loads(raw)
+
+                # Store the text extract for this object
+                extract = data.get("extract", "")
+                if extract:
+                    with self._lock:
+                        self._extracts[obj_id] = extract
+
+                # Get the thumbnail image URL
+                thumb_data = data.get("thumbnail") or {}
+                thumb_src = thumb_data.get("source")
+                if not thumb_src:
+                    raise ValueError("no Wikipedia thumbnail")
+
+                img_raw = _fetch_url(thumb_src)
+                src_surf = pygame.image.load(io.BytesIO(img_raw))
+
             else:
                 raw = _fetch_url(url)
                 src_surf = pygame.image.load(io.BytesIO(raw))
@@ -362,6 +422,11 @@ class ThumbnailCache:
     def prefetch(self, obj_id, link):
         """Prefetch a thumbnail without needing the surface yet."""
         self.get(obj_id, link)
+
+    def get_extract(self, obj_id):
+        """Return cached Wikipedia extract text for an object, or None."""
+        with self._lock:
+            return self._extracts.get(obj_id)
 
     def get_link_type(self, link):
         """Return the link type string for rendering indicators."""
