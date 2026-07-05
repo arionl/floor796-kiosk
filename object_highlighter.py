@@ -1188,7 +1188,7 @@ class ObjectHighlighter:
         for oid, cnt in sorted_by_count[:limit]:
             most.append({
                 "id": oid,
-                "title": self._obj_titles.get(oid, "")[:24],
+                "title": self._obj_titles.get(oid, ""),
                 "views": cnt,
             })
 
@@ -1196,7 +1196,7 @@ class ObjectHighlighter:
         for oid, cnt in reversed(sorted_by_count[-limit:]):
             least.append({
                 "id": oid,
-                "title": self._obj_titles.get(oid, "")[:24],
+                "title": self._obj_titles.get(oid, ""),
                 "views": cnt,
             })
 
@@ -1207,7 +1207,7 @@ class ObjectHighlighter:
         for oid, ts in sorted_by_time[:limit]:
             recent.append({
                 "id": oid,
-                "title": self._obj_titles.get(oid, "")[:24],
+                "title": self._obj_titles.get(oid, ""),
                 "ago": now - ts,
             })
 

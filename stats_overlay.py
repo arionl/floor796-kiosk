@@ -285,7 +285,7 @@ class StatsOverlay:
         grid_area_h = self.panel_h - y - 30
         if grid_area_h > 40 and total > 0:
             self._draw_coverage_grid(x, y, visits, snapshot)
-            y += min(grid_area_h, 150)
+            y += min(grid_area_h, 150) + 8
 
         # Labels (highlighter windowed stats)
         hl_window = snapshot.get("hl_window")
@@ -301,62 +301,32 @@ class StatsOverlay:
             self._draw_row(x, y, "Views", f"{tv}")
             y += 18
 
-            # Most viewed (Top)
+            # Most viewed (Top) — 5 entries
             most = hl_window.get("most_viewed", [])
             if most:
                 self._draw_row(x, y, "Top", "",
                                color=TEXT_ACCENT)
                 y += 16
                 for item in most[:5]:
-                    title = item.get("title", "?")[:18]
+                    title = item.get("title", "?")
                     cnt = item.get("views", 0)
-                    s = self._font_data.render(
-                        f"  {title}", True, TEXT_PRIMARY)
-                    self._cached_panel.blit(s, (x, y))
-                    cnt_s = self._font_data.render(
-                        f"{cnt}x", True, TEXT_SECONDARY)
-                    self._cached_panel.blit(
-                        cnt_s, (x + self.panel_w - 36, y))
-                    y += 16
+                    cnt_text = f"{cnt}x"
+                    y = self._draw_label_entry(
+                        x, y, title, cnt_text, TEXT_SECONDARY)
 
-            # Least viewed (Least)
-            least = hl_window.get("least_viewed", [])
-            if least:
-                y += 4
-                self._draw_row(x, y, "Least", "",
-                               color=TEXT_ACCENT)
-                y += 16
-                for item in least[:5]:
-                    title = item.get("title", "?")[:18]
-                    cnt = item.get("views", 0)
-                    s = self._font_data.render(
-                        f"  {title}", True, TEXT_PRIMARY)
-                    self._cached_panel.blit(s, (x, y))
-                    cnt_s = self._font_data.render(
-                        f"{cnt}x", True, TEXT_SECONDARY)
-                    self._cached_panel.blit(
-                        cnt_s, (x + self.panel_w - 36, y))
-                    y += 16
-
-            # Most recent (Last)
+            # Most recent (Last) — 10 entries
             recent = hl_window.get("recent", [])
             if recent:
                 y += 4
                 self._draw_row(x, y, "Last", "",
                                color=TEXT_ACCENT)
                 y += 16
-                for item in recent[:5]:
-                    title = item.get("title", "?")[:18]
+                for item in recent[:10]:
+                    title = item.get("title", "?")
                     ago = item.get("ago", 0)
-                    ago_str = self._format_uptime(ago)
-                    s = self._font_data.render(
-                        f"  {title}", True, TEXT_PRIMARY)
-                    self._cached_panel.blit(s, (x, y))
-                    ago_s = self._font_data.render(
-                        ago_str, True, TEXT_SECONDARY)
-                    self._cached_panel.blit(
-                        ago_s, (x + self.panel_w - 50, y))
-                    y += 16
+                    ago_text = self._format_uptime(ago)
+                    y = self._draw_label_entry(
+                        x, y, title, ago_text, TEXT_SECONDARY)
 
             y += 8
 
@@ -365,6 +335,43 @@ class StatsOverlay:
         hint = self._font_hint.render("[S] toggle   [T] time window",
                                        True, TEXT_SECONDARY)
         self._cached_panel.blit(hint, (x, y))
+
+
+    def _draw_label_entry(self, x, y, title, suffix, suffix_color):
+        """Draw a label entry with dynamic text truncation.
+
+        All coordinates are panel-local (0..panel_w).  x is the left
+        margin (14px).  The suffix is right-aligned within the panel
+        with a small right margin.  The title fills the space between
+        the indent and the suffix, truncated with "..." if needed.
+        """
+        suffix_s = self._font_data.render(suffix, True, suffix_color)
+        suffix_w = suffix_s.get_width()
+
+        indent = 12
+        gap = 8
+        right_margin = 10
+
+        # Suffix x position: right-aligned within panel (panel-local)
+        suffix_x = self.panel_w - suffix_w - right_margin
+        # Title start x
+        title_x = x + indent
+        # Available width for title text
+        max_title_w = suffix_x - title_x - gap
+
+        title_s = self._font_data.render(title, True, TEXT_PRIMARY)
+        if title_s.get_width() > max_title_w and max_title_w > 20:
+            ellipsis = "..."
+            ellipsis_w = self._font_data.render(ellipsis, True, TEXT_PRIMARY).get_width()
+            avail = max_title_w - ellipsis_w
+            trimmed = title
+            while trimmed and self._font_data.render(trimmed, True, TEXT_PRIMARY).get_width() > avail:
+                trimmed = trimmed[:-1]
+            title_s = self._font_data.render(trimmed.rstrip() + ellipsis, True, TEXT_PRIMARY)
+
+        self._cached_panel.blit(title_s, (title_x, y))
+        self._cached_panel.blit(suffix_s, (suffix_x, y))
+        return y + 16
 
     def _draw_section(self, label, x, y):
         """Draw a section header with a filled background bar."""
