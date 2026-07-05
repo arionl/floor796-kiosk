@@ -95,15 +95,20 @@ echo "    ✓ pygame + brotli ready"
 echo "[4/7] Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 
-# Python package (all modules live under floor796_kiosk/)
-cp -r "${SOURCE_DIR}/floor796_kiosk" "${INSTALL_DIR}/"
+if [[ "${SOURCE_DIR}" != "${INSTALL_DIR}" ]]; then
+    # Python package (all modules live under floor796_kiosk/)
+    cp -r "${SOURCE_DIR}/floor796_kiosk" "${INSTALL_DIR}/"
+    # Deploy scripts
+    mkdir -p "${INSTALL_DIR}/deploy"
+    cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/deploy/"
+    cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/deploy/"
+    chmod +x "${INSTALL_DIR}"/deploy/run.sh "${INSTALL_DIR}"/deploy/kiosk-launch.sh
+else
+    echo "    (source is install dir — skipping copy)"
+fi
 
-# Deploy scripts (run.sh, kiosk-launch.sh, service file)
-mkdir -p "${INSTALL_DIR}/deploy"
-cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/deploy/"
-cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/deploy/"
+# Service file always goes to systemd location
 cp "${SCRIPT_DIR}"/floor796-kiosk.service "${SERVICE_DST}"
-chmod +x "${INSTALL_DIR}"/deploy/run.sh "${INSTALL_DIR}"/deploy/kiosk-launch.sh
 
 # Create empty assets and cache directories
 mkdir -p "${INSTALL_DIR}/assets/tiles" "${INSTALL_DIR}/assets/holograms"
