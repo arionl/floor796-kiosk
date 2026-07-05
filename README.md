@@ -73,10 +73,16 @@ sudo bash deploy/install.sh
 sudo reboot
 ```
 
-The first boot downloads ~123 MB of tiles, decodes them to frame strips
-(~8 minutes), and builds a content density mask (~2 minutes).  On first
-display, the player also downloads object labels from floor796.com.  All of
-this is cached — subsequent boots take ~20 seconds.
+The installer copies the code and configures the system service — it does
+**not** download any content.  Tiles, labels, and all other assets are
+fetched automatically on the first boot of the player:
+
+- ~123 MB of tiles from floor796.com
+- Object labels (changelog.json)
+- Decoded frame strips (~8 minutes)
+- Content density mask (~2 minutes)
+
+All of this is cached — subsequent boots take ~20 seconds.
 
 ---
 

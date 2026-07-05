@@ -12,14 +12,14 @@
 #   2. Creates a dedicated 'kiosk' user if needed
 #   3. Installs the Python packages (pygame, brotli)
 #   4. Copies the floor796_kiosk package + deploy scripts
-#   5. Downloads the initial tile set (~123 MB)
-#   6. Installs systemd service for cold-boot auto-start
-#   7. Disables desktop, lightdm, and all display sleep / screensaver
+#   5. Installs systemd service for cold-boot auto-start
+#   6. Disables desktop, lightdm, and all display sleep / screensaver
 #
 # On first boot, the player automatically:
+#   - Downloads tiles from floor796.com
 #   - Downloads object labels (changelog.json) from floor796.com
-#   - Builds the content density mask (content_mask.npz)
 #   - Decodes tile animation strips
+#   - Builds the content density mask (content_mask.npz)
 # All cached for subsequent boots.
 #
 set -euo pipefail
@@ -117,17 +117,8 @@ mkdir -p "${INSTALL_DIR}/cache/strips" "${INSTALL_DIR}/cache/thumbnails"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
-# ─── 5. Download tiles (first boot) ──────────────────────────────────────────
-echo "[5/7] Downloading Floor796 tiles (~123 MB)..."
-if [[ ! -f "${INSTALL_DIR}/assets/tiles_meta.json" ]]; then
-    sudo -u "${SERVICE_USER}" python3 -m floor796_kiosk.tile_manager
-    echo "    ✓ Tiles downloaded"
-else
-    echo "    ✓ Tiles already cached (will update on first boot)"
-fi
-
-# ─── 6. Disable desktop & display sleep ──────────────────────────────────────
-echo "[6/7] Configuring kiosk mode..."
+# ─── 5. Disable desktop & display sleep ──────────────────────────────────────
+echo "[5/6] Configuring kiosk mode..."
 
 # Disable lightdm/desktop manager — we run our own bare X server
 systemctl disable lightdm 2>/dev/null || true
@@ -150,8 +141,8 @@ if [[ -f "${CONFIG_TXT}" ]]; then
 fi
 echo "    ✓ Desktop disabled, display sleep prevented"
 
-# ─── 7. Enable kiosk service ─────────────────────────────────────────────────
-echo "[7/7] Enabling kiosk service..."
+# ─── 6. Enable kiosk service ─────────────────────────────────────────────────
+echo "[6/6] Enabling kiosk service..."
 systemctl daemon-reload
 systemctl enable floor796-kiosk.service
 echo "    ✓ Kiosk service enabled (starts on boot)"
