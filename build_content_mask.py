@@ -27,18 +27,25 @@ MASK_COLS = 32   # content mask resolution
 MASK_ROWS = 26   # 820/32 ≈ 31px per cell, 1024/32 = 32px per cell
 
 
-def build_and_save(tiles_meta, output_path, strip_dir=None):
+def build_and_save(tiles_meta, output_path, strip_dir=None, progress_callback=None):
     """Build the content density mask and save to output_path.
-    
+
     Callable from kiosk_player.py at startup when content_mask.npz
     doesn't exist yet.  Uses strip_dir if provided (defaults to the
     module's own directory).
+
+    If progress_callback is provided, it is called as
+    ``progress_callback(done, total, message)`` after each tile is
+    processed, so the caller can render a progress bar.
     """
     global STRIP_DIR
     if strip_dir:
         STRIP_DIR = strip_dir
-    map_mask, _ = build_map_content_mask(tiles_meta)
+    map_mask, _ = build_map_content_mask(tiles_meta, progress_callback=progress_callback)
     np.savez_compressed(output_path, map_mask=map_mask)
+    if progress_callback:
+        progress_callback(len(tiles_meta["tiles"]), len(tiles_meta["tiles"]),
+                          "Saving content mask...")
 
 
 def compute_content_mask(strip_path):
@@ -68,35 +75,39 @@ def compute_content_mask(strip_path):
     return mask
 
 
-def build_map_content_mask(tiles_meta):
+def build_map_content_mask(tiles_meta, progress_callback=None):
     """Build a full-map content mask at tile-block resolution.
-    
+
     Simulates the rendered map: for each position on the map grid,
     determines the content density accounting for tile overlap.
-    
+
     Returns a numpy array of shape (map_rows * MASK_ROWS, map_cols * MASK_COLS)
     where each cell is 0..1 content density.
     """
     grid_rows = tiles_meta.get("grid_rows", 11)
     grid_cols = tiles_meta.get("grid_cols", 10)
-    
+
     # First compute per-tile masks
     tile_masks = {}
-    for tid, info in tiles_meta["tiles"].items():
+    tile_items = list(tiles_meta["tiles"].items())
+    total = len(tile_items)
+    for idx, (tid, info) in enumerate(tile_items):
         if not info.get("animated"):
             tile_masks[tid] = None
-            continue
-        strip_path = os.path.join(STRIP_DIR, f"{tid}.bmp")
-        if not os.path.exists(strip_path):
-            strip_path = os.path.join(STRIP_DIR, f"{tid}.png")
-        if not os.path.exists(strip_path):
-            tile_masks[tid] = None
-            continue
-        try:
-            tile_masks[tid] = compute_content_mask(strip_path)
-        except Exception as e:
-            print(f"  Warning: {tid}: {e}")
-            tile_masks[tid] = None
+        else:
+            strip_path = os.path.join(STRIP_DIR, f"{tid}.bmp")
+            if not os.path.exists(strip_path):
+                strip_path = os.path.join(STRIP_DIR, f"{tid}.png")
+            if not os.path.exists(strip_path):
+                tile_masks[tid] = None
+            else:
+                try:
+                    tile_masks[tid] = compute_content_mask(strip_path)
+                except Exception as e:
+                    print(f"  Warning: {tid}: {e}")
+                    tile_masks[tid] = None
+        if progress_callback:
+            progress_callback(idx + 1, total, "Building content mask")
     
     # Build full map mask
     # Each tile occupies MASK_ROWS x MASK_COLS cells

@@ -1256,12 +1256,18 @@ def main():
 
     # ── Build content density mask (if missing) ──
     if not os.path.exists(CONTENT_MASK_PATH):
-        status.show("Building content mask...", "Optimizing wander path")
         log.info("content_mask.npz not found — building...")
+
+        def _mask_progress(done, total, msg):
+            status.show(msg, f"{done} / {total} tiles",
+                        progress=done / total if total else 0)
+
         try:
             import build_content_mask
             build_content_mask.build_and_save(
-                tiles_meta, CONTENT_MASK_PATH, strip_dir=STRIP_DIR)
+                tiles_meta, CONTENT_MASK_PATH, strip_dir=STRIP_DIR,
+                progress_callback=_mask_progress)
+            status.show("Content mask complete", "", progress=1.0)
             log.info("Content mask built and saved to %s", CONTENT_MASK_PATH)
         except Exception as e:
             log.warning("Could not build content mask (%s) — "
