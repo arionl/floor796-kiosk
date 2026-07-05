@@ -1214,7 +1214,8 @@ def main():
                 status.show("Tiles current")
                 time.sleep(0.5)
         else:
-            status.show("First run — downloading tiles...", "This will take a few minutes")
+            status.show("First run — downloading tiles...",
+                        "This will take a few minutes")
             result = tile_manager.check_and_update(
                 status_callback=lambda done, total, tid, ok: status.show(
                     "Downloading tiles", f"{done} / {total}", progress=done / total)
@@ -1252,6 +1253,19 @@ def main():
     # ── Decode strips ──
     status.show("Checking tile strips...")
     prepare_strips(tiles_meta, status=status, display_depth=16)
+
+    # ── Build content density mask (if missing) ──
+    if not os.path.exists(CONTENT_MASK_PATH):
+        status.show("Building content mask...", "Optimizing wander path")
+        log.info("content_mask.npz not found — building...")
+        try:
+            import build_content_mask
+            build_content_mask.build_and_save(
+                tiles_meta, CONTENT_MASK_PATH, strip_dir=STRIP_DIR)
+            log.info("Content mask built and saved to %s", CONTENT_MASK_PATH)
+        except Exception as e:
+            log.warning("Could not build content mask (%s) — "
+                        "wanderer will use binary animated/blank mask", e)
 
     # ── Build tile grid lookup ──
     tile_grid = {}
@@ -1327,6 +1341,11 @@ def main():
     # ── Object highlighter ──
     object_highlighter = None
     if HIGHLIGHTER_AVAILABLE:
+        changelog_path = os.path.join(BASE_DIR, "changelog.json")
+        if not os.path.exists(changelog_path):
+            status.show("Downloading labels...", "Fetching from floor796.com")
+        else:
+            status.show("Loading labels...")
         try:
             hl_objects = load_objects(
                 tiles_meta,
@@ -1338,6 +1357,8 @@ def main():
                     spacing_w=SPACING_W, spacing_h=SPACING_H)
                 log.info("Object highlighter: %d objects loaded",
                          len(hl_objects))
+            else:
+                log.warning("Object highlighter: no objects loaded")
         except Exception as e:
             log.warning("Object highlighter unavailable: %s", e)
             object_highlighter = None

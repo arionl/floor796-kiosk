@@ -27,6 +27,20 @@ MASK_COLS = 32   # content mask resolution
 MASK_ROWS = 26   # 820/32 ≈ 31px per cell, 1024/32 = 32px per cell
 
 
+def build_and_save(tiles_meta, output_path, strip_dir=None):
+    """Build the content density mask and save to output_path.
+    
+    Callable from kiosk_player.py at startup when content_mask.npz
+    doesn't exist yet.  Uses strip_dir if provided (defaults to the
+    module's own directory).
+    """
+    global STRIP_DIR
+    if strip_dir:
+        STRIP_DIR = strip_dir
+    map_mask, _ = build_map_content_mask(tiles_meta)
+    np.savez_compressed(output_path, map_mask=map_mask)
+
+
 def compute_content_mask(strip_path):
     """Compute a MASK_ROWS x MASK_COLS content density (0..1) from a strip."""
     img = Image.open(strip_path)
@@ -138,31 +152,3 @@ if __name__ == "__main__":
     print(f"Saved to {output_path}")
     print(f"Map mask shape: {map_mask.shape}")
     print(f"Overall content density: {np.mean(map_mask):.1%}")
-    
-    # Print map visualization
-    print("\nContent density map (32x26 per tile):")
-    SPACING_W, SPACING_H = 1016, 812
-    VIEW_W, VIEW_H = 1920, 1200
-    cell_w = TILE_W / MASK_COLS
-    cell_h = TILE_H / MASK_ROWS
-    
-    # Check content ratio at several positions
-    grid_rows = tiles_meta["grid_rows"]
-    grid_cols = tiles_meta["grid_cols"]
-    print(f"\nContent ratio at tile centers (simulated viewport):")
-    print("    " + " ".join(f"  c{c:1d}" for c in range(grid_cols)))
-    for r in range(grid_rows):
-        row_str = f"r{r:2d} "
-        for c in range(grid_cols):
-            # Viewport centered on tile (r,c)
-            vx = c * SPACING_W + TILE_W // 2 - VIEW_W // 2
-            vy = r * SPACING_H + TILE_H // 2 - VIEW_H // 2
-            vx = max(0, vx)
-            vy = max(0, vy)
-            cr = content_ratio_at(map_mask, vx, vy, VIEW_W, VIEW_H,
-                                 SPACING_W, SPACING_H, TILE_W, TILE_H)
-            if (r, c) in {(info["row"], info["col"]) for info in tiles_meta["tiles"].values() if info.get("animated")}:
-                row_str += f" {cr*100:3.0f}%"
-            else:
-                row_str += "    "
-        print(row_str)

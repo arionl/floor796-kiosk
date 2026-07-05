@@ -12,9 +12,15 @@
 #   2. Creates a dedicated 'kiosk' user if needed
 #   3. Installs the Python packages (pygame, brotli)
 #   4. Copies all player, highlighter, stats, and tile modules
-#   5. Downloads tiles + changelog, builds content density mask
+#   5. Downloads the initial tile set (~123 MB)
 #   6. Installs systemd service for cold-boot auto-start
 #   7. Disables desktop, lightdm, and all display sleep / screensaver
+#
+# On first boot, the player automatically:
+#   - Downloads object labels (changelog.json) from floor796.com
+#   - Builds the content density mask (content_mask.npz)
+#   - Decodes tile animation strips
+# All cached for subsequent boots.
 #
 set -euo pipefail
 
@@ -114,35 +120,13 @@ chmod +x "${INSTALL_DIR}"/run.sh "${INSTALL_DIR}"/kiosk-launch.sh
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
-# ─── 5. Download tiles + build content mask ──────────────────────────────────
+# ─── 5. Download tiles (first boot) ──────────────────────────────────────────
 echo "[5/7] Downloading Floor796 tiles (~123 MB)..."
 if [[ ! -f "${INSTALL_DIR}/tiles_meta.json" ]]; then
     sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/tile_manager.py"
     echo "    ✓ Tiles downloaded"
 else
     echo "    ✓ Tiles already cached (will update on first boot)"
-fi
-
-# Download changelog for object highlighter
-if [[ ! -f "${INSTALL_DIR}/changelog.json" ]]; then
-    echo "    Downloading object changelog..."
-    sudo -u "${SERVICE_USER}" python3 -c "
-import urllib.request, json
-url = 'https://floor796.com/data/changelog.json'
-req = urllib.request.Request(url, headers={'User-Agent': 'Floor796-Kiosk/1.0'})
-data = urllib.request.urlopen(req, timeout=30).read()
-with open('${INSTALL_DIR}/changelog.json', 'wb') as f:
-    f.write(data)
-print(f'    ✓ Changelog downloaded ({len(data)} bytes)')
-" || echo "    ⚠ Changelog download failed (highlighter will download on first boot)"
-fi
-
-# Build content density mask for edge-hugging wanderer
-if [[ ! -f "${INSTALL_DIR}/content_mask.npz" ]]; then
-    echo "    Building content density mask..."
-    sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/build_content_mask.py" \
-        2>/dev/null && echo "    ✓ Content mask built" || \
-        echo "    ⚠ Content mask build failed (wanderer will use binary mask)"
 fi
 
 # ─── 6. Disable desktop & display sleep ──────────────────────────────────────
