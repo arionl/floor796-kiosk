@@ -6,10 +6,13 @@ display — designed for Raspberry Pi 5 (4 GB+).
 
 The player boots from cold-start, automatically pans across the full animated
 scene ensuring every tile is visited, and keeps the display on 24/7 with no
-screensaver or sleep.  When the floor796 author publishes new tiles, they are
-automatically downloaded and incorporated on the next boot.
+screensaver or sleep.  As objects scroll into view, the highlighter identifies
+them from floor796.com's changelog, drawing a bounding box and info panel with
+title, date, and thumbnail (YouTube, image, video, or Wikipedia).  When the
+floor796 author publishes new tiles, they are automatically downloaded and
+incorporated on the next boot.
 
-![Floor796 Kiosk](docs/screenshot.png)
+![Floor796 Kiosk — object highlighter](screenshot.png)
 
 ---
 
@@ -19,6 +22,18 @@ automatically downloaded and incorporated on the next boot.
   (no scaling artifacts).
 - **Coverage-weighted wandering** — a visit heat map ensures all 50+ animated
   tiles are toured evenly; a blank-ratio guard keeps the viewport on content.
+- **Object highlighter** — automatically identifies and labels 804 objects from
+  floor796.com's changelog as they scroll into view.  Each highlight shows a
+  bounding box with pulse animation, plus an info panel with title, date, and
+  thumbnail (YouTube, images, video frames, Wikipedia extracts).  Selection uses
+  weighted random sampling with recency rotation so objects cycle evenly.
+- **Telemetry & stats** — in-process HTTP API on `127.0.0.1:8796` provides live
+  metrics: FPS, memory, CPU, tile cache, coverage heatmaps, per-object highlight
+  stats, and more.  An on-screen overlay (toggled with `S`) shows real-time
+  performance, coverage, and label statistics.
+
+  ![Stats overlay](stats_overlay_screenshot.png)
+
 - **Auto-updating tiles** — checks floor796.com for new tiles at startup; falls
   back to cached tiles if offline.
 - **Cold-boot kiosk** — boots directly into the player via systemd; no desktop
@@ -69,12 +84,23 @@ The first boot downloads ~123 MB of tiles and decodes them to frame strips
 floor796-kiosk/
 ├── kiosk_player.py              # Main player (rendering + wandering)
 ├── tile_manager.py              # Tile download + auto-update logic
+├── object_highlighter.py        # Object highlighter (804 objects, selection)
+├── thumbnail_cache.py           # Thumbnail fetcher (YouTube, images, video, wiki)
+├── stats_collector.py           # Telemetry collector (ring buffers, heatmaps)
+├── stats_http.py                # HTTP API server (127.0.0.1:8796)
+├── stats_overlay.py             # On-screen alpha-blended stats overlay
+├── hologram.py                  # Hologram scene overlay
+├── build_content_mask.py        # Offline content density mask generator
 ├── run.sh                       # Boot wrapper (starts bare X server)
 ├── install.sh                   # One-shot installer for fresh Raspbian
 ├── floor796-kiosk.service       # systemd unit (cold-boot auto-start)
 ├── tiles/                       # Downloaded MP4 tiles (gitignored)
 ├── strips/                      # Decoded frame strips (gitignored)
 ├── tiles_meta.json              # Grid metadata (auto-generated)
+├── changelog.json               # Object metadata from floor796.com
+├── content_mask.npz             # Pixel-level content density mask
+├── screenshot.png               # Main screenshot (highlighter)
+├── stats_overlay_screenshot.png # Stats overlay screenshot
 ├── README.md                    # This file
 └── .gitignore
 ```
@@ -116,6 +142,60 @@ Full coverage of all animated tiles is typically achieved in ~25 minutes.
 At startup, `tile_manager.py` fetches `matrix.json` from floor796.com to check
 for new or changed tiles.  If the network is unavailable, it silently falls
 back to the existing cache — the kiosk always boots, online or offline.
+
+### Object Highlighter
+
+The `ObjectHighlighter` class automatically identifies and labels objects from
+floor796.com's changelog (804 objects) as the wanderer brings them into view.
+
+**Selection algorithm** — for each highlight cycle, all objects in the viewport
+are scored on five factors:
+
+| Factor | Description |
+|--------|-------------|
+| Spatial proximity | Objects near viewport center score higher |
+| Edge safety | Objects near screen edges get up to 50% penalty (soft) |
+| Panel exclusion | Objects under the info panel footprint get penalized |
+| Velocity prediction | Objects that would scroll off-screen during the highlight are skipped; objects ahead of the wander direction get a bonus |
+| Recency | Recently-viewed objects get exponentially decaying penalty (10-min half-life); never-viewed objects get 15% bonus |
+
+Instead of always picking the top-scoring object (pure argmax), candidates are
+sampled with probability proportional to `score³` (weighted random sampling).
+This prevents the same first/second/third object on every boot while still
+strongly preferring well-positioned candidates.
+
+**Thumbnail types** — the highlighter fetches and displays:
+
+| Link type | Thumbnail source |
+|-----------|-----------------|
+| YouTube | `mqdefault.jpg` from `img.youtube.com` |
+| Image | Direct download (imgur, etc.) |
+| Video | Frame extraction via `ffmpeg` at ~1s timestamp |
+| Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
+| Web / other | No thumbnail; compact text-only panel |
+
+### Telemetry & Stats API
+
+The player runs a lightweight HTTP server on `127.0.0.1:8796` (stdlib only,
+no external dependencies).  All endpoints return JSON unless noted.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /stats[?window=30m]` | Full telemetry snapshot (FPS, memory, CPU, coverage, wanderer position, highlighter state, label stats) |
+| `GET /health` | 24-hour health trends (RSS, CPU, FPS with min/max/avg) |
+| `GET /heatmap[?window=1h]` | Viewport visit heatmap as a PNG image |
+| `GET /coverage[?window=30m]` | Tile coverage grid with per-tile visit counts |
+| `GET /objects` | Per-object highlight stats (id, title, views, last shown) for all 804 objects |
+| `GET /objects/recent?n=20` | N most recently highlighted objects |
+| `GET /objects/summary?window=30m&limit=10` | Windowed summary: most-viewed, most-recent, coverage % |
+| `POST /overlay` | Toggle on-screen overlay: `{"enabled": true}` |
+| `POST /overlay/window` | Set overlay time window: `{"window": "1h"}` or `{"cycle": true}` |
+
+**On-screen overlay** — press `S` to toggle a semi-transparent stats panel
+showing live FPS, memory, CPU, tile cache status, wanderer position/heading,
+coverage heatmap grid, and label statistics (Top 5 most-viewed, Last 10
+most-recent).  Press `T` to cycle time windows (10min → 30min → 1h → 4h →
+8h → all-time).
 
 ---
 
@@ -183,6 +263,10 @@ When a keyboard/mouse is connected during maintenance:
 | Arrow keys      | Pan manually               |
 | Mouse drag      | Pan manually               |
 | V               | Print coverage stats       |
+| O               | Toggle object highlighter  |
+| L               | Switch label mode (corner/inline) |
+| S               | Toggle stats overlay       |
+| T               | Cycle stats time window    |
 | ESC             | Quit (service will restart)|
 | F               | Toggle fullscreen          |
 
@@ -221,13 +305,14 @@ When a keyboard/mouse is connected during maintenance:
 
 | Metric              | Value (Pi 5, 4 GB)              |
 |---------------------|---------------------------------|
-| Render rate         | 60 fps (vsync)                 |
+| Render rate         | 30 fps (vsync)                 |
 | Animation rate      | 12 fps (60-frame, 5s loop)     |
-| Memory (RSS)        | ~1.9 GB                        |
+| Memory (RSS)        | ~2.7 GB                        |
 | Swap                | 0 MB                           |
-| CPU                 | ~83% (one core)                |
+| CPU                 | ~50% (one core)                |
 | Cold-boot to display| ~20s (warm), ~3 min (first run)|
 | Full coverage       | ~25 minutes                    |
+| Objects highlighted | 804 (100% reachable)           |
 
 ---
 
