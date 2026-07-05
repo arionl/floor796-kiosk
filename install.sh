@@ -8,11 +8,11 @@
 #     sudo bash install.sh
 #
 # What it does:
-#   1. Installs system dependencies (X server, ffmpeg, Python, etc.)
+#   1. Installs system dependencies (X server, ffmpeg, Python, numpy, scrot)
 #   2. Creates a dedicated 'kiosk' user if needed
-#   3. Installs the Python packages (pygame)
-#   4. Copies files to /opt/floor796-kiosk
-#   5. Downloads the initial tile set (~123 MB)
+#   3. Installs the Python packages (pygame, brotli)
+#   4. Copies all player, highlighter, stats, and tile modules
+#   5. Downloads tiles + changelog, builds content density mask
 #   6. Installs systemd service for cold-boot auto-start
 #   7. Disables desktop, lightdm, and all display sleep / screensaver
 #
@@ -55,6 +55,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     python3 \
     python3-pip \
     python3-venv \
+    python3-numpy \
+    scrot \
     mesa-utils \
     libegl-mesa0 \
     libgles2 \
@@ -85,9 +87,26 @@ echo "    ✓ pygame + brotli ready"
 # ─── 4. Copy files ───────────────────────────────────────────────────────────
 echo "[4/7] Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
+
+# Core player + tile management
 cp "${SCRIPT_DIR}"/kiosk_player.py      "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/tile_manager.py      "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/hologram.py          "${INSTALL_DIR}/"
+
+# Object highlighter + thumbnail cache
+cp "${SCRIPT_DIR}"/object_highlighter.py  "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/thumbnail_cache.py     "${INSTALL_DIR}/"
+
+# Telemetry & stats
+cp "${SCRIPT_DIR}"/stats_collector.py   "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/stats_http.py        "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/stats_overlay.py     "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/kiosk_status.py      "${INSTALL_DIR}/"
+
+# Content mask builder (used offline to generate content_mask.npz)
+cp "${SCRIPT_DIR}"/build_content_mask.py "${INSTALL_DIR}/"
+
+# Boot / service scripts
 cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/"
 cp "${SCRIPT_DIR}"/floor796-kiosk.service "${SERVICE_DST}"
@@ -95,13 +114,35 @@ chmod +x "${INSTALL_DIR}"/run.sh "${INSTALL_DIR}"/kiosk-launch.sh
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
-# ─── 5. Download tiles ───────────────────────────────────────────────────────
+# ─── 5. Download tiles + build content mask ──────────────────────────────────
 echo "[5/7] Downloading Floor796 tiles (~123 MB)..."
 if [[ ! -f "${INSTALL_DIR}/tiles_meta.json" ]]; then
     sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/tile_manager.py"
     echo "    ✓ Tiles downloaded"
 else
     echo "    ✓ Tiles already cached (will update on first boot)"
+fi
+
+# Download changelog for object highlighter
+if [[ ! -f "${INSTALL_DIR}/changelog.json" ]]; then
+    echo "    Downloading object changelog..."
+    sudo -u "${SERVICE_USER}" python3 -c "
+import urllib.request, json
+url = 'https://floor796.com/data/changelog.json'
+req = urllib.request.Request(url, headers={'User-Agent': 'Floor796-Kiosk/1.0'})
+data = urllib.request.urlopen(req, timeout=30).read()
+with open('${INSTALL_DIR}/changelog.json', 'wb') as f:
+    f.write(data)
+print(f'    ✓ Changelog downloaded ({len(data)} bytes)')
+" || echo "    ⚠ Changelog download failed (highlighter will download on first boot)"
+fi
+
+# Build content density mask for edge-hugging wanderer
+if [[ ! -f "${INSTALL_DIR}/content_mask.npz" ]]; then
+    echo "    Building content density mask..."
+    sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/build_content_mask.py" \
+        2>/dev/null && echo "    ✓ Content mask built" || \
+        echo "    ⚠ Content mask build failed (wanderer will use binary mask)"
 fi
 
 # ─── 6. Disable desktop & display sleep ──────────────────────────────────────
