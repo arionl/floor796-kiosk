@@ -5,6 +5,18 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.0.1 — Screenshots & README (2026-07-05)
+
+### Added
+- Main screenshot (`screenshot.png`) — highlighter in action with YouTube
+  thumbnail (Sonic the Hedgehog #320).
+- Stats overlay screenshot (`stats_overlay_screenshot.png`) — cropped view of
+  the on-screen telemetry panel with all sections visible.
+- README documentation for object highlighter, telemetry API endpoints,
+  thumbnail types, on-screen overlay, and updated keyboard controls.
+
+---
+
 ## v2.0 — Object highlighter (2026-07-05)
 
 ### Added
