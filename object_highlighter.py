@@ -550,13 +550,17 @@ class ObjectHighlighter:
             if last is not None and (now - last) < RECENT_BLACKLIST:
                 continue
 
-            # Hard skip: bbox must be fully inside the viewport (with
-            # small margin to prevent clipping).  This is the ONLY
-            # hard spatial skip — everything else is a soft penalty.
-            if (seg.abs_x1 < vp_x1 + margin_x or
-                    seg.abs_x2 > vp_x2 - margin_x or
-                    seg.abs_y1 < vp_y1 + margin_y or
-                    seg.abs_y2 > vp_y2 - margin_y):
+            # Hard skip: bbox must be fully inside the viewport.  Use a
+            # reduced margin (1.5%) for the actual pixel-clipping check,
+            # to allow objects that barely overflow the 4% scoring margin
+            # at their only reachable viewport positions (edge-of-map
+            # objects like #383).
+            clip_margin_x = vp_w * 0.015
+            clip_margin_y = vp_h * 0.015
+            if (seg.abs_x1 < vp_x1 + clip_margin_x or
+                    seg.abs_x2 > vp_x2 - clip_margin_x or
+                    seg.abs_y1 < vp_y1 + clip_margin_y or
+                    seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
             # ── Spatial score: 1.0 at center, 0.0 at edges ──
@@ -566,7 +570,7 @@ class ObjectHighlighter:
             spatial_score = max(0.0, 1.0 - dist_sq)
 
             # ── Edge proximity penalty (soft) ──
-            # Distance from viewport edges (normalized 0..1 where 1=edge)
+            # Distance from viewport edges (normalized 0..1 where 1=safe)
             seg_right_dist = (vp_x2 - seg.abs_x2) / edge_zone_x
             seg_left_dist = (seg.abs_x1 - vp_x1) / edge_zone_x
             seg_bottom_dist = (vp_y2 - seg.abs_y2) / edge_zone_y
@@ -607,16 +611,18 @@ class ObjectHighlighter:
                 # Object's future position relative to viewport
                 # (viewport moves, object stays — so relative to
                 # viewport, the object moves backward by predict_dist)
+                clip_m = vp_w * 0.015
                 future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
                 future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
                 future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
                 future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
 
-                # Check if the object would still be visible
-                visible = (future_x2 > margin_x and
-                           future_x1 < self._screen_w - margin_x and
-                           future_y2 > margin_y and
-                           future_y1 < self._screen_h - margin_y)
+                # Check if the object would still be visible (using
+                # the relaxed clip margin)
+                visible = (future_x2 > clip_m and
+                           future_x1 < self._screen_w - clip_m and
+                           future_y2 > clip_m and
+                           future_y1 < self._screen_h - clip_m)
                 if not visible:
                     # Would scroll off — skip this one
                     continue
