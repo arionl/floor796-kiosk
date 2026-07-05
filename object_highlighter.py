@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import random
 import time
 import urllib.request
 
@@ -59,6 +60,15 @@ RECENCY_HALFLIFE = 600.0   # 10 minutes
 RECENT_BLACKLIST = 45.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 RECENT_PENALTY = 0.90      # max score reduction for just-viewed (90%)
 NEVER_VIEWED_BONUS = 1.15  # 15% score boost for never-viewed objects
+
+# Weighted random sampling: instead of always picking the highest-scored
+# object (pure argmax), we sample proportional to score^TEMPERATURE.
+# Higher TEMPERATURE = more deterministic (always picks best).
+# TEMPERATURE = 1.0 = purely proportional to score.
+# TEMPERATURE = 3.0 = heavily favours top candidates but still varies.
+# This prevents the same object always being picked first on startup
+# when all objects have identical recency scores.
+SELECTION_TEMPERATURE = 3.0
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
 CHANGELOG_URL = "https://floor796.com/data/changelog.json"
@@ -537,8 +547,7 @@ class ObjectHighlighter:
         # How far the viewport will move during the highlight
         predict_dist = wander_speed * HIGHLIGHT_DURATION
 
-        best_seg = None
-        best_score = -1.0
+        scored_candidates = []
 
         for seg in candidates:
             # Skip too-small segments
@@ -650,11 +659,40 @@ class ObjectHighlighter:
                      vel_mult *
                      recency)
 
-            if score > best_score:
-                best_score = score
-                best_seg = seg
+            scored_candidates.append((score, seg))
 
-        return best_seg
+        if not scored_candidates:
+            return None
+
+        # Weighted random sampling: sample proportional to score^temperature.
+        # This ensures variety while still strongly preferring high-scoring
+        # objects.  Prevents the same first/third/fifth object on every boot.
+        max_score = max(s for s, _ in scored_candidates)
+        if max_score <= 0:
+            return None
+
+        # Apply temperature: scores are normalized to [0,1] then raised
+        # to the power of TEMPERATURE.  At temp=3, the top candidate is
+        # ~27x more likely than one at half its score, but still not
+        # guaranteed — providing variety across boots.
+        weights = []
+        for score, _ in scored_candidates:
+            normalized = score / max_score
+            weights.append(normalized ** SELECTION_TEMPERATURE)
+
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            # All-zero weights (shouldn't happen) — fall back to uniform
+            return random.choice(scored_candidates)[1]
+
+        r = random.random() * total_weight
+        cumulative = 0.0
+        for weight, (score, seg) in zip(weights, scored_candidates):
+            cumulative += weight
+            if r <= cumulative:
+                return seg
+
+        return scored_candidates[-1][1]
 
     def update(self, dt, pos_x, pos_y, vel_x=0, vel_y=0):
         """Advance the state machine.  Called once per frame.
@@ -1115,7 +1153,7 @@ class ObjectHighlighter:
             "objects": objects,
         }
 
-    def get_windowed_summary(self, window_seconds):
+    def get_windowed_summary(self, window_seconds, limit=5):
         """Return highlighter stats scoped to a time window.
 
         Filters view histories to only counts within the window, then
@@ -1123,8 +1161,8 @@ class ObjectHighlighter:
           - viewed_in_window: unique objects shown
           - total_views: total highlight events
           - coverage_pct: viewed_in_window / total_objects
-          - most_viewed: top 3 objects by view count (with titles)
-          - least_viewed: bottom 3 viewed objects
+          - most_viewed: top  objects by view count (with titles)
+          - least_viewed: bottom  viewed objects
           - recent: last 3 highlighted objects (within window)
         """
         now = time.time()
@@ -1147,7 +1185,7 @@ class ObjectHighlighter:
         sorted_by_count = sorted(window_counts.items(),
                                  key=lambda x: x[1], reverse=True)
         most = []
-        for oid, cnt in sorted_by_count[:3]:
+        for oid, cnt in sorted_by_count[:limit]:
             most.append({
                 "id": oid,
                 "title": self._obj_titles.get(oid, "")[:24],
@@ -1155,7 +1193,7 @@ class ObjectHighlighter:
             })
 
         least = []
-        for oid, cnt in reversed(sorted_by_count[-3:]):
+        for oid, cnt in reversed(sorted_by_count[-limit:]):
             least.append({
                 "id": oid,
                 "title": self._obj_titles.get(oid, "")[:24],
@@ -1166,7 +1204,7 @@ class ObjectHighlighter:
         recent = []
         sorted_by_time = sorted(window_last.items(),
                                 key=lambda x: x[1], reverse=True)
-        for oid, ts in sorted_by_time[:3]:
+        for oid, ts in sorted_by_time[:limit]:
             recent.append({
                 "id": oid,
                 "title": self._obj_titles.get(oid, "")[:24],

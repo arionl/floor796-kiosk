@@ -530,11 +530,11 @@ class StatsCollector:
             return None
         return self._highlighter.get_object_stats()
 
-    def get_windowed_hl_summary(self, window_seconds):
+    def get_windowed_hl_summary(self, window_seconds, limit=5):
         """Return windowed highlighter summary from the highlighter."""
         if self._highlighter is None:
             return None
-        return self._highlighter.get_windowed_summary(window_seconds)
+        return self._highlighter.get_windowed_summary(window_seconds, limit=limit)
 
     def get_recent_highlights(self, n=20):
         """Return N most recently highlighted objects."""

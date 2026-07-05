@@ -225,6 +225,23 @@ class StatsHandler(BaseHTTPRequestHandler):
             recent = collector.get_recent_highlights(n)
             self._send_json({"recent": recent, "count": len(recent)})
 
+        elif path == "/objects/summary":
+            # Windowed summary with customizable limit
+            # ?window=30m&limit=20
+            window = parse_window(params.get("window"))
+            try:
+                limit = int(params.get("limit", "5"))
+            except ValueError:
+                limit = 5
+            limit = max(1, min(limit, 100))
+            if window is None:
+                window = 0  # all-time
+            summary = collector.get_windowed_hl_summary(window, limit=limit)
+            if summary is None:
+                self._send_json({"error": "highlighter not available"}, 503)
+            else:
+                self._send_json(summary)
+
         elif path == "/windows":
             self._send_json({"windows": collector.get_heatmap_windows()})
 

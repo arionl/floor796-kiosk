@@ -672,6 +672,12 @@ class Wanderer:
             avg_col, avg_row = self._grid_cols / 2, self._grid_rows / 2
         self.x = avg_col * SPACING_W + SPACING_W / 2 - view_w / 2
         self.y = avg_row * SPACING_H + SPACING_H / 2 - view_h / 2
+        # Random jitter so every boot doesn't start at the exact same
+        # viewport position — ensures different first-objects highlighted.
+        # ±200px keeps the start inside animated content while providing
+        # enough offset to change which objects are near center.
+        self.x += random.uniform(-200, 200)
+        self.y += random.uniform(-200, 200)
         self.x = max(self.min_x, min(self.max_x, self.x))
         self.y = max(self.min_y, min(self.max_y, self.y))
 
