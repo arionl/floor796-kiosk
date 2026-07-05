@@ -42,30 +42,29 @@ import pygame
 
 # Stats telemetry (optional — degrades gracefully if unavailable)
 try:
-    from stats_collector import StatsCollector
-    from stats_http import start_stats_server
-    from stats_overlay import StatsOverlay
+    from floor796_kiosk.stats import StatsCollector, start_stats_server, StatsOverlay
     STATS_AVAILABLE = True
 except ImportError:
     STATS_AVAILABLE = False
 
 try:
-    from object_highlighter import (load_objects, ObjectHighlighter,
-                                    LABEL_INLINE, LABEL_CORNER)
+    from floor796_kiosk.highlighter import (load_objects, ObjectHighlighter,
+                                            LABEL_INLINE, LABEL_CORNER)
     HIGHLIGHTER_AVAILABLE = True
 except ImportError:
     HIGHLIGHTER_AVAILABLE = False
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TILE_DIR = os.path.join(BASE_DIR, "tiles")
-TILE_META_PATH = os.path.join(BASE_DIR, "tiles_meta.json")
-CONTENT_MASK_PATH = os.path.join(BASE_DIR, "content_mask.npz")
-# Resolution of the per-tile content-density mask (must match build_content_mask.py)
+from floor796_kiosk.paths import (
+    INSTALL_DIR, ASSETS_DIR, TILE_DIR, TILE_META_PATH,
+    CONTENT_MASK_PATH, STRIP_DIR, HOLOGRAM_DIR, CHANGELOG_PATH,
+    THUMBNAIL_DIR, ensure_dirs,
+)
+
+# Resolution of the per-tile content-density mask (must match content_mask.py)
 MASK_COLS = 32
 MASK_ROWS = 26
-STRIP_DIR = os.path.join(BASE_DIR, "strips")
 
 # 0 means auto-detect from the connected display.
 DEFAULT_WIDTH = 0
@@ -1196,10 +1195,11 @@ def main():
 
     status = StatusDisplay(screen)
     status.show("Floor796 Kiosk", "Starting up...")
+    ensure_dirs()
 
     # ── Check for tile updates (graceful offline fallback) ──
     try:
-        import tile_manager
+        from floor796_kiosk import tile_manager
         if tile_manager.has_cached_tiles():
             status.show("Checking for updates...")
             result = tile_manager.check_and_update()
@@ -1263,8 +1263,8 @@ def main():
                         progress=done / total if total else 0)
 
         try:
-            import build_content_mask
-            build_content_mask.build_and_save(
+            from floor796_kiosk.content_mask import build_and_save
+            build_and_save(
                 tiles_meta, CONTENT_MASK_PATH, strip_dir=STRIP_DIR,
                 progress_callback=_mask_progress)
             status.show("Content mask complete", "", progress=1.0)
@@ -1303,9 +1303,8 @@ def main():
     # ── Hologram overlay ──
     hologram = None
     try:
-        from hologram import HologramOverlay
-        holo_cache = os.path.join(BASE_DIR, "holo_cache")
-        hologram = HologramOverlay(holo_cache)
+        from floor796_kiosk.hologram import HologramOverlay
+        hologram = HologramOverlay(HOLOGRAM_DIR)
         hologram.prepare()
         hologram.start_decoder()
     except Exception as e:
@@ -1347,7 +1346,7 @@ def main():
     # ── Object highlighter ──
     object_highlighter = None
     if HIGHLIGHTER_AVAILABLE:
-        changelog_path = os.path.join(BASE_DIR, "changelog.json")
+        changelog_path = CHANGELOG_PATH
         if not os.path.exists(changelog_path):
             status.show("Downloading labels...", "Fetching from floor796.com")
         else:
@@ -1356,7 +1355,7 @@ def main():
             hl_objects = load_objects(
                 tiles_meta,
                 spacing_w=SPACING_W, spacing_h=SPACING_H,
-                data_dir=BASE_DIR)
+                data_dir=ASSETS_DIR)
             if hl_objects:
                 object_highlighter = ObjectHighlighter(
                     hl_objects, args.width, args.height,

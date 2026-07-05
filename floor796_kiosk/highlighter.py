@@ -26,7 +26,7 @@ import urllib.request
 
 import pygame
 
-from thumbnail_cache import ThumbnailCache, classify_link
+from floor796_kiosk.thumbnails import ThumbnailCache, classify_link
 
 log = logging.getLogger("floor796")
 

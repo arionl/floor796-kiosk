@@ -4,6 +4,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --- Performance tuning (avoid swap stutter on 4 GB Pi) ---
 # 1. Lower swappiness — prefer keeping tile surfaces in RAM over swapping.

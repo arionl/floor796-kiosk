@@ -25,9 +25,7 @@ log = logging.getLogger("floor796")
 MATRIX_URL = "https://floor796.com/data/matrix.json"
 CDN_BASE = "https://cdn.floor796.com/data/"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TILE_DIR = os.path.join(BASE_DIR, "tiles")
-TILE_META_PATH = os.path.join(BASE_DIR, "tiles_meta.json")
+from floor796_kiosk.paths import TILE_DIR, TILE_META_PATH, ensure_dirs
 
 NETWORK_TIMEOUT = 15
 
@@ -43,6 +41,7 @@ def check_and_update(status_callback=None):
         offline (bool)    — True if network was unavailable.
         total_tiles (int) — total tiles after update.
     """
+    ensure_dirs()
     matrix = _fetch_matrix()
     if matrix is None:
         log.info("Offline or unreachable — using cached tiles.")

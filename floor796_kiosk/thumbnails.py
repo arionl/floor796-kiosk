@@ -33,7 +33,7 @@ log = logging.getLogger("floor796")
 BASE_URL = "https://floor796.com"
 THUMB_W = 320          # target width in pixels
 THUMB_H = 200          # target height in pixels
-CACHE_DIR = "thumbs"   # directory for cached thumbnails
+from floor796_kiosk.paths import THUMBNAIL_DIR as CACHE_DIR
 MAX_FETCH_WORKERS = 2  # concurrent fetch threads
 REQUEST_TIMEOUT = 8    # seconds
 

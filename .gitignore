@@ -1,13 +1,21 @@
-# Downloaded / generated assets — not tracked in git
+# Downloaded assets — cached locally, not tracked in git
+assets/
+# Generated cache — rebuilt automatically, not tracked in git
+cache/
+# Legacy directories (pre-refactor)
 tiles/
 strips/
 holo_cache/
+thumbs/
 tiles_meta.json
 content_mask.npz
+changelog.json
 
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+.venv/
 venv/
 
 # OS
@@ -17,3 +25,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Simulation outputs
+wander_heatmap*.png

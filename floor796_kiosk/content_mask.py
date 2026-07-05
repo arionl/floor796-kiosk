@@ -19,8 +19,8 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 300000000
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STRIP_DIR = os.path.join(BASE_DIR, "strips")
+from floor796_kiosk.paths import STRIP_DIR as _DEFAULT_STRIP_DIR, CONTENT_MASK_PATH, TILE_META_PATH
+
 TILE_W = 1024
 TILE_H = 820
 MASK_COLS = 32   # content mask resolution
@@ -30,17 +30,16 @@ MASK_ROWS = 26   # 820/32 ≈ 31px per cell, 1024/32 = 32px per cell
 def build_and_save(tiles_meta, output_path, strip_dir=None, progress_callback=None):
     """Build the content density mask and save to output_path.
 
-    Callable from kiosk_player.py at startup when content_mask.npz
+    Callable from player.py at startup when content_mask.npz
     doesn't exist yet.  Uses strip_dir if provided (defaults to the
-    module's own directory).
+    configured cache directory).
 
     If progress_callback is provided, it is called as
     ``progress_callback(done, total, message)`` after each tile is
     processed, so the caller can render a progress bar.
     """
     global STRIP_DIR
-    if strip_dir:
-        STRIP_DIR = strip_dir
+    STRIP_DIR = strip_dir or _DEFAULT_STRIP_DIR
     map_mask, _ = build_map_content_mask(tiles_meta, progress_callback=progress_callback)
     np.savez_compressed(output_path, map_mask=map_mask)
     if progress_callback:
@@ -150,16 +149,13 @@ def content_ratio_at(map_mask, x, y, view_w, view_h,
 
 
 if __name__ == "__main__":
-    meta_path = os.path.join(BASE_DIR, "tiles_meta.json")
-    with open(meta_path) as f:
+    with open(TILE_META_PATH) as f:
         tiles_meta = json.load(f)
-    
+
     print("Building content density map...")
-    map_mask, tile_masks = build_map_content_mask(tiles_meta)
-    
-    # Save
-    output_path = os.path.join(BASE_DIR, "content_mask.npz")
-    np.savez_compressed(output_path, map_mask=map_mask)
-    print(f"Saved to {output_path}")
+    build_and_save(tiles_meta, CONTENT_MASK_PATH,
+                   progress_callback=lambda d, t, m: print(f"\r{m}: {d}/{t}", end=""))
+    map_mask = np.load(CONTENT_MASK_PATH)["map_mask"]
+    print(f"\nSaved to {CONTENT_MASK_PATH}")
     print(f"Map mask shape: {map_mask.shape}")
     print(f"Overall content density: {np.mean(map_mask):.1%}")

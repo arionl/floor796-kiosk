@@ -11,7 +11,7 @@
 #   1. Installs system dependencies (X server, ffmpeg, Python, numpy, scrot)
 #   2. Creates a dedicated 'kiosk' user if needed
 #   3. Installs the Python packages (pygame, brotli)
-#   4. Copies all player, highlighter, stats, and tile modules
+#   4. Copies the floor796_kiosk package + deploy scripts
 #   5. Downloads the initial tile set (~123 MB)
 #   6. Installs systemd service for cold-boot auto-start
 #   7. Disables desktop, lightdm, and all display sleep / screensaver
@@ -25,6 +25,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/floor796-kiosk}"
 SERVICE_USER="kiosk"
 SERVICE_SRC="${SCRIPT_DIR}/floor796-kiosk.service"
@@ -33,7 +34,7 @@ SERVICE_DST="/etc/systemd/system/floor796-kiosk.service"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Floor796 Kiosk Installer"
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Source:      ${SCRIPT_DIR}"
+echo "  Source:      ${SOURCE_DIR}"
 echo "  Install dir: ${INSTALL_DIR}"
 echo ""
 
@@ -43,8 +44,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ ! -f "${SCRIPT_DIR}/kiosk_player.py" ]]; then
-    echo "ERROR: kiosk_player.py not found in ${SCRIPT_DIR}"
+if [[ ! -f "${SOURCE_DIR}/floor796_kiosk/player.py" ]]; then
+    echo "ERROR: floor796_kiosk/player.py not found in ${SOURCE_DIR}"
     exit 1
 fi
 
@@ -94,36 +95,27 @@ echo "    ✓ pygame + brotli ready"
 echo "[4/7] Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 
-# Core player + tile management
-cp "${SCRIPT_DIR}"/kiosk_player.py      "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/tile_manager.py      "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/hologram.py          "${INSTALL_DIR}/"
+# Python package (all modules live under floor796_kiosk/)
+cp -r "${SOURCE_DIR}/floor796_kiosk" "${INSTALL_DIR}/"
 
-# Object highlighter + thumbnail cache
-cp "${SCRIPT_DIR}"/object_highlighter.py  "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/thumbnail_cache.py     "${INSTALL_DIR}/"
-
-# Telemetry & stats
-cp "${SCRIPT_DIR}"/stats_collector.py   "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/stats_http.py        "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/stats_overlay.py     "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/kiosk_status.py      "${INSTALL_DIR}/"
-
-# Content mask builder (used offline to generate content_mask.npz)
-cp "${SCRIPT_DIR}"/build_content_mask.py "${INSTALL_DIR}/"
-
-# Boot / service scripts
-cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/"
+# Deploy scripts (run.sh, kiosk-launch.sh, service file)
+mkdir -p "${INSTALL_DIR}/deploy"
+cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/deploy/"
+cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/deploy/"
 cp "${SCRIPT_DIR}"/floor796-kiosk.service "${SERVICE_DST}"
-chmod +x "${INSTALL_DIR}"/run.sh "${INSTALL_DIR}"/kiosk-launch.sh
+chmod +x "${INSTALL_DIR}"/deploy/run.sh "${INSTALL_DIR}"/deploy/kiosk-launch.sh
+
+# Create empty assets and cache directories
+mkdir -p "${INSTALL_DIR}/assets/tiles" "${INSTALL_DIR}/assets/holograms"
+mkdir -p "${INSTALL_DIR}/cache/strips" "${INSTALL_DIR}/cache/thumbnails"
+
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
 # ─── 5. Download tiles (first boot) ──────────────────────────────────────────
 echo "[5/7] Downloading Floor796 tiles (~123 MB)..."
-if [[ ! -f "${INSTALL_DIR}/tiles_meta.json" ]]; then
-    sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/tile_manager.py"
+if [[ ! -f "${INSTALL_DIR}/assets/tiles_meta.json" ]]; then
+    sudo -u "${SERVICE_USER}" python3 -m floor796_kiosk.tile_manager
     echo "    ✓ Tiles downloaded"
 else
     echo "    ✓ Tiles already cached (will update on first boot)"
