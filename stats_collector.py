@@ -504,7 +504,7 @@ class StatsCollector:
 
                 # Windowed summary (scoped to the overlay's time window)
                 win_secs = self._window_to_seconds(self.overlay_window)
-                wl = hl.get_windowed_summary(win_secs)
+                wl = hl.get_windowed_summary(win_secs, limit=10)
                 result["hl_window"] = {
                     "viewed": wl["viewed_in_window"],
                     "total": wl["total_objects"],
