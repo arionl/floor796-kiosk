@@ -34,8 +34,22 @@ log = logging.getLogger("floor796")
 HIGHLIGHT_DURATION = 10.0  # seconds an object is shown
 PAUSE_DURATION = 2.0       # seconds between objects
 MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
-EDGE_MARGIN = 0.15         # fraction of viewport — objects within this
-                           # fraction of any edge are deprioritized
+EDGE_MARGIN = 0.04         # hard margin — bbox must be at least this
+                           # far inside the viewport (4%) to prevent
+                           # it from being partially off-screen
+EDGE_PENALTY = 0.50        # score reduction for objects near edges
+
+# Panel exclusion: the info panel occupies the bottom-right corner.
+# Objects whose bbox falls under the panel footprint are penalized.
+# Panel is at most 360px wide + 20px margin, ~340px tall + 20px margin.
+PANEL_EXCLUDE_W = 380
+PANEL_EXCLUDE_H = 360
+PANEL_EXCLUDE_PENALTY = 0.30  # up to 70% score reduction if under panel
+
+# Wander velocity prediction: when the viewport is moving, predict
+# where the object will be relative to the viewport at the end of the
+# highlight duration.  If it would scroll off, penalize heavily.
+WANDER_SPEED_DEFAULT = 15.0   # px/s — fallback if no velocity given
 
 # Recency-weighted selection: prefer objects not recently viewed.
 # After RECENCY_HALFLIFE seconds, a previously-viewed object's penalty
@@ -475,37 +489,56 @@ class ObjectHighlighter:
         penalty = RECENT_PENALTY * (0.5 ** (elapsed / RECENCY_HALFLIFE))
         return max(0.05, 1.0 - penalty)
 
-    def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2):
+    def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2,
+                        vel_x=0, vel_y=0):
         """Select the best segment to highlight in the current viewport.
 
-        Scoring combines two factors:
-          1. Spatial: bias toward segments near the viewport center,
-             deprioritize segments near edges.
-          2. Recency: prefer objects not recently viewed. Never-viewed
-             objects get a bonus; recently-viewed objects get a penalty
-             that decays exponentially over RECENCY_HALFLIFE.
+        Scoring factors:
+          1. Spatial proximity to viewport center (primary).
+          2. Edge safety: soft penalty for objects near viewport edges.
+             Only hard-skips if the bbox would be partially off-screen
+             (< EDGE_MARGIN inside).
+          3. Panel exclusion: penalize objects under the bottom-right
+             panel footprint (where the info panel renders).
+          4. Velocity prediction: penalize objects that would scroll
+             off-screen during the highlight duration based on wander
+             velocity.  Objects ahead of the viewport (will move toward
+             center) get a bonus.
+          5. Recency: prefer not-recently-viewed objects.
 
-        Objects within RECENT_BLACKLIST seconds are skipped entirely
-        (hard cooldown) to prevent immediate repeats.
+        Objects within RECENT_BLACKLIST seconds are skipped entirely.
         """
         candidates = self._index.query_viewport(vp_x1, vp_y1, vp_x2, vp_y2)
         if not candidates:
             return None
 
         now = time.time()
-        vp_cx = (vp_x1 + vp_x2) / 2
-        vp_cy = (vp_y1 + vp_y2) / 2
         vp_w = vp_x2 - vp_x1
         vp_h = vp_y2 - vp_y1
+        vp_cx = (vp_x1 + vp_x2) / 2
+        vp_cy = (vp_y1 + vp_y2) / 2
 
-        # Edge-safe zone: segments must be at least EDGE_MARGIN inside
-        edge_safe_x1 = vp_x1 + vp_w * EDGE_MARGIN
-        edge_safe_y1 = vp_y1 + vp_h * EDGE_MARGIN
-        edge_safe_x2 = vp_x2 - vp_w * EDGE_MARGIN
-        edge_safe_y2 = vp_y2 - vp_h * EDGE_MARGIN
+        # Hard margin — bbox must be at least this far inside to be
+        # fully visible.  This is small (4%) just to prevent clipping.
+        margin_x = vp_w * EDGE_MARGIN
+        margin_y = vp_h * EDGE_MARGIN
+
+        # Edge penalty zone: between hard margin and 20% from edge,
+        # objects get a progressively heavier penalty.
+        edge_zone_x = vp_w * 0.20
+        edge_zone_y = vp_h * 0.20
+
+        # Panel footprint in screen coords (bottom-right corner)
+        panel_x1 = self._screen_w - PANEL_EXCLUDE_W
+        panel_y1 = self._screen_h - PANEL_EXCLUDE_H
+
+        # Wander speed for prediction
+        wander_speed = math.hypot(vel_x, vel_y)
+        # How far the viewport will move during the highlight
+        predict_dist = wander_speed * HIGHLIGHT_DURATION
 
         best_seg = None
-        best_score = -1
+        best_score = -1.0
 
         for seg in candidates:
             # Skip too-small segments
@@ -517,21 +550,99 @@ class ObjectHighlighter:
             if last is not None and (now - last) < RECENT_BLACKLIST:
                 continue
 
-            # Skip segments that aren't within the edge-safe zone
-            if (seg.abs_x2 < edge_safe_x1 or seg.abs_x1 > edge_safe_x2 or
-                    seg.abs_y2 < edge_safe_y1 or seg.abs_y1 > edge_safe_y2):
+            # Hard skip: bbox must be fully inside the viewport (with
+            # small margin to prevent clipping).  This is the ONLY
+            # hard spatial skip — everything else is a soft penalty.
+            if (seg.abs_x1 < vp_x1 + margin_x or
+                    seg.abs_x2 > vp_x2 - margin_x or
+                    seg.abs_y1 < vp_y1 + margin_y or
+                    seg.abs_y2 > vp_y2 - margin_y):
                 continue
 
-            # Spatial score: 1.0 at center, 0.0 at viewport corners
-            dx = (seg.cx - vp_cx) / vp_w
-            dy = (seg.cy - vp_cy) / vp_h
+            # ── Spatial score: 1.0 at center, 0.0 at edges ──
+            dx = (seg.cx - vp_cx) / (vp_w / 2)
+            dy = (seg.cy - vp_cy) / (vp_h / 2)
             dist_sq = dx * dx + dy * dy
-            spatial_score = 1.0 - dist_sq
+            spatial_score = max(0.0, 1.0 - dist_sq)
 
-            # Recency multiplier
+            # ── Edge proximity penalty (soft) ──
+            # Distance from viewport edges (normalized 0..1 where 1=edge)
+            seg_right_dist = (vp_x2 - seg.abs_x2) / edge_zone_x
+            seg_left_dist = (seg.abs_x1 - vp_x1) / edge_zone_x
+            seg_bottom_dist = (vp_y2 - seg.abs_y2) / edge_zone_y
+            seg_top_dist = (seg.abs_y1 - vp_y1) / edge_zone_y
+            min_edge_dist = min(seg_right_dist, seg_left_dist,
+                                seg_bottom_dist, seg_top_dist)
+            if min_edge_dist < 1.0:
+                edge_mult = 1.0 - EDGE_PENALTY * (1.0 - min_edge_dist)
+            else:
+                edge_mult = 1.0
+
+            # ── Panel overlap penalty ──
+            # Convert bbox to screen coords
+            sx1 = seg.abs_x1 - vp_x1
+            sy1 = seg.abs_y1 - vp_y1
+            sx2 = seg.abs_x2 - vp_x1
+            sy2 = seg.abs_y2 - vp_y1
+            # Compute overlap fraction with panel footprint
+            ox1 = max(sx1, panel_x1)
+            oy1 = max(sy1, panel_y1)
+            ox2 = min(sx2, self._screen_w)
+            oy2 = min(sy2, self._screen_h)
+            if ox2 > ox1 and oy2 > oy1:
+                overlap_area = (ox2 - ox1) * (oy2 - oy1)
+                seg_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                overlap_frac = overlap_area / seg_area
+                panel_mult = 1.0 - PANEL_EXCLUDE_PENALTY * overlap_frac
+            else:
+                panel_mult = 1.0
+
+            # ── Velocity prediction ──
+            # At 15px/s over 10s, the viewport moves 150px.
+            # An object near the leading edge will move toward center
+            # (good).  An object near the trailing edge will scroll off
+            # (bad).  We predict where the bbox will be relative to the
+            # viewport at t+HIGHLIGHT_DURATION.
+            if predict_dist > 1:
+                # Object's future position relative to viewport
+                # (viewport moves, object stays — so relative to
+                # viewport, the object moves backward by predict_dist)
+                future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
+                future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
+                future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
+                future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
+
+                # Check if the object would still be visible
+                visible = (future_x2 > margin_x and
+                           future_x1 < self._screen_w - margin_x and
+                           future_y2 > margin_y and
+                           future_y1 < self._screen_h - margin_y)
+                if not visible:
+                    # Would scroll off — skip this one
+                    continue
+
+                # Bonus for objects ahead of the viewport (moving toward
+                # center): the further ahead, the more it'll be centered
+                # during the highlight
+                future_cx = (future_x1 + future_x2) / 2
+                future_cy = (future_y1 + future_y2) / 2
+                future_center_dist = math.hypot(
+                    (future_cx - self._screen_w / 2) / (self._screen_w / 2),
+                    (future_cy - self._screen_h / 2) / (self._screen_h / 2))
+                # Objects that will be MORE centered get a small bonus
+                vel_mult = 1.0 + 0.10 * max(0, 1.0 - future_center_dist)
+            else:
+                vel_mult = 1.0
+
+            # ── Recency multiplier ──
             recency = self._recency_score(seg.obj_id, now)
 
-            score = spatial_score * recency
+            # ── Combined score ──
+            score = (spatial_score *
+                     edge_mult *
+                     panel_mult *
+                     vel_mult *
+                     recency)
 
             if score > best_score:
                 best_score = score
@@ -539,8 +650,13 @@ class ObjectHighlighter:
 
         return best_seg
 
-    def update(self, dt, pos_x, pos_y):
-        """Advance the state machine.  Called once per frame."""
+    def update(self, dt, pos_x, pos_y, vel_x=0, vel_y=0):
+        """Advance the state machine.  Called once per frame.
+
+        vel_x, vel_y: viewport velocity in pixels/sec (from wanderer).
+        Used to predict whether candidate objects will stay visible
+        for the full highlight duration.
+        """
         if not self.enabled:
             return
 
@@ -552,7 +668,8 @@ class ObjectHighlighter:
         self._timer += dt
 
         if self._state == STATE_IDLE:
-            seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2)
+            seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2,
+                                        vel_x, vel_y)
             if seg:
                 self._current_seg = seg
                 self._state = STATE_HIGHLIGHT

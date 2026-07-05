@@ -1393,7 +1393,13 @@ def main():
 
         # Object highlighter state machine
         if object_highlighter:
-            object_highlighter.update(dt, pos_x, pos_y)
+            hl_vel_x = 0
+            hl_vel_y = 0
+            if wandering:
+                hv = wanderer.heading()
+                hl_vel_x, hl_vel_y = hv[0], hv[1]
+            object_highlighter.update(dt, pos_x, pos_y,
+                                       hl_vel_x, hl_vel_y)
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
