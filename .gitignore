@@ -3,6 +3,7 @@ tiles/
 strips/
 holo_cache/
 tiles_meta.json
+content_mask.npz
 
 # Python
 __pycache__/
