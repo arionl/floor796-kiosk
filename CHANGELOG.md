@@ -5,6 +5,65 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.0 — Object highlighter (2026-07-05)
+
+### Added
+- **Automatic object highlighter** (`object_highlighter.py`) — identifies
+  and labels objects from floor796.com's changelog as the wanderer moves
+  through the map. 804 objects indexed with bounding boxes, titles, dates,
+  and optional media links.
+  - **Weighted random selection** — candidates scored by spatial proximity,
+    edge safety, panel exclusion, velocity prediction, and recency. Sampling
+    proportional to score³ (temperature=3) prevents the same first/second/
+    third object on every boot while still strongly preferring well-positioned
+    candidates.
+  - **Recency-weighted rotation** — exponential decay (10-min half-life).
+    Never-viewed objects get 15% bonus. 45-second hard cooldown prevents
+    immediate repeats.
+  - **Soft edge scoring** — 4% hard margin for pixel clipping only; objects
+    in the 4–20% zone get up to 50% score penalty but remain selectable.
+    Relaxed 1.5% clip margin ensures edge-of-map objects (e.g. #383) are
+    reachable. All 804 objects (100%) are reachable.
+  - **Velocity prediction** — predicts object position at end of highlight
+    duration based on wander speed/direction. Skips objects that would scroll
+    off-screen. Objects ahead of viewport direction get 10% bonus.
+  - **Panel exclusion** — objects overlapping the bottom-right info panel
+    footprint get up to 30% score penalty.
+  - **Thumbnail support** (`thumbnail_cache.py`) — images, YouTube
+    (mqdefault), video frame extraction via ffmpeg, and Wikipedia REST API
+    (thumbnail + text extract). Background fetching with animated placeholder.
+  - **Pulse animation** — 1.8s expanding glow halos at highlight start to
+    draw attention, settling into a steady outline.
+  - **Corner info panel** — title (2-line word-wrap), date, thumbnail,
+    Wikipedia extract (3-line), link type indicator, and progress bar.
+  - **Single bounding box per object** — computed from min/max of all polygon
+    vertices, avoiding per-tile fragmentation.
+- **Highlighter telemetry** —
+  - `GET /objects` — full per-object stats (id, title, views, last_shown).
+  - `GET /objects/recent?n=20` — N most recently highlighted.
+  - `GET /objects/summary?window=30m&limit=10` — windowed summary with
+    most_viewed, recent, and coverage stats. Customizable limit (1–100).
+- **Label stats in overlay** — Top (5 most viewed) and Last (10 most recent)
+  sections with dynamic pixel-based title truncation and right-aligned
+  counters/time values. Windowed to match overlay's time window selection.
+- **Wanderer start jitter** (±200px) — different viewport position each boot
+  for highlighter variety.
+
+### Changed
+- Stats overlay moved to left side (`panel_x = 0`) to avoid overlap with
+  the highlighter's bottom-right info panel.
+- Label stats titles pass through full (untruncated) from the data layer;
+  the overlay renderer handles pixel-based truncation with ellipsis.
+
+### Fixed
+- **Deterministic selection** — pure argmax meant same first/third/fifth
+  object on every boot. Replaced with weighted random sampling.
+- **1.5% clip margin** — edge-of-map objects that barely overflowed the 4%
+  scoring margin at their only reachable viewport positions are now
+  selectable (was: permanently unreachable).
+
+---
+
 ## v1.4 — Telemetry & stats overlay (2026-07-04)
 
 ### Added

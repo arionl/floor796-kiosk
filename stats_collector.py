@@ -291,6 +291,35 @@ class StatsCollector:
         # CPU sampling
         self._last_cpu_time = None
 
+        # Object highlighter reference (set by main loop)
+        self._highlighter = None
+
+    def set_highlighter(self, highlighter):
+        """Attach the ObjectHighlighter for object telemetry queries."""
+        self._highlighter = highlighter
+
+    @staticmethod
+    def _window_to_seconds(window_name):
+        """Convert a heatmap window name ('30min', '1h', 'all') to seconds.
+
+        'all' returns 0, which the highlighter treats as "no cutoff"
+        (include entire history).
+        """
+        if not window_name or window_name == "all":
+            return 0
+        name = window_name.lower()
+        multipliers = {"min": 60, "h": 3600, "s": 1}
+        for suffix, mult in multipliers.items():
+            if name.endswith(suffix):
+                try:
+                    return int(name[:-len(suffix)]) * mult
+                except ValueError:
+                    pass
+        try:
+            return int(name)
+        except ValueError:
+            return 0
+
     @property
     def start_time(self):
         return self._start_time
@@ -457,6 +486,35 @@ class StatsCollector:
                 result["rss_8h_ago"] = rss_trend[1]
                 result["rss_trend_pct"] = rss_trend[2]
 
+            # Object highlighter summary
+            hl = self._highlighter
+            if hl is not None:
+                hl_state = hl.get_state()
+                result["hl_state"] = hl_state.get("hl_state")
+                result["hl_current"] = hl_state.get("hl_current")
+                result["hl_current_id"] = hl_state.get("hl_current_id")
+                result["hl_shown"] = hl_state.get("hl_shown", 0)
+                result["hl_enabled"] = hl_state.get("hl_enabled", True)
+                # Coverage stats (lightweight — just counts)
+                obj_stats = hl.get_object_stats()
+                result["hl_total_objects"] = obj_stats["total_objects"]
+                result["hl_viewed_objects"] = obj_stats["viewed_objects"]
+                result["hl_never_viewed"] = obj_stats["never_viewed"]
+                result["hl_coverage_pct"] = round(obj_stats["coverage_pct"], 1)
+
+                # Windowed summary (scoped to the overlay's time window)
+                win_secs = self._window_to_seconds(self.overlay_window)
+                wl = hl.get_windowed_summary(win_secs, limit=10)
+                result["hl_window"] = {
+                    "viewed": wl["viewed_in_window"],
+                    "total": wl["total_objects"],
+                    "total_views": wl["total_views"],
+                    "coverage_pct": round(wl["coverage_pct"], 1),
+                    "most_viewed": wl["most_viewed"],
+                    "least_viewed": wl["least_viewed"],
+                    "recent": wl["recent"],
+                }
+
             return result
 
     def get_heatmap(self, window_name="all"):
@@ -465,6 +523,24 @@ class StatsCollector:
             return (self._heatmap.get_grid(window_name).copy(),
                     self._heatmap.resolution,
                     self._heatmap.shape)
+
+    def get_object_stats(self):
+        """Return full per-object view statistics from the highlighter."""
+        if self._highlighter is None:
+            return None
+        return self._highlighter.get_object_stats()
+
+    def get_windowed_hl_summary(self, window_seconds, limit=5):
+        """Return windowed highlighter summary from the highlighter."""
+        if self._highlighter is None:
+            return None
+        return self._highlighter.get_windowed_summary(window_seconds, limit=limit)
+
+    def get_recent_highlights(self, n=20):
+        """Return N most recently highlighted objects."""
+        if self._highlighter is None:
+            return []
+        return self._highlighter.get_recent_highlights(n)
 
     def get_heatmap_windows(self):
         return self._heatmap.get_window_names()
