@@ -1232,9 +1232,9 @@ def main():
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # At 4K, SCALED adds overhead (offscreen render + GPU copy) without
-    # benefit when there's no hardware GL.  Use plain FULLSCREEN for 4K,
-    # SCALED for 1080p (enables GPU page-flip + vsync on smaller buffers).
+    # At 4K, use plain FULLSCREEN (direct framebuffer) for best performance.
+    # SCALED adds GL compositing overhead that's slower than direct blitting
+    # on this hardware.  At 1080p, SCALED enables GPU page-flip + vsync.
     if args.width > 3000:
         flags = pygame.FULLSCREEN if args.fullscreen else 0
     else:
