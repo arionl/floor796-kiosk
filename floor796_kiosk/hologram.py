@@ -451,6 +451,11 @@ class HologramOverlay:
         to pick up and convert to pygame surfaces (which must happen on
         the main thread).
         """
+        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
+        # No-op on homogeneous SoCs like the Raspberry Pi 5.
+        from floor796_kiosk.cpu_affinity import pin_background_thread
+        pin_background_thread("hologram_decoder")
+
         # Deprioritize so we never starve the render loop
         try:
             os.setpriority(os.PRIO_PROCESS, 0, 10)

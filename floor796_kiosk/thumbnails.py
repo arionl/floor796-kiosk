@@ -356,6 +356,11 @@ class ThumbnailCache:
 
     def _fetch_worker(self, obj_id, url, cache_file):
         """Background fetch: download image, resize, save to disk, cache."""
+        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
+        # No-op on homogeneous SoCs like the Raspberry Pi 5.
+        from floor796_kiosk.cpu_affinity import pin_background_thread
+        pin_background_thread("thumb_fetch")
+
         try:
             link_type, _ = classify_link(url)
 

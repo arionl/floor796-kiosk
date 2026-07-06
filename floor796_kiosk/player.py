@@ -62,6 +62,10 @@ from floor796_kiosk.paths import (
     THUMBNAIL_DIR, ensure_dirs,
 )
 
+from floor796_kiosk.cpu_affinity import (
+    pin_main_thread, pin_background_thread, get_affinity_info,
+)
+
 # Resolution of the per-tile content-density mask (must match content_mask.py)
 MASK_COLS = 32
 MASK_ROWS = 26
@@ -288,6 +292,10 @@ class TileCache:
         self._stop_flag = False
 
     def _worker_loop(self):
+        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
+        # No-op on homogeneous SoCs like the Raspberry Pi 5.
+        pin_background_thread("tile_cache")
+
         # Lower this thread's OS priority so it never starves the render loop
         try:
             os.setpriority(os.PRIO_PROCESS, 0, 10)
@@ -1165,6 +1173,10 @@ def main():
         stream=sys.stdout,
     )
 
+    # Pin main thread to fast cores on big.LITTLE SoCs (e.g. OrangePi 5 Max).
+    # No-op on homogeneous SoCs like the Raspberry Pi 5.
+    pin_main_thread()
+
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
 
@@ -1551,6 +1563,7 @@ def main():
                 "scale_mode": ("4k-native" if args.width > 3000
                                else "4k-xrandr" if physical_w > 3000
                                else "native"),
+                "cpu_affinity": get_affinity_info(),
             })
 
         # ── Render ──
