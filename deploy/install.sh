@@ -85,11 +85,11 @@ usermod -aG video,render,input,tty "${SERVICE_USER}" 2>/dev/null || true
 
 # ─── 3. Install pygame ───────────────────────────────────────────────────────
 echo "[3/7] Installing Python packages..."
-if ! python3 -c "import pygame, brotli" 2>/dev/null; then
-    pip3 install --break-system-packages pygame-ce brotli 2>/dev/null || \
-    pip3 install pygame-ce brotli
+if ! python3 -c "import pygame, brotli, PIL" 2>/dev/null; then
+    pip3 install --break-system-packages pygame-ce brotli pillow 2>/dev/null || \
+    pip3 install pygame-ce brotli pillow
 fi
-echo "    ✓ pygame + brotli ready"
+echo "    ✓ pygame + brotli + pillow ready"
 
 # ─── 4. Copy files ───────────────────────────────────────────────────────────
 echo "[4/7] Installing to ${INSTALL_DIR}..."

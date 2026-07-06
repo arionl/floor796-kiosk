@@ -598,6 +598,7 @@ class Wanderer:
                     self.animated_tiles.add(rc)
 
         # Load pixel-level content density mask if available
+        self.content_bounds = None
         try:
             if os.path.exists(CONTENT_MASK_PATH):
                 npz = np.load(CONTENT_MASK_PATH)
@@ -643,7 +644,6 @@ class Wanderer:
         except Exception as e:
             log.warning("Could not load content_mask.npz (%s) - "
                        "using binary animated/blank", e)
-            self.content_bounds = None
 
         self.map_w = map_w
         self.map_h = map_h
