@@ -53,8 +53,20 @@ def detect_big_little():
     """Detect big.LITTLE CPU topology.
 
     Returns (fast_cores, slow_cores) tuples:
-      - fast_cores: set of CPU IDs for the highest-frequency cluster
-      - slow_cores: set of CPU IDs for the lowest-frequency cluster
+      - fast_cores: set of CPU IDs for non-slowest clusters (mid + big)
+      - slow_cores: set of CPU IDs for the slowest cluster (little)
+
+    On the OrangePi 5 Max (RK3588):
+      - fast_cores = {4, 5, 6, 7}  (Cortex-A76 @ 2.26-2.30 GHz)
+      - slow_cores = {0, 1, 2, 3}  (Cortex-A55 @ 1.80 GHz)
+
+    Background threads are pinned to slow_cores. The main thread is
+    left unrestricted — it inherits the default affinity (all cores).
+    This is intentional: llvmpipe (software rendering) spawns worker
+    threads that inherit the main thread's affinity, and it needs access
+    to all cores for maximum rendering throughput. The key optimization
+    is keeping background tasks *off* the fast cores, not restricting
+    the main thread to a subset.
 
     Returns (None, None) if the SoC is homogeneous (all cores same freq)
     or if detection fails — in which case pinning is skipped.
@@ -82,14 +94,16 @@ def detect_big_little():
         _topology = (None, None)
         return _topology
 
-    fast_cores = set(c for c, f in valid_freqs.items() if f == max_freq)
+    # Slow cores = lowest-frequency cluster (little).
+    # Fast cores = everything else (mid + big).
     slow_cores = set(c for c, f in valid_freqs.items() if f == min_freq)
+    fast_cores = set(c for c, f in valid_freqs.items() if f > min_freq)
 
     model = _read_device_model()
     log.info("CPU topology: big.LITTLE detected (%s)", model or "unknown SoC")
-    log.info("  Fast cores: %s (%d MHz)",
+    log.info("  Fast cores (main): %s (%d MHz)",
              sorted(fast_cores), max_freq // 1000)
-    log.info("  Slow cores: %s (%d MHz)",
+    log.info("  Slow cores (bg):   %s (%d MHz)",
              sorted(slow_cores), min_freq // 1000)
 
     _topology = (fast_cores, slow_cores)
@@ -97,20 +111,22 @@ def detect_big_little():
 
 
 def pin_main_thread():
-    """Pin the calling (main/render) thread to the fast cores.
+    """Detect and log the CPU topology for the main thread.
+
+    The main thread is intentionally NOT pinned — llvmpipe (software
+    rendering) spawns worker threads that inherit the main thread's
+    affinity, and it needs all cores for maximum rendering throughput.
+    The optimization is in pin_background_thread() keeping background
+    tasks off the fast cores.
 
     No-op on homogeneous SoCs like the Raspberry Pi 5.
     """
-    fast, _ = detect_big_little()
+    fast, slow = detect_big_little()
     if fast is None:
         return False
-    try:
-        os.sched_setaffinity(0, fast)
-        log.info("Main thread pinned to fast cores: %s", sorted(fast))
-        return True
-    except OSError as e:
-        log.warning("Could not pin main thread: %s", e)
-        return False
+    # Log detection but don't restrict the main thread's affinity.
+    log.info("Main thread: unrestricted (llvmpipe needs all cores)")
+    return True
 
 
 def pin_background_thread(name="background"):
