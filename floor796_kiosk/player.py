@@ -1232,8 +1232,13 @@ def main():
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # SCALED enables the GPU's hardware page-flip with vsync.
-    flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+    # At 4K, SCALED adds overhead (offscreen render + GPU copy) without
+    # benefit when there's no hardware GL.  Use plain FULLSCREEN for 4K,
+    # SCALED for 1080p (enables GPU page-flip + vsync on smaller buffers).
+    if args.width > 3000:
+        flags = pygame.FULLSCREEN if args.fullscreen else 0
+    else:
+        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
