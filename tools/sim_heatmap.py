@@ -67,13 +67,14 @@ fake_pygame.display.flip = lambda: None
 sys.modules["pygame"] = fake_pygame
 
 import numpy as np
-from kiosk_player import (
+from floor796_kiosk.player import (
     Wanderer, SPACING_W, SPACING_H, TILE_W, TILE_H,
     DEFAULT_WANDER_SPEED, _compute_content_bounds,
     _visible_and_margin_tile_ids,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
 
 
 def _encode_rgba_png(rgba):
@@ -148,7 +149,7 @@ def run_simulation(tiles_meta_path, view_w, view_h, sim_hours=1.0,
         def sleep(s):
             pass
 
-    import kiosk_player
+    import floor796_kiosk.player as kiosk_player
     original_time_module = kiosk_player.time
     kiosk_player.time = FakeTime
 
@@ -428,7 +429,7 @@ if __name__ == "__main__":
                         help="Image downsample factor (default: 8)")
     args = parser.parse_args()
 
-    meta_path = os.path.join(BASE_DIR, "tiles_meta.json")
+    meta_path = os.path.join(PROJECT_ROOT, "assets", "tiles_meta.json")
     if not os.path.exists(meta_path):
         print(f"Error: {meta_path} not found")
         sys.exit(1)

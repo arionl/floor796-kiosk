@@ -8,17 +8,24 @@
 #     sudo bash install.sh
 #
 # What it does:
-#   1. Installs system dependencies (X server, ffmpeg, Python, etc.)
+#   1. Installs system dependencies (X server, ffmpeg, Python, numpy, scrot)
 #   2. Creates a dedicated 'kiosk' user if needed
-#   3. Installs the Python packages (pygame)
-#   4. Copies files to /opt/floor796-kiosk
-#   5. Downloads the initial tile set (~123 MB)
-#   6. Installs systemd service for cold-boot auto-start
-#   7. Disables desktop, lightdm, and all display sleep / screensaver
+#   3. Installs the Python packages (pygame, brotli)
+#   4. Copies the floor796_kiosk package + deploy scripts
+#   5. Installs systemd service for cold-boot auto-start
+#   6. Disables desktop, lightdm, and all display sleep / screensaver
+#
+# On first boot, the player automatically:
+#   - Downloads tiles from floor796.com
+#   - Downloads object labels (changelog.json) from floor796.com
+#   - Decodes tile animation strips
+#   - Builds the content density mask (content_mask.npz)
+# All cached for subsequent boots.
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/floor796-kiosk}"
 SERVICE_USER="kiosk"
 SERVICE_SRC="${SCRIPT_DIR}/floor796-kiosk.service"
@@ -27,7 +34,7 @@ SERVICE_DST="/etc/systemd/system/floor796-kiosk.service"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Floor796 Kiosk Installer"
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Source:      ${SCRIPT_DIR}"
+echo "  Source:      ${SOURCE_DIR}"
 echo "  Install dir: ${INSTALL_DIR}"
 echo ""
 
@@ -37,8 +44,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ ! -f "${SCRIPT_DIR}/kiosk_player.py" ]]; then
-    echo "ERROR: kiosk_player.py not found in ${SCRIPT_DIR}"
+if [[ ! -f "${SOURCE_DIR}/floor796_kiosk/player.py" ]]; then
+    echo "ERROR: floor796_kiosk/player.py not found in ${SOURCE_DIR}"
     exit 1
 fi
 
@@ -55,6 +62,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     python3 \
     python3-pip \
     python3-venv \
+    python3-numpy \
+    scrot \
     mesa-utils \
     libegl-mesa0 \
     libgles2 \
@@ -85,27 +94,31 @@ echo "    ✓ pygame + brotli ready"
 # ─── 4. Copy files ───────────────────────────────────────────────────────────
 echo "[4/7] Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
-cp "${SCRIPT_DIR}"/kiosk_player.py      "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/tile_manager.py      "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/hologram.py          "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/"
+
+if [[ "${SOURCE_DIR}" != "${INSTALL_DIR}" ]]; then
+    # Python package (all modules live under floor796_kiosk/)
+    cp -r "${SOURCE_DIR}/floor796_kiosk" "${INSTALL_DIR}/"
+    # Deploy scripts
+    mkdir -p "${INSTALL_DIR}/deploy"
+    cp "${SCRIPT_DIR}"/run.sh               "${INSTALL_DIR}/deploy/"
+    cp "${SCRIPT_DIR}"/kiosk-launch.sh      "${INSTALL_DIR}/deploy/"
+    chmod +x "${INSTALL_DIR}"/deploy/run.sh "${INSTALL_DIR}"/deploy/kiosk-launch.sh
+else
+    echo "    (source is install dir — skipping copy)"
+fi
+
+# Service file always goes to systemd location
 cp "${SCRIPT_DIR}"/floor796-kiosk.service "${SERVICE_DST}"
-chmod +x "${INSTALL_DIR}"/run.sh "${INSTALL_DIR}"/kiosk-launch.sh
+
+# Create empty assets and cache directories
+mkdir -p "${INSTALL_DIR}/assets/tiles" "${INSTALL_DIR}/assets/holograms"
+mkdir -p "${INSTALL_DIR}/cache/strips" "${INSTALL_DIR}/cache/thumbnails"
+
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
-# ─── 5. Download tiles ───────────────────────────────────────────────────────
-echo "[5/7] Downloading Floor796 tiles (~123 MB)..."
-if [[ ! -f "${INSTALL_DIR}/tiles_meta.json" ]]; then
-    sudo -u "${SERVICE_USER}" python3 "${INSTALL_DIR}/tile_manager.py"
-    echo "    ✓ Tiles downloaded"
-else
-    echo "    ✓ Tiles already cached (will update on first boot)"
-fi
-
-# ─── 6. Disable desktop & display sleep ──────────────────────────────────────
-echo "[6/7] Configuring kiosk mode..."
+# ─── 5. Disable desktop & display sleep ──────────────────────────────────────
+echo "[5/6] Configuring kiosk mode..."
 
 # Disable lightdm/desktop manager — we run our own bare X server
 systemctl disable lightdm 2>/dev/null || true
@@ -128,8 +141,8 @@ if [[ -f "${CONFIG_TXT}" ]]; then
 fi
 echo "    ✓ Desktop disabled, display sleep prevented"
 
-# ─── 7. Enable kiosk service ─────────────────────────────────────────────────
-echo "[7/7] Enabling kiosk service..."
+# ─── 6. Enable kiosk service ─────────────────────────────────────────────────
+echo "[6/6] Enabling kiosk service..."
 systemctl daemon-reload
 systemctl enable floor796-kiosk.service
 echo "    ✓ Kiosk service enabled (starts on boot)"

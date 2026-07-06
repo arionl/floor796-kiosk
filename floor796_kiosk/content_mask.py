@@ -19,12 +19,32 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 300000000
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STRIP_DIR = os.path.join(BASE_DIR, "strips")
+from floor796_kiosk.paths import STRIP_DIR as _DEFAULT_STRIP_DIR, CONTENT_MASK_PATH, TILE_META_PATH
+
 TILE_W = 1024
 TILE_H = 820
 MASK_COLS = 32   # content mask resolution
 MASK_ROWS = 26   # 820/32 ≈ 31px per cell, 1024/32 = 32px per cell
+
+
+def build_and_save(tiles_meta, output_path, strip_dir=None, progress_callback=None):
+    """Build the content density mask and save to output_path.
+
+    Callable from player.py at startup when content_mask.npz
+    doesn't exist yet.  Uses strip_dir if provided (defaults to the
+    configured cache directory).
+
+    If progress_callback is provided, it is called as
+    ``progress_callback(done, total, message)`` after each tile is
+    processed, so the caller can render a progress bar.
+    """
+    global STRIP_DIR
+    STRIP_DIR = strip_dir or _DEFAULT_STRIP_DIR
+    map_mask, _ = build_map_content_mask(tiles_meta, progress_callback=progress_callback)
+    np.savez_compressed(output_path, map_mask=map_mask)
+    if progress_callback:
+        progress_callback(len(tiles_meta["tiles"]), len(tiles_meta["tiles"]),
+                          "Saving content mask...")
 
 
 def compute_content_mask(strip_path):
@@ -54,35 +74,39 @@ def compute_content_mask(strip_path):
     return mask
 
 
-def build_map_content_mask(tiles_meta):
+def build_map_content_mask(tiles_meta, progress_callback=None):
     """Build a full-map content mask at tile-block resolution.
-    
+
     Simulates the rendered map: for each position on the map grid,
     determines the content density accounting for tile overlap.
-    
+
     Returns a numpy array of shape (map_rows * MASK_ROWS, map_cols * MASK_COLS)
     where each cell is 0..1 content density.
     """
     grid_rows = tiles_meta.get("grid_rows", 11)
     grid_cols = tiles_meta.get("grid_cols", 10)
-    
+
     # First compute per-tile masks
     tile_masks = {}
-    for tid, info in tiles_meta["tiles"].items():
+    tile_items = list(tiles_meta["tiles"].items())
+    total = len(tile_items)
+    for idx, (tid, info) in enumerate(tile_items):
         if not info.get("animated"):
             tile_masks[tid] = None
-            continue
-        strip_path = os.path.join(STRIP_DIR, f"{tid}.bmp")
-        if not os.path.exists(strip_path):
-            strip_path = os.path.join(STRIP_DIR, f"{tid}.png")
-        if not os.path.exists(strip_path):
-            tile_masks[tid] = None
-            continue
-        try:
-            tile_masks[tid] = compute_content_mask(strip_path)
-        except Exception as e:
-            print(f"  Warning: {tid}: {e}")
-            tile_masks[tid] = None
+        else:
+            strip_path = os.path.join(STRIP_DIR, f"{tid}.bmp")
+            if not os.path.exists(strip_path):
+                strip_path = os.path.join(STRIP_DIR, f"{tid}.png")
+            if not os.path.exists(strip_path):
+                tile_masks[tid] = None
+            else:
+                try:
+                    tile_masks[tid] = compute_content_mask(strip_path)
+                except Exception as e:
+                    print(f"  Warning: {tid}: {e}")
+                    tile_masks[tid] = None
+        if progress_callback:
+            progress_callback(idx + 1, total, "Building content mask")
     
     # Build full map mask
     # Each tile occupies MASK_ROWS x MASK_COLS cells
@@ -125,44 +149,13 @@ def content_ratio_at(map_mask, x, y, view_w, view_h,
 
 
 if __name__ == "__main__":
-    meta_path = os.path.join(BASE_DIR, "tiles_meta.json")
-    with open(meta_path) as f:
+    with open(TILE_META_PATH) as f:
         tiles_meta = json.load(f)
-    
+
     print("Building content density map...")
-    map_mask, tile_masks = build_map_content_mask(tiles_meta)
-    
-    # Save
-    output_path = os.path.join(BASE_DIR, "content_mask.npz")
-    np.savez_compressed(output_path, map_mask=map_mask)
-    print(f"Saved to {output_path}")
+    build_and_save(tiles_meta, CONTENT_MASK_PATH,
+                   progress_callback=lambda d, t, m: print(f"\r{m}: {d}/{t}", end=""))
+    map_mask = np.load(CONTENT_MASK_PATH)["map_mask"]
+    print(f"\nSaved to {CONTENT_MASK_PATH}")
     print(f"Map mask shape: {map_mask.shape}")
     print(f"Overall content density: {np.mean(map_mask):.1%}")
-    
-    # Print map visualization
-    print("\nContent density map (32x26 per tile):")
-    SPACING_W, SPACING_H = 1016, 812
-    VIEW_W, VIEW_H = 1920, 1200
-    cell_w = TILE_W / MASK_COLS
-    cell_h = TILE_H / MASK_ROWS
-    
-    # Check content ratio at several positions
-    grid_rows = tiles_meta["grid_rows"]
-    grid_cols = tiles_meta["grid_cols"]
-    print(f"\nContent ratio at tile centers (simulated viewport):")
-    print("    " + " ".join(f"  c{c:1d}" for c in range(grid_cols)))
-    for r in range(grid_rows):
-        row_str = f"r{r:2d} "
-        for c in range(grid_cols):
-            # Viewport centered on tile (r,c)
-            vx = c * SPACING_W + TILE_W // 2 - VIEW_W // 2
-            vy = r * SPACING_H + TILE_H // 2 - VIEW_H // 2
-            vx = max(0, vx)
-            vy = max(0, vy)
-            cr = content_ratio_at(map_mask, vx, vy, VIEW_W, VIEW_H,
-                                 SPACING_W, SPACING_H, TILE_W, TILE_H)
-            if (r, c) in {(info["row"], info["col"]) for info in tiles_meta["tiles"].values() if info.get("animated")}:
-                row_str += f" {cr*100:3.0f}%"
-            else:
-                row_str += "    "
-        print(row_str)

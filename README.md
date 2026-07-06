@@ -67,43 +67,84 @@ git clone <repo-url> /tmp/floor796-kiosk
 cd /tmp/floor796-kiosk
 
 # 2. Run the installer (requires root)
-sudo bash install.sh
+sudo bash deploy/install.sh
 
 # 3. Reboot to test cold-boot auto-start
 sudo reboot
 ```
 
-The first boot downloads ~123 MB of tiles and decodes them to frame strips
-(~3 minutes).  Subsequent boots take ~20 seconds.
+The installer copies the code and configures the system service — it does
+**not** download any content.  Tiles, labels, and all other assets are
+fetched automatically on the first boot of the player:
+
+- ~123 MB of tiles from floor796.com
+- Object labels (changelog.json)
+- Decoded frame strips (~8 minutes)
+- Content density mask (~2 minutes)
+
+All of this is cached — subsequent boots take ~20 seconds.
 
 ---
 
-## File Structure
+## Project Structure
 
 ```
 floor796-kiosk/
-├── kiosk_player.py              # Main player (rendering + wandering)
-├── tile_manager.py              # Tile download + auto-update logic
-├── object_highlighter.py        # Object highlighter (804 objects, selection)
-├── thumbnail_cache.py           # Thumbnail fetcher (YouTube, images, video, wiki)
-├── stats_collector.py           # Telemetry collector (ring buffers, heatmaps)
-├── stats_http.py                # HTTP API server (127.0.0.1:8796)
-├── stats_overlay.py             # On-screen alpha-blended stats overlay
-├── hologram.py                  # Hologram scene overlay
-├── build_content_mask.py        # Offline content density mask generator
-├── run.sh                       # Boot wrapper (starts bare X server)
-├── install.sh                   # One-shot installer for fresh Raspbian
-├── floor796-kiosk.service       # systemd unit (cold-boot auto-start)
-├── tiles/                       # Downloaded MP4 tiles (gitignored)
-├── strips/                      # Decoded frame strips (gitignored)
-├── tiles_meta.json              # Grid metadata (auto-generated)
-├── changelog.json               # Object metadata from floor796.com
-├── content_mask.npz             # Pixel-level content density mask
-├── screenshot.png               # Main screenshot (highlighter)
-├── stats_overlay_screenshot.png # Stats overlay screenshot
-├── README.md                    # This file
+├── floor796_kiosk/               Python package
+│   ├── __init__.py
+│   ├── __main__.py               Entry point: python -m floor796_kiosk
+│   ├── paths.py                  Centralized path management
+│   ├── player.py                 Main player (rendering + wandering)
+│   ├── tile_manager.py           Tile download + auto-update logic
+│   ├── content_mask.py           Content density mask generator
+│   ├── hologram.py               Hologram scene overlay
+│   ├── highlighter.py            Object highlighter (804 objects, selection)
+│   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki)
+│   └── stats/
+│       ├── __init__.py
+│       ├── collector.py          Telemetry collector (ring buffers, heatmaps)
+│       ├── http_server.py        HTTP API server (127.0.0.1:8796)
+│       └── overlay.py            On-screen alpha-blended stats overlay
+├── assets/                       Downloaded from floor796.com (cached, gitignored)
+│   ├── tiles/                    Source tile MP4s
+│   ├── tiles_meta.json           Grid metadata
+│   ├── changelog.json            Object labels / polygon data
+│   └── holograms/                Hologram scene sources
+├── cache/                        Generated at runtime (rebuildable, gitignored)
+│   ├── strips/                   Decoded frame strips (BMP)
+│   ├── content_mask.npz          Pixel-level content density mask
+│   └── thumbnails/               Resized label thumbnails
+├── tools/                        Simulations & CLI tools
+│   ├── kiosk_status.py           Query the stats API from CLI
+│   ├── sim_heatmap.py            Wanderer heatmap simulation + visualization
+│   ├── sim_wander.py             Wanderer coverage simulation
+│   ├── sim_prefetch.py           Tile prefetch strategy simulation
+│   └── sim_prefetch_v3.py        Extended prefetch simulation
+├── deploy/                       Installation & systemd
+│   ├── install.sh                One-shot installer for fresh Raspbian
+│   ├── run.sh                    Boot wrapper (starts bare X server)
+│   ├── kiosk-launch.sh           Player launcher (runs inside X session)
+│   └── floor796-kiosk.service    systemd unit (cold-boot auto-start)
+├── screenshot.png                Main screenshot (highlighter)
+├── stats_overlay_screenshot.png  Stats overlay screenshot
+├── README.md
+├── CHANGELOG.md
 └── .gitignore
 ```
+
+### Directory Roles
+
+- **`assets/`** — files downloaded from floor796.com and cached locally.  If
+  deleted, the player re-downloads them on next boot.  Safe to delete to force
+  a fresh download.
+- **`cache/`** — files generated by the player at runtime (decoded strips,
+  content mask, thumbnails).  Safe to delete at any time; the player rebuilds
+  them automatically (strips take ~8 min, content mask ~2 min).
+- **`floor796_kiosk/`** — the Python package.  Entry point is
+  `python -m floor796_kiosk`.
+- **`tools/`** — offline simulation scripts and CLI utilities, not needed for
+  normal operation.
+- **`deploy/`** — system integration scripts, used only during installation.
 
 ---
 
@@ -114,14 +155,16 @@ floor796-kiosk/
 Floor796's map is a grid of 1024×820 pixel tiles.  Most tiles are static
 (single-frame), but ~50 tiles in the center are animated (60-frame loops at
 12 fps).  The player downloads these as MP4s from the CDN, decodes them to
-full-resolution PNG frame strips using ffmpeg, and caches them in `strips/`.
+full-resolution BMP frame strips using ffmpeg, and caches them in
+`cache/strips/`.
 
 Tiles are spaced at 1016×812 intervals (8 px overlap per axis), matching the
 floor796.com front-end.  This overlap is critical for pixel-perfect alignment.
 
 ### Wandering Algorithm
 
-The `Wanderer` class implements coverage-weighted waypoint navigation:
+The `Wanderer` class in `player.py` implements coverage-weighted waypoint
+navigation:
 
 1. **Visit heat map** — counts how many frames each animated tile has been
    visible in the viewport.
@@ -133,9 +176,23 @@ The `Wanderer` class implements coverage-weighted waypoint navigation:
 4. **Smooth steering** — gradual angle interpolation toward the next waypoint
    with momentum blending for natural-looking movement.
 5. **Dynamic timeout** — far tiles get longer timeouts based on distance and
-   speed (`distance / speed * 1.8`), ensuring the full scene is reachable.
+   speed, ensuring the full scene is reachable.
 
 Full coverage of all animated tiles is typically achieved in ~25 minutes.
+
+### Content Density Mask
+
+The `content_mask.py` module builds a downscaled content-density map from the
+decoded tile strips.  For each animated tile, it measures local pixel standard
+deviation to distinguish pixel-art content from flat background (the isometric
+diamond shape means ~66% of each tile is background).  This mask is used by:
+
+- The wanderer to compute blank ratios and find optimal viewing positions.
+- The object highlighter to determine content bounds (tight box around actual
+  pixel art, not the full tile rectangle).
+
+The mask is built on first boot (or whenever `cache/content_mask.npz` is
+missing) and cached.  A progress bar is shown on-screen during the build.
 
 ### Auto-Update
 
@@ -145,8 +202,9 @@ back to the existing cache — the kiosk always boots, online or offline.
 
 ### Object Highlighter
 
-The `ObjectHighlighter` class automatically identifies and labels objects from
-floor796.com's changelog (804 objects) as the wanderer brings them into view.
+The `ObjectHighlighter` class in `highlighter.py` automatically identifies and
+labels objects from floor796.com's changelog (804 objects) as the wanderer
+brings them into view.
 
 **Selection algorithm** — for each highlight cycle, all objects in the viewport
 are scored on five factors:
@@ -173,6 +231,8 @@ strongly preferring well-positioned candidates.
 | Video | Frame extraction via `ffmpeg` at ~1s timestamp |
 | Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
 | Web / other | No thumbnail; compact text-only panel |
+
+Thumbnails are cached in `cache/thumbnails/` and fetched in background threads.
 
 ### Telemetry & Stats API
 
@@ -201,8 +261,11 @@ most-recent).  Press `T` to cycle time windows (10min → 30min → 1h → 4h �
 
 ## Configuration
 
-The player can be configured via command-line arguments (see `run.sh`) or by
-editing constants at the top of `kiosk_player.py`:
+The player can be configured via command-line arguments or by editing constants
+in `floor796_kiosk/player.py` and `floor796_kiosk/paths.py`.
+
+All file paths are centralized in `paths.py` — if you need to relocate the
+data directories (e.g., to a faster SD card or RAM disk), change them there.
 
 | Setting             | Default | Description                              |
 |---------------------|---------|------------------------------------------|
@@ -284,9 +347,8 @@ When a keyboard/mouse is connected during maintenance:
 ### Player crashes / restarts repeatedly
 
 - Check logs: `journalctl -u floor796-kiosk --no-pager -n 100`
-- Ensure the venv has pygame installed: `ls /opt/floor796-kiosk/venv/bin/python`
 - Check available memory: `free -h` (needs ~2 GB free).
-- Ensure tiles are downloaded: `ls /opt/floor796-kiosk/tiles/*.mp4 | wc -l`
+- Ensure tiles are downloaded: `ls /opt/floor796-kiosk/assets/tiles/*.mp4 | wc -l`
 
 ### Display goes to sleep
 
@@ -297,7 +359,24 @@ When a keyboard/mouse is connected during maintenance:
 ### Tiles not updating
 
 - The player checks for updates at every startup.  If offline, it uses cache.
-- To force a manual update: `sudo -u kiosk /opt/floor796-kiosk/venv/bin/python /opt/floor796-kiosk/tile_manager.py`
+- To force a manual update:
+  ```bash
+  cd /opt/floor796-kiosk
+  sudo -u kiosk python3 -m floor796_kiosk.tile_manager
+  ```
+
+### Rebuilding the cache
+
+The `cache/` directory is fully rebuildable.  To force a clean rebuild:
+
+```bash
+sudo systemctl stop floor796-kiosk
+sudo rm -rf /opt/floor796-kiosk/cache/*
+sudo systemctl start floor796-kiosk
+```
+
+The player will re-decode strips (~8 min), rebuild the content mask (~2 min),
+and re-fetch thumbnails on next boot.
 
 ---
 
@@ -310,9 +389,41 @@ When a keyboard/mouse is connected during maintenance:
 | Memory (RSS)        | ~2.7 GB                        |
 | Swap                | 0 MB                           |
 | CPU                 | ~50% (one core)                |
-| Cold-boot to display| ~20s (warm), ~3 min (first run)|
+| Cold-boot to display| ~20s (warm), ~10 min (first run)|
 | Full coverage       | ~25 minutes                    |
 | Objects highlighted | 804 (100% reachable)           |
+
+---
+
+## Development
+
+### Running the player directly
+
+```bash
+cd floor796-kiosk
+python3 -m floor796_kiosk --fullscreen
+```
+
+### Simulation tools
+
+```bash
+# Simulate 1 hour of wandering and generate a heatmap
+cd floor796-kiosk
+python3 tools/sim_heatmap.py --hours 1 --output heatmap.png
+
+# Simulate wanderer coverage
+python3 tools/sim_wander.py --hours 2
+
+# Check kiosk status via API
+python3 tools/kiosk_status.py --host 127.0.0.1
+```
+
+### Building the content mask manually
+
+```bash
+cd floor796-kiosk
+python3 -m floor796_kiosk.content_mask
+```
 
 ---
 

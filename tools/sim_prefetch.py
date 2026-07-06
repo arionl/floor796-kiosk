@@ -20,7 +20,7 @@ import math
 import random
 import os
 
-TILE_META_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiles_meta.json")
+TILE_META_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "tiles_meta.json")
 
 SPACING_W = 1016
 SPACING_H = 812
