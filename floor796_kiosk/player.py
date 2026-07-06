@@ -93,17 +93,57 @@ ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
-# Memory budget on 4 GB Pi:
+# Memory budget on 4 GB Pi (1080p):
 #   Each animated strip: 96 MB (1024x49200x2 at 16-bit)
 #   Hologram: ~120 MB per scene (60 frames x 805x646 x 4 bytes)
 #   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
-MAX_TILES = 15
+# At 4K (3840x2160) the viewport shows ~4× more tiles; scale max_tiles
+# accordingly, but cap by available memory.
+MAX_TILES_BASE = 15          # baseline for 1080p + 4 GB RAM
+MAX_TILES_CAP = 40           # hard ceiling (strip cache ~3.8 GB)
 
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
 ACCENT_COLOR = (0, 200, 100)
 
 log = logging.getLogger("floor796")
+
+
+def _detect_total_memory_mb():
+    """Read total system RAM in MB from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    # "MemTotal:       8174936 kB"
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _compute_max_tiles(view_w, view_h, total_mem_mb):
+    """Scale MAX_TILES based on viewport area and available RAM.
+
+    At 1080p (1920×1080 = ~2M px) with 4 GB, max_tiles=15 is tuned.
+    At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
+    so we need a larger cache. Scale linearly with viewport area, then
+    cap by available memory (each strip ~96 MB).
+    """
+    # Scale factor relative to 1080p baseline
+    vp_area = view_w * view_h
+    base_area = 1920 * 1080
+    area_scale = vp_area / base_area
+
+    # Memory ceiling: leave ~2 GB for OS + other app overhead
+    if total_mem_mb > 0:
+        mem_budget_mb = max(500, total_mem_mb - 2048)
+        mem_cap = int(mem_budget_mb / 96)  # 96 MB per strip
+    else:
+        mem_cap = MAX_TILES_CAP
+
+    max_t = int(MAX_TILES_BASE * area_scale)
+    return max(MAX_TILES_BASE, min(max_t, mem_cap, MAX_TILES_CAP))
 
 # ─── Status Display ───────────────────────────────────────────────────────────
 
@@ -1142,17 +1182,24 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
-    # ── 4K downscale ──
-    # The Pi 5 can't render full 4K in real time (memory + GPU limits).
-    # When a 4K display is attached, switch the X display to 1080p so the
-    # monitor's hardware scaler fills the panel.  No software scaling.
+    # ── 4K handling ──
+    # On devices with ≤4 GB RAM (Pi 5), we can't render full 4K in real time
+    # (memory + GPU limits), so we switch X to 1080p and let the monitor's
+    # hardware scaler upscale to the panel.
+    #
+    # On devices with ≥6 GB RAM (e.g. OrangePi 5 with 8 GB), we render at
+    # native 4K — the viewport shows ~4× more tiles but memory is sufficient.
     #
     # After xrandr, pygame must be quit+re-init so it picks up the new
     # display mode — otherwise set_mode() uses stale dimensions and the
     # fullscreen window ends up positioned in a corner.
     physical_w = args.width
     physical_h = args.height
-    if args.width > 3000:
+    total_mem_mb = _detect_total_memory_mb()
+    log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
+
+    if args.width > 3000 and total_mem_mb < 6144:
+        # Not enough RAM for native 4K — downscale to 1080p
         render_w = 1920
         render_h = 1080
         try:
@@ -1179,15 +1226,14 @@ def main():
         except Exception as e:
             log.warning("Could not switch display mode: %s — "
                        "rendering at native %dx%d", e, args.width, args.height)
+    elif args.width > 3000:
+        log.info("4K display detected — rendering at native %dx%d "
+                 "(%d MB RAM sufficient for native 4K)",
+                 args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # SCALED enables the GPU's hardware page-flip with vsync.  Use it for
-    # all normal (non-4K) displays.  The 4K path doesn't need it because
-    # xrandr has already switched the X display to a matching mode.
-    if physical_w > 3000:
-        flags = pygame.FULLSCREEN if args.fullscreen else 0
-    else:
-        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+    # SCALED enables the GPU's hardware page-flip with vsync.
+    flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
@@ -1291,7 +1337,10 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    cache = TileCache(STRIP_DIR, max_tiles=MAX_TILES)
+    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
+    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM)",
+             max_tiles, args.width, args.height, total_mem_mb)
+    cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
@@ -1494,7 +1543,9 @@ def main():
                 "render_h": args.height,
                 "physical_w": physical_w,
                 "physical_h": physical_h,
-                "scale_mode": "native" if physical_w == args.width else "4k-xrandr",
+                "scale_mode": ("4k-native" if args.width > 3000
+                               else "4k-xrandr" if physical_w > 3000
+                               else "native"),
             })
 
         # ── Render ──
