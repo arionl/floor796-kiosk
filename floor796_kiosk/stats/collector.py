@@ -436,6 +436,7 @@ class StatsCollector:
                 "map_w": self._map_w,
                 "map_h": self._map_h,
                 "scale_mode": f.get("scale_mode", "native"),
+                "cpu_affinity": f.get("cpu_affinity", {}),
                 "fps": f.get("fps", 0),
                 "fps_avg": fps_stats[3],
                 "fps_min": fps_stats[1],

@@ -300,6 +300,13 @@ def start_stats_server(collector, host="127.0.0.1", port=8796):
     server.collector = collector
     server.daemon_threads = True
 
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    def _serve():
+        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
+        # No-op on homogeneous SoCs like the Raspberry Pi 5.
+        from floor796_kiosk.cpu_affinity import pin_background_thread
+        pin_background_thread("stats_http")
+        server.serve_forever()
+
+    thread = threading.Thread(target=_serve, daemon=True)
     thread.start()
     return server

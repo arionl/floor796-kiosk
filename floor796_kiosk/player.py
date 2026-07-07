@@ -20,8 +20,9 @@ Controls (for maintenance/testing only):
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
-Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display.
-The player auto-detects the native display resolution at startup.
+Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display,
+or OrangePi 5 Max (8 GB) with a 3840×2160 (4K) display.
+The player auto-detects the board type and native display resolution at startup.
 """
 
 import argparse
@@ -62,6 +63,12 @@ from floor796_kiosk.paths import (
     THUMBNAIL_DIR, ensure_dirs,
 )
 
+from floor796_kiosk.cpu_affinity import (
+    pin_main_thread, pin_background_thread, get_affinity_info,
+)
+
+from floor796_kiosk.board_detect import detect_board, get_render_config, BoardType
+
 # Resolution of the per-tile content-density mask (must match content_mask.py)
 MASK_COLS = 32
 MASK_ROWS = 26
@@ -93,17 +100,57 @@ ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
-# Memory budget on 4 GB Pi:
+# Memory budget on 4 GB Pi (1080p):
 #   Each animated strip: 96 MB (1024x49200x2 at 16-bit)
 #   Hologram: ~120 MB per scene (60 frames x 805x646 x 4 bytes)
 #   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
-MAX_TILES = 15
+# At 4K (3840x2160) the viewport shows ~4× more tiles; scale max_tiles
+# accordingly, but cap by available memory.
+MAX_TILES_BASE = 15          # baseline for 1080p + 4 GB RAM
+MAX_TILES_CAP = 40           # hard ceiling (strip cache ~3.8 GB)
 
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
 ACCENT_COLOR = (0, 200, 100)
 
 log = logging.getLogger("floor796")
+
+
+def _detect_total_memory_mb():
+    """Read total system RAM in MB from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    # "MemTotal:       8174936 kB"
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _compute_max_tiles(view_w, view_h, total_mem_mb):
+    """Scale MAX_TILES based on viewport area and available RAM.
+
+    At 1080p (1920×1080 = ~2M px) with 4 GB, max_tiles=15 is tuned.
+    At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
+    so we need a larger cache. Scale linearly with viewport area, then
+    cap by available memory (each strip ~96 MB).
+    """
+    # Scale factor relative to 1080p baseline
+    vp_area = view_w * view_h
+    base_area = 1920 * 1080
+    area_scale = vp_area / base_area
+
+    # Memory ceiling: leave ~2 GB for OS + other app overhead
+    if total_mem_mb > 0:
+        mem_budget_mb = max(500, total_mem_mb - 2048)
+        mem_cap = int(mem_budget_mb / 96)  # 96 MB per strip
+    else:
+        mem_cap = MAX_TILES_CAP
+
+    max_t = int(MAX_TILES_BASE * area_scale)
+    return max(MAX_TILES_BASE, min(max_t, mem_cap, MAX_TILES_CAP))
 
 # ─── Status Display ───────────────────────────────────────────────────────────
 
@@ -248,6 +295,10 @@ class TileCache:
         self._stop_flag = False
 
     def _worker_loop(self):
+        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
+        # No-op on homogeneous SoCs like the Raspberry Pi 5.
+        pin_background_thread("tile_cache")
+
         # Lower this thread's OS priority so it never starves the render loop
         try:
             os.setpriority(os.PRIO_PROCESS, 0, 10)
@@ -598,6 +649,7 @@ class Wanderer:
                     self.animated_tiles.add(rc)
 
         # Load pixel-level content density mask if available
+        self.content_bounds = None
         try:
             if os.path.exists(CONTENT_MASK_PATH):
                 npz = np.load(CONTENT_MASK_PATH)
@@ -643,7 +695,6 @@ class Wanderer:
         except Exception as e:
             log.warning("Could not load content_mask.npz (%s) - "
                        "using binary animated/blank", e)
-            self.content_bounds = None
 
         self.map_w = map_w
         self.map_h = map_h
@@ -1125,7 +1176,27 @@ def main():
         stream=sys.stdout,
     )
 
-    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+    # Pin main thread to fast cores on big.LITTLE SoCs (e.g. OrangePi 5 Max).
+    # No-op on homogeneous SoCs like the Raspberry Pi 5.
+    pin_main_thread()
+
+    # ── Select SDL2 video driver (board-specific) ──
+    # Board detection is centralized in floor796_kiosk.board_detect.
+    #   - OrangePi 5 Max (RK3588 + Mesa Panthor) → KMSDRM, no X11
+    #   - Raspberry Pi 5 (Mesa V3D)              → X11
+    #   - Generic / unknown                       → X11 fallback
+    # Allow override via SDL_VIDEODRIVER env var.
+    if "SDL_VIDEODRIVER" not in os.environ:
+        board = detect_board()
+        render_cfg = get_render_config(board)
+        os.environ["SDL_VIDEODRIVER"] = render_cfg.sdl_driver
+        log.info("Board: %s — using %s for rendering (gpu=%s, x11=%s)",
+                 board.value, render_cfg.sdl_driver,
+                 render_cfg.gpu_driver, render_cfg.needs_x11)
+    else:
+        log.info("SDL_VIDEODRIVER overridden to '%s' via environment",
+                 os.environ["SDL_VIDEODRIVER"])
+
     pygame.init()
 
     # ── Auto-detect native display resolution ──
@@ -1142,17 +1213,39 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
-    # ── 4K downscale ──
-    # The Pi 5 can't render full 4K in real time (memory + GPU limits).
-    # When a 4K display is attached, switch the X display to 1080p so the
-    # monitor's hardware scaler fills the panel.  No software scaling.
+    # ── 4K handling ──
+    # Four board+display scenarios to handle:
+    #
+    #   1. Pi 5 + 4K display:     Downscale to 1080p via xrandr (4 GB RAM
+    #      can't handle native 4K). Monitor hardware upscales to 3840×2160.
+    #
+    #   2. Pi 5 + 1080p display:  No action needed — render at native 1080p.
+    #
+    #   3. OrangePi + 4K display: Render at native 4K (8 GB RAM + Panthor
+    #      GPU acceleration is sufficient). KMSDRM doesn't use xrandr.
+    #
+    #   4. OrangePi + 1080p:      No action needed — render at native 1080p.
+    #      KMSDRM detects the display's native mode. Panthor handles 1080p
+    #      effortlessly. The 4K downscale block below is skipped because
+    #      args.width (1920) is not > 3000.
     #
     # After xrandr, pygame must be quit+re-init so it picks up the new
     # display mode — otherwise set_mode() uses stale dimensions and the
     # fullscreen window ends up positioned in a corner.
+    #
+    # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with Panthor),
+    # we skip the downscale — KMSDRM uses the display's native mode directly.
     physical_w = args.width
     physical_h = args.height
-    if args.width > 3000:
+    total_mem_mb = _detect_total_memory_mb()
+    log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
+
+    using_kmsdrm = os.environ.get("SDL_VIDEODRIVER") == "kmsdrm"
+
+    if args.width > 3000 and total_mem_mb < 6144 and not using_kmsdrm:
+        # Pi 5 (or low-RAM board) + 4K display + X11:
+        # Not enough RAM for native 4K — downscale to 1080p via xrandr.
+        # The monitor's hardware scaler upscales 1080p → 3840×2160.
         render_w = 1920
         render_h = 1080
         try:
@@ -1179,15 +1272,32 @@ def main():
         except Exception as e:
             log.warning("Could not switch display mode: %s — "
                        "rendering at native %dx%d", e, args.width, args.height)
+    elif args.width > 3000 and total_mem_mb < 6144 and using_kmsdrm:
+        # OrangePi (or low-RAM KMSDRM board) + 4K display + < 6 GB RAM:
+        # Can't use xrandr (KMSDRM doesn't support it). KMSDRM will render
+        # at the display's native 4K mode, but memory may be tight.
+        # Reduce tile cache to fit available memory — _compute_max_tiles()
+        # already caps by RAM, so we just log a warning.
+        log.warning("4K display on low-RAM KMSDRM board (%d MB) — "
+                    "rendering at native %dx%d, tile cache will be "
+                    "memory-constrained", total_mem_mb, args.width, args.height)
+    elif args.width > 3000:
+        # OrangePi + 4K display with sufficient RAM, or any board with
+        # ≥ 6 GB RAM on a 4K display.
+        log.info("4K display detected — rendering at native %dx%d "
+                 "(%d MB RAM sufficient for native 4K)",
+                 args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # SCALED enables the GPU's hardware page-flip with vsync.  Use it for
-    # all normal (non-4K) displays.  The 4K path doesn't need it because
-    # xrandr has already switched the X display to a matching mode.
-    if physical_w > 3000:
-        flags = pygame.FULLSCREEN if args.fullscreen else 0
+    # With KMSDRM + Panthor GPU, both FULLSCREEN and SCALED use hardware GLES
+    # rendering via the SDL renderer.  SCALED gives us vsync + page-flip.
+    # With X11 (Pi 5), SCALED also uses the SDL renderer (Mesa V3D GPU).
+    # At 4K with X11 + llvmpipe (old config), FULLSCREEN was faster because
+    # SCALED added GL compositing overhead — but that path is no longer used.
+    if args.fullscreen:
+        flags = pygame.FULLSCREEN | pygame.SCALED
     else:
-        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+        flags = pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
@@ -1291,7 +1401,10 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    cache = TileCache(STRIP_DIR, max_tiles=MAX_TILES)
+    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
+    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM)",
+             max_tiles, args.width, args.height, total_mem_mb)
+    cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
@@ -1494,7 +1607,10 @@ def main():
                 "render_h": args.height,
                 "physical_w": physical_w,
                 "physical_h": physical_h,
-                "scale_mode": "native" if physical_w == args.width else "4k-xrandr",
+                "scale_mode": ("4k-native" if args.width > 3000
+                               else "4k-xrandr" if physical_w > 3000
+                               else "native"),
+                "cpu_affinity": get_affinity_info(),
             })
 
         # ── Render ──

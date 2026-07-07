@@ -5,6 +5,74 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.2 — Multi-board support: OrangePi 5 Max + Raspberry Pi 5 (2026-07-07)
+
+### Added
+- **Centralized board detection** (`floor796_kiosk/board_detect.py`) — a single
+  module that detects the embedded board type and selects the appropriate
+  rendering code path:
+  - **OrangePi 5 Max** (RK3588 + Mali-G610) → KMSDRM + Mesa Panthor, no X11
+  - **Raspberry Pi 5** (BCM2712 + VideoCore VII) → X11 + Mesa V3D
+  - **Generic / unknown** → X11 fallback (works on most Linux desktops)
+  - Detection methods: `/proc/device-tree/model` (primary), GPU driver in DRM
+    render node uevent files (fallback 1), `/proc/device-tree/compatible`
+    (fallback 2). All read-only, no special permissions.
+  - CLI interface for shell scripts: `python3 -m floor796_kiosk.board_detect
+    --shell` prints `BOARD_TYPE`, `GPU_DRIVER`, `RENDER_BACKEND`, `NEEDS_X11`,
+    `RUNS_AS_ROOT`, `SUPPORTS_4K_NATIVE`, `TOTAL_MEM_MB`. Also supports
+    `--json` for structured output.
+- **Board-aware install script** — `deploy/install.sh` now detects the board
+  type at install time and installs the correct system packages:
+  - OrangePi: `libgbm1`, `libgl1-mesa-dri`, `mesa-va-drivers` (KMSDRM/Mesa)
+  - Raspberry Pi / generic: `xserver-xorg`, `xinit`, `x11-xserver-utils`
+    (X11/Mesa)
+  - OrangePi install skips X11 packages entirely (no desktop manager needed).
+  - Board-specific kiosk configuration: OrangePi uses console blanking
+    disable; Raspberry Pi uses `config.txt` HDMI settings.
+
+### Changed
+- **Player GPU detection refactored** — `player.py` no longer has inline
+  Panthor detection logic. Instead, it imports `detect_board()` and
+  `get_render_config()` from `floor796_kiosk.board_detect`. The inline
+  `has_panthor` scan of `/sys/class/drm/renderD*/device/uevent` is replaced
+  by a single function call. `SDL_VIDEODRIVER` is set based on the board's
+  `RenderConfig.sdl_driver` field.
+- **`deploy/run.sh` refactored** — uses `python3 -m floor796_kiosk.board_detect
+  --shell` for board detection instead of inline shell loop scanning for
+  Panthor render nodes. The X11-vs-KMSDRM decision is now driven by the
+  `NEEDS_X11` variable from the Python module, ensuring the shell scripts and
+  player code use identical detection logic.
+- **`deploy/kiosk-launch.sh` refactored** — uses `RUNS_AS_ROOT` from
+  `board_detect` to decide whether to run as root (KMSDRM/OrangePi) or
+  `runuser -u kiosk` (X11/Pi 5). Eliminates the duplicated Panthor detection
+  loop that was previously in this script.
+- **Comments updated** — references to "libmali" in code comments corrected to
+  "Panthor" (the proprietary libmali driver was replaced by Mesa Panthor in
+  v2.1.3).
+- **Player docstring** updated to mention both Raspberry Pi 5 and OrangePi 5
+  Max as supported platforms.
+
+### Fixed
+- **OrangePi/Pi 5 code path isolation** — the 4K and X11-specific logic in
+  `player.py` (xrandr mode switching, `pygame.display.quit()` re-init) is
+  correctly skipped on KMSDRM (OrangePi) via the `using_kmsdrm` check, which
+  now uses the board detection module's `sdl_driver` value. The Raspberry Pi 5
+  X11 path is unaffected by the OrangePi KMSDRM changes.
+- **Consistent detection** — previously, `run.sh`, `kiosk-launch.sh`, and
+  `player.py` each had their own copy of the Panthor detection loop with
+  slightly different ranges (128-132 vs 128-140). Now all three use the same
+  `board_detect` module, eliminating detection inconsistencies.
+- **OrangePi + 1080p display support** — verified that the OrangePi 5 Max
+  works correctly when connected to a 1080p display (not just 4K). KMSDRM
+  detects the display's native mode and renders at 1920×1080. The 4K downscale
+  block is skipped because `args.width` (1920) is not > 3000. Tile cache is
+  sized for 1080p (15 tiles), same as a Pi 5 at 1080p. Also added a new code
+  path for the edge case of an OrangePi with only 4 GB RAM on a 4K display
+  (can't use xrandr on KMSDRM, so it renders native 4K with a memory-constrained
+  tile cache and a warning log).
+
+---
+
 ## v2.1 — Package refactor & self-sufficient install (2026-07-05)
 
 ### Changed
