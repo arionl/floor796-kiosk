@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 #
-# install.sh — Floor796 Kiosk installer for Raspberry Pi 5 (Raspbian)
+# install.sh — Floor796 Kiosk installer for embedded boards
 #
-# Assumes nothing beyond a fresh Raspberry Pi OS (Bookworm/Trixie) install
-# with at least 4 GB RAM and an internet connection.  Run as root:
+# Supports:
+#   - Raspberry Pi 5 (Raspbian Pi OS)  → X11 + Mesa V3D
+#   - OrangePi 5 Max (DietPi/Armbian)  → KMSDRM + Mesa Panthor
+#   - Generic Linux                    → X11 fallback
 #
+# Run as root:
 #     sudo bash install.sh
 #
 # What it does:
-#   1. Installs system dependencies (X server, ffmpeg, Python, numpy, scrot)
-#   2. Creates a dedicated 'kiosk' user if needed
-#   3. Installs the Python packages (pygame, brotli)
-#   4. Copies the floor796_kiosk package + deploy scripts
-#   5. Installs systemd service for cold-boot auto-start
-#   6. Disables desktop, lightdm, and all display sleep / screensaver
+#   1. Detects the board type
+#   2. Installs board-appropriate system dependencies
+#   3. Creates a dedicated 'kiosk' user if needed
+#   4. Installs the Python packages (pygame, brotli)
+#   5. Copies the floor796_kiosk package + deploy scripts
+#   6. Installs systemd service for cold-boot auto-start
+#   7. Disables desktop, lightdm, and all display sleep / screensaver
 #
 # On first boot, the player automatically:
 #   - Downloads tiles from floor796.com
@@ -49,24 +53,128 @@ if [[ ! -f "${SOURCE_DIR}/floor796_kiosk/player.py" ]]; then
     exit 1
 fi
 
-# ─── 1. System packages ──────────────────────────────────────────────────────
+# ─── 0. Detect board type ────────────────────────────────────────────────────
+echo "[0/7] Detecting board type..."
+
+# Try Python board_detect module first (most reliable)
+BOARD_TYPE=""
+GPU_DRIVER=""
+RENDER_BACKEND=""
+NEEDS_X11=""
+
+# Install python3 if not present (needed for board detection)
+if ! command -v python3 &>/dev/null; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null
+fi
+
+if python3 -c "import sys; sys.path.insert(0, '${SOURCE_DIR}'); from floor796_kiosk.board_detect import detect_board, get_render_config" 2>/dev/null; then
+    eval "$(cd "${SOURCE_DIR}" && python3 -m floor796_kiosk.board_detect --shell 2>/dev/null)"
+fi
+
+# Fallback: shell-based detection if Python module failed
+if [[ -z "${BOARD_TYPE}" ]]; then
+    MODEL=""
+    [[ -f /proc/device-tree/model ]] && MODEL="$(cat /proc/device-tree/model | tr -d '\0')"
+
+    if echo "${MODEL}" | grep -qi "raspberry pi"; then
+        BOARD_TYPE="raspberry_pi_5"
+        GPU_DRIVER="v3d"
+        RENDER_BACKEND="x11"
+        NEEDS_X11=1
+    elif echo "${MODEL}" | grep -qi "orangepi"; then
+        BOARD_TYPE="orangepi_5"
+        GPU_DRIVER="panthor"
+        RENDER_BACKEND="kmsdrm"
+        NEEDS_X11=0
+    else
+        # Check DRM render nodes for GPU driver
+        for i in 128 129 130 131 132; do
+            if [[ -f "/sys/class/drm/renderD${i}/device/uevent" ]]; then
+                if grep -q panthor "/sys/class/drm/renderD${i}/device/uevent" 2>/dev/null; then
+                    BOARD_TYPE="orangepi_5"
+                    GPU_DRIVER="panthor"
+                    RENDER_BACKEND="kmsdrm"
+                    NEEDS_X11=0
+                    break
+                fi
+                if grep -q v3d "/sys/class/drm/renderD${i}/device/uevent" 2>/dev/null; then
+                    BOARD_TYPE="raspberry_pi_5"
+                    GPU_DRIVER="v3d"
+                    RENDER_BACKEND="x11"
+                    NEEDS_X11=1
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # Ultimate fallback
+    if [[ -z "${BOARD_TYPE}" ]]; then
+        BOARD_TYPE="generic"
+        GPU_DRIVER="unknown"
+        RENDER_BACKEND="x11"
+        NEEDS_X11=1
+    fi
+fi
+
+echo "    ✓ Board: ${BOARD_TYPE}"
+echo "      GPU: ${GPU_DRIVER}, Render: ${RENDER_BACKEND}, X11: ${NEEDS_X11}"
+echo ""
+
+# ─── 1. System packages (board-specific) ─────────────────────────────────────
 echo "[1/7] Installing system packages..."
+
+# Common packages needed on all boards
+COMMON_PKGS=(
+    ffmpeg
+    python3
+    python3-pip
+    python3-venv
+    python3-numpy
+    mesa-utils
+    libegl-mesa0
+    libgles2
+)
+
+# Board-specific packages
+if [[ "${BOARD_TYPE}" == "orangepi_5" ]]; then
+    # OrangePi 5 Max: KMSDRM + Panthor — no X11 needed
+    # Mesa packages provide libgbm, libEGL, libGLES for KMSDRM
+    BOARD_PKGS=(
+        libgbm1
+        libgl1-mesa-dri
+        mesa-va-drivers
+    )
+    echo "    (OrangePi: installing KMSDRM/Mesa packages, skipping X11)"
+elif [[ "${BOARD_TYPE}" == "raspberry_pi_5" ]]; then
+    # Raspberry Pi 5: X11 + V3D
+    BOARD_PKGS=(
+        xserver-xorg
+        xserver-xorg-video-all
+        xserver-xorg-video-fbdev
+        xinit
+        x11-xserver-utils
+        scrot
+    )
+    echo "    (Raspberry Pi: installing X11 + Mesa packages)"
+else
+    # Generic: install X11 + Mesa (works on most boards)
+    BOARD_PKGS=(
+        xserver-xorg
+        xserver-xorg-video-all
+        xserver-xorg-video-fbdev
+        xinit
+        x11-xserver-utils
+        scrot
+    )
+    echo "    (Generic: installing X11 + Mesa packages)"
+fi
+
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    xserver-xorg \
-    xserver-xorg-video-all \
-    xserver-xorg-video-fbdev \
-    xinit \
-    x11-xserver-utils \
-    ffmpeg \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-numpy \
-    scrot \
-    mesa-utils \
-    libegl-mesa0 \
-    libgles2 \
+    "${COMMON_PKGS[@]}" \
+    "${BOARD_PKGS[@]}" \
     >/dev/null
 echo "    ✓ System packages installed"
 
@@ -117,32 +225,56 @@ mkdir -p "${INSTALL_DIR}/cache/strips" "${INSTALL_DIR}/cache/thumbnails"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
 echo "    ✓ Files copied"
 
-# ─── 5. Disable desktop & display sleep ──────────────────────────────────────
-echo "[5/6] Configuring kiosk mode..."
+# ─── 5. Board-specific configuration ─────────────────────────────────────────
+echo "[5/7] Configuring kiosk mode..."
 
-# Disable lightdm/desktop manager — we run our own bare X server
-systemctl disable lightdm 2>/dev/null || true
-systemctl mask lightdm 2>/dev/null || true
+if [[ "${BOARD_TYPE}" == "orangepi_5" ]]; then
+    # OrangePi 5 Max: No X11, no desktop manager to disable.
+    # Set default target to multi-user (no desktop).
+    systemctl set-default multi-user.target
 
-# Set default target to multi-user (no desktop)
-systemctl set-default multi-user.target
-
-# Disable HDMI blanking in boot config
-CONFIG_TXT="/boot/firmware/config.txt"
-[[ ! -f "${CONFIG_TXT}" ]] && CONFIG_TXT="/boot/config.txt"
-
-if [[ -f "${CONFIG_TXT}" ]]; then
-    if ! grep -q "hdmi_blanking=0" "${CONFIG_TXT}" 2>/dev/null; then
-        echo "hdmi_blanking=0" >> "${CONFIG_TXT}"
+    # Disable display sleep via console blanking
+    if [ -f /sys/class/graphics/fb0/blank ]; then
+        echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true
     fi
-    if ! grep -q "hdmi_force_hotplug=1" "${CONFIG_TXT}" 2>/dev/null; then
-        echo "hdmi_force_hotplug=1" >> "${CONFIG_TXT}"
+
+    # Set console blanking to 0 (never blank)
+    if [ -f /etc/sysctl.d/ ]; then
+        echo "kernel.consoleblank=0" > /etc/sysctl.d/99-kiosk-consoleblank.conf
     fi
+
+    echo "    ✓ KMSDRM mode configured (no X11, no desktop)"
+else
+    # Raspberry Pi 5 / generic: disable desktop manager
+    systemctl disable lightdm 2>/dev/null || true
+    systemctl mask lightdm 2>/dev/null || true
+
+    # Set default target to multi-user (no desktop)
+    systemctl set-default multi-user.target
+
+    # Disable HDMI blanking in boot config (Raspberry Pi)
+    CONFIG_TXT="/boot/firmware/config.txt"
+    [[ ! -f "${CONFIG_TXT}" ]] && CONFIG_TXT="/boot/config.txt"
+
+    if [[ -f "${CONFIG_TXT}" ]]; then
+        if ! grep -q "hdmi_blanking=0" "${CONFIG_TXT}" 2>/dev/null; then
+            echo "hdmi_blanking=0" >> "${CONFIG_TXT}"
+        fi
+        if ! grep -q "hdmi_force_hotplug=1" "${CONFIG_TXT}" 2>/dev/null; then
+            echo "hdmi_force_hotplug=1" >> "${CONFIG_TXT}"
+        fi
+    fi
+
+    # Set console blanking to 0 (never blank)
+    if [ -d /etc/sysctl.d/ ]; then
+        echo "kernel.consoleblank=0" > /etc/sysctl.d/99-kiosk-consoleblank.conf
+    fi
+
+    echo "    ✓ Desktop disabled, display sleep prevented"
 fi
-echo "    ✓ Desktop disabled, display sleep prevented"
 
 # ─── 6. Enable kiosk service ─────────────────────────────────────────────────
-echo "[6/6] Enabling kiosk service..."
+echo "[6/7] Enabling kiosk service..."
 systemctl daemon-reload
 systemctl enable floor796-kiosk.service
 echo "    ✓ Kiosk service enabled (starts on boot)"
@@ -153,10 +285,19 @@ echo "════════════════════════�
 echo "  Installation Complete!"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
+echo "  Board:        ${BOARD_TYPE}"
+echo "  GPU driver:   ${GPU_DRIVER}"
+echo "  Render:       ${RENDER_BACKEND}"
 echo "  Install dir:  ${INSTALL_DIR}"
 echo "  Service:      floor796-kiosk.service"
 echo "  User:         ${SERVICE_USER}"
 echo ""
+if [[ "${BOARD_TYPE}" == "orangepi_5" ]]; then
+    echo "  NOTE: OrangePi uses KMSDRM (no X11). The service runs as root"
+    echo "  for DRM master access. Ensure the Panthor kernel module is"
+    echo "  loaded and /dev/dri/renderD* exists."
+    echo ""
+fi
 echo "  To start now:   sudo systemctl start floor796-kiosk"
 echo "  To check logs:  journalctl -u floor796-kiosk -f"
 echo "  To stop:        sudo systemctl stop floor796-kiosk"

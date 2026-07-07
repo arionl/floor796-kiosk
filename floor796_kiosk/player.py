@@ -20,8 +20,9 @@ Controls (for maintenance/testing only):
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
-Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display.
-The player auto-detects the native display resolution at startup.
+Designed for Raspberry Pi 5 (4 GB+) with a 1920×1200 or 1920×1080 display,
+or OrangePi 5 Max (8 GB) with a 3840×2160 (4K) display.
+The player auto-detects the board type and native display resolution at startup.
 """
 
 import argparse
@@ -65,6 +66,8 @@ from floor796_kiosk.paths import (
 from floor796_kiosk.cpu_affinity import (
     pin_main_thread, pin_background_thread, get_affinity_info,
 )
+
+from floor796_kiosk.board_detect import detect_board, get_render_config, BoardType
 
 # Resolution of the per-tile content-density mask (must match content_mask.py)
 MASK_COLS = 32
@@ -1177,30 +1180,22 @@ def main():
     # No-op on homogeneous SoCs like the Raspberry Pi 5.
     pin_main_thread()
 
-    # ── Select SDL2 video driver ──
-    # On the OrangePi 5 Max (RK3588 + Panthor), the proprietary libmali
-    # driver was replaced with Mesa's Panthor driver.  Panthor provides
-    # a standard DRM render node (/dev/dri/renderD13x) that works with
-    # Mesa's libgbm and libEGL, so SDL2's KMSDRM backend works out of
-    # the box for hardware-accelerated EGL/GLES on the Mali-G610 GPU.
-    #
-    # On the Raspberry Pi 5, Mesa's V3D driver works fine through X11, so
-    # we keep the default.  KMSDRM is also available on the Pi 5 but X11
-    # is more reliable for fullscreen apps there.
-    #
-    # Detection: if a Panthor render node exists, prefer KMSDRM.
+    # ── Select SDL2 video driver (board-specific) ──
+    # Board detection is centralized in floor796_kiosk.board_detect.
+    #   - OrangePi 5 Max (RK3588 + Mesa Panthor) → KMSDRM, no X11
+    #   - Raspberry Pi 5 (Mesa V3D)              → X11
+    #   - Generic / unknown                       → X11 fallback
     # Allow override via SDL_VIDEODRIVER env var.
     if "SDL_VIDEODRIVER" not in os.environ:
-        has_panthor = any(
-            os.path.exists(f"/sys/class/drm/renderD{i}/device/uevent")
-            and "panthor" in open(f"/sys/class/drm/renderD{i}/device/uevent").read()
-            for i in range(128, 140)
-        )
-        if has_panthor:
-            os.environ["SDL_VIDEODRIVER"] = "kmsdrm"
-            log.info("Panthor GPU detected — using KMSDRM for hardware GPU acceleration")
-        else:
-            os.environ["SDL_VIDEODRIVER"] = "x11"
+        board = detect_board()
+        render_cfg = get_render_config(board)
+        os.environ["SDL_VIDEODRIVER"] = render_cfg.sdl_driver
+        log.info("Board: %s — using %s for rendering (gpu=%s, x11=%s)",
+                 board.value, render_cfg.sdl_driver,
+                 render_cfg.gpu_driver, render_cfg.needs_x11)
+    else:
+        log.info("SDL_VIDEODRIVER overridden to '%s' via environment",
+                 os.environ["SDL_VIDEODRIVER"])
 
     pygame.init()
 
@@ -1230,7 +1225,7 @@ def main():
     # display mode — otherwise set_mode() uses stale dimensions and the
     # fullscreen window ends up positioned in a corner.
     #
-    # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with libmali),
+    # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with Panthor),
     # we skip the downscale — native 4K with hardware GPU acceleration is
     # fast enough (~30 FPS).
     physical_w = args.width
@@ -1274,7 +1269,7 @@ def main():
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # With KMSDRM + Mali GPU, both FULLSCREEN and SCALED use hardware GLES
+    # With KMSDRM + Panthor GPU, both FULLSCREEN and SCALED use hardware GLES
     # rendering via the SDL renderer.  SCALED gives us vsync + page-flip.
     # With X11 (Pi 5), SCALED also uses the SDL renderer (Mesa V3D GPU).
     # At 4K with X11 + llvmpipe (old config), FULLSCREEN was faster because

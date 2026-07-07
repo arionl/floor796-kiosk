@@ -1,6 +1,12 @@
 #!/bin/sh
 # Floor796 Kiosk — boot wrapper
-# Starts the player either with X11 (Pi 5) or KMSDRM (OrangePi with Panthor).
+# Starts the player with the correct rendering path based on board type.
+#
+#   - OrangePi 5 Max (RK3588 + Panthor): KMSDRM direct rendering, no X server
+#   - Raspberry Pi 5 (V3D): X server + SDL X11 driver
+#   - Generic: X server + SDL X11 driver
+#
+# Board detection is handled by floor796_kiosk.board_detect (Python).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,29 +23,17 @@ if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
     done
 fi
 
-# ── Choose rendering path ──
-# On the OrangePi 5 Max (RK3588 + Mesa Panthor), use KMSDRM — no X server
-# needed. The player connects directly to the DRM/KMS subsystem via
-# GBM and gets hardware-accelerated EGL/GLES on the Mali-G610 GPU.
-#
-# On the Raspberry Pi 5, start X (needed for Mesa V3D driver).
-# Detect Panthor by looking for a panthor render node.
-HAS_PANTHOR=""
-for i in 128 129 130 131 132; do
-    if [ -f "/sys/class/drm/renderD${i}/device/uevent" ]; then
-        if grep -q panthor "/sys/class/drm/renderD${i}/device/uevent" 2>/dev/null; then
-            HAS_PANTHOR=1
-            break
-        fi
-    fi
-done
+# ── Detect board type and rendering configuration ──
+# Uses the Python board_detect module for consistent detection between
+# the shell scripts and the player code.
+eval "$(python3 -m floor796_kiosk.board_detect --shell 2>/dev/null)"
 
-if [ -n "${HAS_PANTHOR}" ]; then
-    # OrangePi: KMSDRM direct rendering (no X11)
+if [ "${NEEDS_X11}" = "0" ]; then
+    # OrangePi 5 Max (RK3588 + Mesa Panthor): KMSDRM direct rendering (no X11)
     # KMSDRM needs root for DRM master access (page flip).
     exec "${SCRIPT_DIR}/kiosk-launch.sh"
 else
-    # Raspberry Pi: X server starts as root (needs VT7 access).
+    # Raspberry Pi 5 or generic: X server starts as root (needs VT7 access).
     # The player runs via the launch script as the kiosk user.
     xinit "${SCRIPT_DIR}/kiosk-launch.sh" \
         -- \

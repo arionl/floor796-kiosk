@@ -1,19 +1,15 @@
 #!/bin/sh
 # Floor796 Kiosk — player launcher
-# Called by run.sh. Runs as root initially; drops to kiosk user.
+# Called by run.sh. On OrangePi, runs as root; on Pi 5, drops to kiosk user.
 #
-# On the OrangePi 5 Max (RK3588 + Panthor), we use SDL2's KMSDRM video
-# driver to bypass X11 entirely and connect directly to the DRM/KMS
-# subsystem via GBM. Mesa's Panthor driver provides a standard DRM
-# render node that works with Mesa libgbm/libEGL, giving us hardware-
-# accelerated EGL/GLES on the Mali-G610 GPU.
+# Board detection is handled by floor796_kiosk.board_detect (Python).
+# The player code in player.py also calls detect_board() and sets
+# SDL_VIDEODRIVER accordingly — this script just provides the right
+# env vars and decides whether to run as root or the kiosk user.
 #
-# On the Raspberry Pi 5, Mesa's V3D driver works fine through X11, so
-# we keep the X11 path (xinit still starts X, SDL_VIDEODRIVER=x11).
-#
-# The player code in player.py auto-detects Panthor and sets
-# SDL_VIDEODRIVER=kmsdrm — this script just provides the right env vars
-# and decides whether to start X or not.
+#   - OrangePi 5 Max (Panthor): KMSDRM, runs as root (DRM master access)
+#   - Raspberry Pi 5 (V3D):     X11, runs as kiosk user
+#   - Generic:                   X11, runs as kiosk user
 
 export HOME=/home/kiosk
 export SDL_AUDIODRIVER=dummy
@@ -28,18 +24,10 @@ HEIGHT="${KIOSK_HEIGHT:-0}"
 
 cd "${INSTALL_DIR}"
 
-# ── Detect Panthor GPU and choose rendering path ──
-PANTHOR_DEVICE=""
-for i in 128 129 130 131 132; do
-    if [ -f "/sys/class/drm/renderD${i}/device/uevent" ]; then
-        if grep -q panthor "/sys/class/drm/renderD${i}/device/uevent" 2>/dev/null; then
-            PANTHOR_DEVICE="renderD${i}"
-            break
-        fi
-    fi
-done
+# ── Detect board type and rendering configuration ──
+eval "$(python3 -m floor796_kiosk.board_detect --shell 2>/dev/null)"
 
-if [ -n "${PANTHOR_DEVICE}" ]; then
+if [ "${RUNS_AS_ROOT}" = "1" ]; then
     # OrangePi 5 Max (RK3588 + Mali-G610 via Mesa Panthor):
     # Use KMSDRM for direct GPU access — no X11 needed.
     # Panthor + Mesa provides EGL/OpenGL ES via standard DRM/GBM.
@@ -56,7 +44,7 @@ if [ -n "${PANTHOR_DEVICE}" ]; then
         --width "${WIDTH}" \
         --height "${HEIGHT}"
 else
-    # Raspberry Pi 5 (Mesa V3D via X11):
+    # Raspberry Pi 5 (Mesa V3D via X11) or generic board:
     # X is started by xinit in run.sh; this script runs inside that X session.
     # The kiosk user can access the display through X.
     export SDL_VIDEODRIVER=x11
