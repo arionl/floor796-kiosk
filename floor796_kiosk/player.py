@@ -1177,7 +1177,31 @@ def main():
     # No-op on homogeneous SoCs like the Raspberry Pi 5.
     pin_main_thread()
 
-    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+    # ── Select SDL2 video driver ──
+    # On the OrangePi 5 Max (RK3588 + Panthor), the proprietary libmali
+    # driver was replaced with Mesa's Panthor driver.  Panthor provides
+    # a standard DRM render node (/dev/dri/renderD13x) that works with
+    # Mesa's libgbm and libEGL, so SDL2's KMSDRM backend works out of
+    # the box for hardware-accelerated EGL/GLES on the Mali-G610 GPU.
+    #
+    # On the Raspberry Pi 5, Mesa's V3D driver works fine through X11, so
+    # we keep the default.  KMSDRM is also available on the Pi 5 but X11
+    # is more reliable for fullscreen apps there.
+    #
+    # Detection: if a Panthor render node exists, prefer KMSDRM.
+    # Allow override via SDL_VIDEODRIVER env var.
+    if "SDL_VIDEODRIVER" not in os.environ:
+        has_panthor = any(
+            os.path.exists(f"/sys/class/drm/renderD{i}/device/uevent")
+            and "panthor" in open(f"/sys/class/drm/renderD{i}/device/uevent").read()
+            for i in range(128, 140)
+        )
+        if has_panthor:
+            os.environ["SDL_VIDEODRIVER"] = "kmsdrm"
+            log.info("Panthor GPU detected — using KMSDRM for hardware GPU acceleration")
+        else:
+            os.environ["SDL_VIDEODRIVER"] = "x11"
+
     pygame.init()
 
     # ── Auto-detect native display resolution ──
@@ -1205,13 +1229,19 @@ def main():
     # After xrandr, pygame must be quit+re-init so it picks up the new
     # display mode — otherwise set_mode() uses stale dimensions and the
     # fullscreen window ends up positioned in a corner.
+    #
+    # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with libmali),
+    # we skip the downscale — native 4K with hardware GPU acceleration is
+    # fast enough (~30 FPS).
     physical_w = args.width
     physical_h = args.height
     total_mem_mb = _detect_total_memory_mb()
     log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
 
-    if args.width > 3000 and total_mem_mb < 6144:
-        # Not enough RAM for native 4K — downscale to 1080p
+    using_kmsdrm = os.environ.get("SDL_VIDEODRIVER") == "kmsdrm"
+
+    if args.width > 3000 and total_mem_mb < 6144 and not using_kmsdrm:
+        # Not enough RAM for native 4K — downscale to 1080p (X11 only)
         render_w = 1920
         render_h = 1080
         try:
@@ -1244,13 +1274,15 @@ def main():
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # At 4K, use plain FULLSCREEN (direct framebuffer) for best performance.
-    # SCALED adds GL compositing overhead that's slower than direct blitting
-    # on this hardware.  At 1080p, SCALED enables GPU page-flip + vsync.
-    if args.width > 3000:
-        flags = pygame.FULLSCREEN if args.fullscreen else 0
+    # With KMSDRM + Mali GPU, both FULLSCREEN and SCALED use hardware GLES
+    # rendering via the SDL renderer.  SCALED gives us vsync + page-flip.
+    # With X11 (Pi 5), SCALED also uses the SDL renderer (Mesa V3D GPU).
+    # At 4K with X11 + llvmpipe (old config), FULLSCREEN was faster because
+    # SCALED added GL compositing overhead — but that path is no longer used.
+    if args.fullscreen:
+        flags = pygame.FULLSCREEN | pygame.SCALED
     else:
-        flags = pygame.FULLSCREEN | pygame.SCALED if args.fullscreen else pygame.SCALED
+        flags = pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
