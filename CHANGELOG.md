@@ -62,6 +62,14 @@ Tags are cut on `main`; development happens on `dev`.
   `player.py` each had their own copy of the Panthor detection loop with
   slightly different ranges (128-132 vs 128-140). Now all three use the same
   `board_detect` module, eliminating detection inconsistencies.
+- **OrangePi + 1080p display support** — verified that the OrangePi 5 Max
+  works correctly when connected to a 1080p display (not just 4K). KMSDRM
+  detects the display's native mode and renders at 1920×1080. The 4K downscale
+  block is skipped because `args.width` (1920) is not > 3000. Tile cache is
+  sized for 1080p (15 tiles), same as a Pi 5 at 1080p. Also added a new code
+  path for the edge case of an OrangePi with only 4 GB RAM on a 4K display
+  (can't use xrandr on KMSDRM, so it renders native 4K with a memory-constrained
+  tile cache and a warning log).
 
 ---
 

@@ -1214,20 +1214,27 @@ def main():
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
     # ── 4K handling ──
-    # On devices with ≤4 GB RAM (Pi 5), we can't render full 4K in real time
-    # (memory + GPU limits), so we switch X to 1080p and let the monitor's
-    # hardware scaler upscale to the panel.
+    # Four board+display scenarios to handle:
     #
-    # On devices with ≥6 GB RAM (e.g. OrangePi 5 with 8 GB), we render at
-    # native 4K — the viewport shows ~4× more tiles but memory is sufficient.
+    #   1. Pi 5 + 4K display:     Downscale to 1080p via xrandr (4 GB RAM
+    #      can't handle native 4K). Monitor hardware upscales to 3840×2160.
+    #
+    #   2. Pi 5 + 1080p display:  No action needed — render at native 1080p.
+    #
+    #   3. OrangePi + 4K display: Render at native 4K (8 GB RAM + Panthor
+    #      GPU acceleration is sufficient). KMSDRM doesn't use xrandr.
+    #
+    #   4. OrangePi + 1080p:      No action needed — render at native 1080p.
+    #      KMSDRM detects the display's native mode. Panthor handles 1080p
+    #      effortlessly. The 4K downscale block below is skipped because
+    #      args.width (1920) is not > 3000.
     #
     # After xrandr, pygame must be quit+re-init so it picks up the new
     # display mode — otherwise set_mode() uses stale dimensions and the
     # fullscreen window ends up positioned in a corner.
     #
     # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with Panthor),
-    # we skip the downscale — native 4K with hardware GPU acceleration is
-    # fast enough (~30 FPS).
+    # we skip the downscale — KMSDRM uses the display's native mode directly.
     physical_w = args.width
     physical_h = args.height
     total_mem_mb = _detect_total_memory_mb()
@@ -1236,7 +1243,9 @@ def main():
     using_kmsdrm = os.environ.get("SDL_VIDEODRIVER") == "kmsdrm"
 
     if args.width > 3000 and total_mem_mb < 6144 and not using_kmsdrm:
-        # Not enough RAM for native 4K — downscale to 1080p (X11 only)
+        # Pi 5 (or low-RAM board) + 4K display + X11:
+        # Not enough RAM for native 4K — downscale to 1080p via xrandr.
+        # The monitor's hardware scaler upscales 1080p → 3840×2160.
         render_w = 1920
         render_h = 1080
         try:
@@ -1263,7 +1272,18 @@ def main():
         except Exception as e:
             log.warning("Could not switch display mode: %s — "
                        "rendering at native %dx%d", e, args.width, args.height)
+    elif args.width > 3000 and total_mem_mb < 6144 and using_kmsdrm:
+        # OrangePi (or low-RAM KMSDRM board) + 4K display + < 6 GB RAM:
+        # Can't use xrandr (KMSDRM doesn't support it). KMSDRM will render
+        # at the display's native 4K mode, but memory may be tight.
+        # Reduce tile cache to fit available memory — _compute_max_tiles()
+        # already caps by RAM, so we just log a warning.
+        log.warning("4K display on low-RAM KMSDRM board (%d MB) — "
+                    "rendering at native %dx%d, tile cache will be "
+                    "memory-constrained", total_mem_mb, args.width, args.height)
     elif args.width > 3000:
+        # OrangePi + 4K display with sufficient RAM, or any board with
+        # ≥ 6 GB RAM on a 4K display.
         log.info("4K display detected — rendering at native %dx%d "
                  "(%d MB RAM sufficient for native 4K)",
                  args.width, args.height, total_mem_mb)
