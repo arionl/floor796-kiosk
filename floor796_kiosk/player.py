@@ -98,6 +98,9 @@ SPACING_H = int(812 * SCALE)       # 812
 DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
+# On boards with small tile caches, the full margin ring can exceed max_tiles.
+# We compute an effective margin that fits within the cache budget after
+# reserving slots for visible tiles, preventing load-evict-reload churn.
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
 # Memory budget on 4 GB Pi (1080p):
@@ -106,8 +109,18 @@ COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 #   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
 # At 4K (3840x2160) the viewport shows ~4× more tiles; scale max_tiles
 # accordingly, but cap by available memory.
-MAX_TILES_BASE = 15          # baseline for 1080p + 4 GB RAM
+MAX_TILES_BASE = 18          # baseline for 1080p + 4 GB RAM (9 visible + 9 margin)
 MAX_TILES_CAP = 40           # hard ceiling (strip cache ~3.8 GB)
+
+# Boards with <= 4 GB usable RAM (most 4 GB boards report ~4000-4050 MB).
+# Set slightly below 4096 so 4 GB boards (which typically report ~4000-4050 MB
+# usable) don't trigger the low-memory banner.  2 GB boards report ~2000 MB.
+LOW_MEM_THRESHOLD_MB = 3900
+
+# Boards with <= 4 GB RAM are capped at 1080p regardless of the attached
+# display's native resolution.  Higher resolutions need too many tiles in
+# the viewport cache, causing OOM on 2-4 GB boards.
+MAX_RES_1080P_MEM_MB = 4096
 
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
@@ -166,7 +179,7 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     # The mem_cap MUST be able to drop below MAX_TILES_BASE on constrained
     # boards — the previous `max(MAX_TILES_BASE, ...)` floor defeated it
     # entirely and caused OOM kills every ~5 min on 2 GB Pi 5 boards.
-    if total_mem_mb > 0 and total_mem_mb < 4096:
+    if total_mem_mb > 0 and total_mem_mb < LOW_MEM_THRESHOLD_MB:
         # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
         reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
         mem_budget_mb = max(0, total_mem_mb - reserve_mb)
@@ -177,6 +190,38 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     return min(max_t, MAX_TILES_CAP)
 
 # ─── Status Display ───────────────────────────────────────────────────────────
+
+def _compute_effective_margin(max_tiles, view_w, view_h):
+    """Shrink the margin ring to fit within the tile cache budget.
+
+    The visible tiles at 1080p occupy ~6-9 slots (with partial overlaps
+    at tile boundaries).  With max_tiles=15, that leaves ~6-9 slots for
+    margin.  A 2-ring margin can request up to ~40 tiles, far exceeding the
+    budget — causing load-evict-reload churn.
+
+    We pick the largest margin (0, 1, or 2) whose estimated tile count fits
+    in the remaining budget, so the background worker only loads tiles we
+    can keep.  Estimates account for partial-tile overlaps (visible count is
+    ~1 tile more per axis) and directional filtering (~halves margin tiles).
+    """
+    cols = max(1, math.ceil(view_w / SPACING_W))
+    rows = max(1, math.ceil(view_h / SPACING_H))
+    # Account for partial-tile overlap: the viewport straddles tile boundaries,
+    # so it typically shows (cols+1) × (rows+1) tiles.
+    vis_count = (cols + 1) * (rows + 1)
+    budget = max_tiles - vis_count
+    for margin in range(CACHE_MARGIN, -1, -1):
+        if margin <= 0:
+            return 0
+        ring_cols = cols + 1 + 2 * margin
+        ring_rows = rows + 1 + 2 * margin
+        full_ring = ring_cols * ring_rows - vis_count
+        # Directional filtering keeps roughly half the margin ring.
+        margin_tiles = math.ceil(full_ring / 2)
+        if margin_tiles <= budget:
+            return margin
+    return 0
+
 
 class StatusDisplay:
     """Renders loading / progress messages on the pygame window."""
@@ -352,6 +397,10 @@ class TileCache:
         self._lock = threading.Lock()
         self._worker = None
         self._stop_flag = False
+        # Last-known tile priority sets from set_needed(). Used by
+        # poll_results() to do intelligent eviction (never evict visible).
+        self._visible_ids = set()
+        self._needed_ids = set()
 
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
@@ -410,6 +459,9 @@ class TileCache:
 
     def set_needed(self, visible_ids, margin_ids):
         needed = visible_ids | margin_ids
+        # Stash priority sets for poll_results() intelligent eviction.
+        self._visible_ids = visible_ids
+        self._needed_ids = needed
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
@@ -473,18 +525,22 @@ class TileCache:
         # by the size of ready, which on memory-constrained boards (2 GB Pi)
         # triggers the OOM killer before the next set_needed() can evict.
         for tid, (surf, num_frames) in ready.items():
-            # Surface is already converted to 16-bit by the background thread.
             self.cache[tid] = (surf, num_frames)
             self.load_count += 1
-        # Evict down to max_tiles if we overshot. Prefer keeping visible /
-        # margin tiles (caller will re-issue set_needed next frame, but this
-        # bounds peak memory between frames).
+        # Intelligent eviction using last-known priority from set_needed().
+        # NEVER evict visible tiles — that causes on-screen blanking.
         if len(self.cache) > self.max_tiles:
-            with self._lock:
-                # Evict oldest-inserted first (dict preserves insertion order
-                # in Python 3.7+); caller's set_needed will refine further.
-                while len(self.cache) > self.max_tiles:
-                    self.cache.pop(next(iter(self.cache)))
+            vis = self._visible_ids
+            needed = self._needed_ids
+            # Priority 1: evict tiles not in the needed set at all
+            evictable = [t for t in self.cache if t not in needed]
+            while len(self.cache) > self.max_tiles and evictable:
+                self.cache.pop(evictable.pop(0))
+            # Priority 2: evict needed-but-not-visible (margin tiles)
+            if len(self.cache) > self.max_tiles:
+                evictable = [t for t in self.cache if t not in vis]
+                while len(self.cache) > self.max_tiles and evictable:
+                    self.cache.pop(evictable.pop())
 
     def preload_all(self, tile_ids, status=None, status_label=""):
         total = len(tile_ids)
@@ -1289,15 +1345,28 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
-    # ── 4K handling ──
-    # With KMSDRM on all supported boards, the display runs at its native
-    # mode.  For low-RAM boards (< 6 GB) with a 4K display, KMSDRM renders
-    # at native 4K but _compute_max_tiles() caps the tile cache by RAM so
-    # we don't OOM.  The old X11 xrandr downscale path is gone.
-    physical_w = args.width
-    physical_h = args.height
+    # ── Resolution cap for low-RAM boards ──
+    # Boards with <= 4 GB RAM are capped at 1080p even if a higher-res
+    # display is attached (e.g. 1440p/4K monitor).  Higher resolutions need
+    # too many tiles in the viewport cache for the memory budget.
     total_mem_mb = _detect_total_memory_mb()
     log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
+
+    if total_mem_mb > 0 and total_mem_mb <= MAX_RES_1080P_MEM_MB:
+        if args.width > 1920 or args.height > 1080:
+            log.info("Capping display from %dx%d to 1920x1080 "
+                     "(%d MB RAM <= %d MB threshold)",
+                     args.width, args.height, total_mem_mb,
+                     MAX_RES_1080P_MEM_MB)
+            args.width = 1920
+            args.height = 1080
+
+    # ── 4K handling ──
+    # Only 8 GB+ boards with native 4K displays reach this path (low-RAM
+    # boards are capped at 1080p above).  _compute_max_tiles() caps the
+    # tile cache by RAM as a defense in depth.
+    physical_w = args.width
+    physical_h = args.height
 
     if args.width > 3000 and total_mem_mb < 6144:
         log.warning("4K display on low-RAM board (%d MB) — "
@@ -1326,9 +1395,9 @@ def main():
 
     # ── Low-memory startup warning ──
     # This is the very first thing the user sees. If the board has less
-    # than 4 GB RAM the tile cache will be too small to keep all in-view
+    # than ~4 GB RAM the tile cache will be too small to keep all in-view
     # tiles loaded — we tell the user up front.
-    low_memory = 0 < total_mem_mb < 4096
+    low_memory = 0 < total_mem_mb < LOW_MEM_THRESHOLD_MB
     if low_memory:
         ram_gb = total_mem_mb / 1024
         log.warning("Low memory: %d MB (%.0f GB) — below 4 GB recommendation. "
@@ -1440,12 +1509,13 @@ def main():
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
     max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
-    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM)",
-             max_tiles, args.width, args.height, total_mem_mb)
+    effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
+    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM, margin=%d)",
+             max_tiles, args.width, args.height, total_mem_mb, effective_margin)
     cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
-        grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
+        grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
     )
     cache.preload_all(visible_tile_ids, status=status,
                       status_label="Loading visible tiles")
@@ -1529,8 +1599,8 @@ def main():
     if low_memory:
         mem_banner = MemoryWarningBanner(screen, total_mem_mb,
                                          overscan_margin=args.overscan_margin)
-        log.info("Memory warning banner enabled (%d MB < 4 GB, overscan margin %dpx)",
-                 total_mem_mb, args.overscan_margin)
+        log.info("Memory warning banner enabled (%d MB < %d MB, overscan margin %dpx)",
+                 total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
 
     running = True
     while running:
@@ -1605,7 +1675,7 @@ def main():
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
             tiles_meta=tiles_meta,
-            margin=CACHE_MARGIN, tile_grid=tile_grid,
+            margin=effective_margin, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
             vel_x=wanderer.heading()[0] if wandering else 0,
             vel_y=wanderer.heading()[1] if wandering else 0,
