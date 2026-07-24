@@ -22,6 +22,10 @@ INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WIDTH="${KIOSK_WIDTH:-0}"
 HEIGHT="${KIOSK_HEIGHT:-0}"
 
+# KIOSK_OVERSCAN_MARGIN: pixels to inset UI elements for TVs with
+# overscan.  0 = disabled (default, correct for modern displays).
+OVERSCAN="${KIOSK_OVERSCAN_MARGIN:-0}"
+
 cd "${INSTALL_DIR}"
 
 # ── Detect board type and rendering configuration ──
@@ -42,7 +46,8 @@ if [ "${RUNS_AS_ROOT}" = "1" ]; then
         -m floor796_kiosk \
         --fullscreen \
         --width "${WIDTH}" \
-        --height "${HEIGHT}"
+        --height "${HEIGHT}" \
+        --overscan-margin "${OVERSCAN}"
 else
     # Raspberry Pi 5 (Mesa V3D via X11) or generic board:
     # X is started by xinit in run.sh; this script runs inside that X session.
@@ -54,5 +59,6 @@ else
         -m floor796_kiosk \
         --fullscreen \
         --width "${WIDTH}" \
-        --height "${HEIGHT}"
+        --height "${HEIGHT}" \
+        --overscan-margin "${OVERSCAN}"
 fi
