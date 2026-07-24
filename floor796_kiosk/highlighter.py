@@ -577,6 +577,10 @@ class ObjectHighlighter:
                 self.highlights_shown += 1
                 # Record view timestamp
                 now = time.time()
+                last = self._last_shown.get(seg.obj_id)
+                ago = f"first time" if last is None else f"{now - last:.0f}s ago"
+                log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
+                         seg.obj_id, seg.title[:40], ago, len(self._last_shown))
                 self._last_shown[seg.obj_id] = now
                 history = self._view_history.setdefault(seg.obj_id, [])
                 history.append(now)
@@ -599,6 +603,8 @@ class ObjectHighlighter:
                         seg.abs_y2 < vp_y1 + clip_margin_y or
                         seg.abs_y1 > vp_y2 - clip_margin_y):
                     # Scrolled off — immediately select next
+                    log.info("Scroll-off abort: obj %d '%s' left viewport at %.1fs",
+                             seg.obj_id, seg.title[:30], self._timer)
                     self._current_seg = None
                     self._state = STATE_IDLE
                     self._timer = 0.0
