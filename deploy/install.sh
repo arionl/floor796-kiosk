@@ -135,6 +135,7 @@ COMMON_PKGS=(
     mesa-utils
     libegl-mesa0
     libgles2
+    libcairo2
 )
 
 # Board-specific packages
@@ -197,7 +198,12 @@ if ! python3 -c "import pygame, brotli, PIL" 2>/dev/null; then
     pip3 install --break-system-packages pygame-ce brotli pillow 2>/dev/null || \
     pip3 install pygame-ce brotli pillow
 fi
-echo "    ✓ pygame + brotli + pillow ready"
+# cairosvg (SVG thumbnails) + pillow-heif (HEIC/HEIF thumbnails)
+# Requires libcairo2 system lib (installed in step 1 if missing)
+pip3 install --break-system-packages cairosvg pillow-heif 2>/dev/null || \
+    pip3 install cairosvg pillow-heif 2>/dev/null || \
+    echo "    ⚠ cairosvg/pillow-heif not installed (SVG/HEIC thumbnails will be skipped)"
+echo "    ✓ pygame + brotli + pillow + cairosvg + pillow-heif ready"
 
 # ─── 4. Copy files ───────────────────────────────────────────────────────────
 echo "[4/7] Installing to ${INSTALL_DIR}..."

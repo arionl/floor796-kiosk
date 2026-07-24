@@ -114,11 +114,13 @@ def _extract_og_image(html_bytes):
             return m.group(1)
 
     # Fallback: first <img> tag src (useful for floor796 pages without og:image)
-    # Skip SVGs and other pygame-unsupported formats
+    # Skip SVGs in <img> tags — they are almost always site logos/icons, not
+    # content thumbnails. AVIF/HEIC/HEIF are legitimate photo formats and
+    # are handled by the Pillow fallback in _decode_image().
     for m in _IMG_TAG_RE.finditer(html):
         src = m.group(1)
         lower = src.lower().split("?")[0]
-        if lower.endswith((".svg", ".avif", ".heic", ".heif")):
+        if lower.endswith(".svg"):
             continue
         return src
 
@@ -303,15 +305,17 @@ def resolve_thumb_url(link):
     return lt, None, None
 
 
-def _decode_image(raw_bytes, obj_id=0, title=""):
+def _decode_image(raw_bytes, obj_id=0, title="", url=None):
     """Decode raw image bytes into a pygame Surface.
 
-    Tries pygame.image.load first. If that fails (e.g. WEBP, AVIF,
-    or other unsupported formats), falls back to Pillow which has
-    broader format support (WEBP, AVIF via pillow-avif, etc.).
+    Tries pygame.image.load first. If that fails (WEBP, AVIF, HEIC,
+    SVG, or other formats SDL_image can't handle), falls back to
+    Pillow which supports WEBP and AVIF natively, HEIC via pillow-heif,
+    and SVG via cairosvg.
+
     Returns a 24/32-bit Surface, or None on failure.
     """
-    # ── Try pygame first ──
+    # ── Try pygame first (fast path for JPEG/PNG/GIF/BMP) ──
     try:
         src_surf = pygame.image.load(io.BytesIO(raw_bytes))
         if src_surf.get_bitsize() < 24:
@@ -320,13 +324,51 @@ def _decode_image(raw_bytes, obj_id=0, title=""):
     except pygame.error:
         pass  # Fall through to Pillow
 
-    # ── Pillow fallback for formats pygame can't decode ──
+    # ── Detect SVG by magic bytes (XML containing <svg) ──
+    is_svg = False
+    try:
+        sniff = raw_bytes[:512].lstrip()[:4].lower()
+        if sniff.startswith(b"<") and b"<svg" in raw_bytes[:1024].lower():
+            is_svg = True
+    except Exception:
+        pass
+
+    # Also check URL hint
+    if url and url.lower().split("?")[0].endswith(".svg"):
+        is_svg = True
+
+    # ── SVG: render via cairosvg → PNG bytes → pygame ──
+    if is_svg:
+        try:
+            import cairosvg
+            png_bytes = cairosvg.svg2png(
+                bytestring=raw_bytes,
+                output_width=THUMB_W * 2,  # render at 2x for quality
+                output_height=THUMB_H * 2,
+            )
+            src_surf = pygame.image.load(io.BytesIO(png_bytes))
+            if src_surf.get_bitsize() < 24:
+                src_surf = src_surf.convert(32)
+            return src_surf
+        except Exception as e:
+            log.warning("Save failed for obj %d (%s): SVG decode error: %s",
+                        obj_id, title[:40], e)
+            return None
+
+    # ── Pillow fallback for WEBP, AVIF, HEIC, etc. ──
     try:
         from PIL import Image
     except ImportError:
         log.warning("Save failed for obj %d (%s): pygame can't decode format "
                     "and Pillow not installed", obj_id, title[:40])
         return None
+
+    # Register HEIC/HEIF support (idempotent)
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
 
     try:
         pil_img = Image.open(io.BytesIO(raw_bytes))
@@ -449,7 +491,7 @@ def main():
 
     # ── Fetch phase: download raw bytes in parallel ──────────────────────────
     stats = Counter()
-    pending_resizes = []  # list of (raw_bytes, cache_file, obj_id, title)
+    pending_resizes = []  # list of (raw_bytes, cache_file, obj_id, title, thumb_url)
     failed_items = []
     start_time = time.time()
 
@@ -488,7 +530,8 @@ def main():
             lt, status, raw_bytes, cache_file, item, detail = future.result()
 
             if status == "ok" and raw_bytes is not None:
-                pending_resizes.append((raw_bytes, cache_file, item["id"], item.get("t", "")))
+                pending_resizes.append((raw_bytes, cache_file, item["id"],
+                                       item.get("t", ""), detail))
                 stats["fetched"] += 1
                 stats[f"fetched_{lt}"] += 1
             else:
@@ -508,9 +551,10 @@ def main():
     # ── Resize + save phase: single-threaded (pygame not thread-safe) ────────
     log.info("Resizing and saving %d thumbnails...", len(pending_resizes))
 
-    for i, (raw_bytes, cache_file, obj_id, title) in enumerate(pending_resizes, 1):
+    for i, (raw_bytes, cache_file, obj_id, title, thumb_url) in enumerate(pending_resizes, 1):
         try:
-            src_surf = _decode_image(raw_bytes, obj_id, title)
+            src_surf = _decode_image(raw_bytes, obj_id, title,
+                                     url=thumb_url)
             if src_surf is None:
                 continue  # error already logged
             thumb = _resize_cover(src_surf, THUMB_W, THUMB_H)
