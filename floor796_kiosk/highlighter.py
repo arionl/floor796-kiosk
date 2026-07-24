@@ -47,12 +47,12 @@ CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
-BOX_COLOR = (255, 50, 50)        # bright red
-BOX_FILL = (255, 50, 50, 35)     # semi-transparent red fill
+BOX_COLOR = (255, 20, 20)        # bright red
+BOX_FILL = (255, 20, 20, 35)     # semi-transparent red fill
 BOX_OUTLINE = 3                   # pixels
 LABEL_BG = (15, 15, 20, 220)
 LABEL_TEXT = (255, 255, 255)
-LABEL_ACCENT = (255, 50, 50)
+LABEL_ACCENT = (255, 20, 20)
 CORNER_PANEL_BG = (15, 15, 20, 230)
 CORNER_PANEL_BORDER = (60, 60, 80)
 
@@ -62,18 +62,20 @@ CORNER_PANEL_BORDER = (60, 60, 80)
 #   Intense flashing with expanding glow halos and brightness oscillation.
 #   Decays from full intensity to settle into phase 2.
 #
-# Phase 2 — Subtle steady-state pulse (rest of highlight):
-#   A slow, gentle breathing effect that keeps the box alive without
-#   being distracting.  Brightness gently oscillates between
-#   STEADY_MIN and 1.0 at STEADY_SPEED Hz.
+# Phase 2 — Breathing glow (rest of highlight):
+#   An alpha-channel gradient that radiates outward from the box for
+#   GLOW_RADIUS pixels, gently expanding/contracting and fading in/
+#   out at STEADY_SPEED Hz.
 PULSE_DURATION = 1.8             # seconds of attention-grab flash
 PULSE_SPEED = 5.0                # Hz — flash oscillations during phase 1
 PULSE_GLOW_MAX = 8               # max glow radius in pixels during phase 1
 PULSE_INTENSITY_MIN = 0.35       # brightness floor during phase 1
 PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha during phase 1
 
-STEADY_SPEED = 0.7               # Hz — slow breathing pulse (~1.4s/cycle)
-STEADY_MIN = 0.65                # intensity floor during steady-state pulse
+STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
+GLOW_RADIUS = 16                 # outward gradient extent in pixels
+GLOW_STEPS = 16                  # number of concentric rect layers
+GLOW_PEAK_ALPHA = 90             # peak alpha at box edge when breathing peaks
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
 # The corner panel becomes vertical to accommodate a thumbnail image.
@@ -656,24 +658,24 @@ class ObjectHighlighter:
         Two phases:
           Phase 1 (0..PULSE_DURATION): attention-grab flash with glow
             halos and fast brightness oscillation, decaying envelope.
-          Phase 2 (PULSE_DURATION..end): subtle steady-state breathing
-            pulse. Brightness slowly oscillates between STEADY_MIN and
-            1.0 at STEADY_SPEED Hz. No glow halos.
+          Phase 2 (PULSE_DURATION..end): outward alpha-gradient glow
+            that breathes — expands/contracts and fades in/out at
+            STEADY_SPEED Hz. glow_px encodes the current gradient
+            extent (negative signals phase-2 gradient mode).
         """
         t = self._timer
 
         if t >= PULSE_DURATION:
-            # Phase 2 — subtle breathing pulse
+            # Phase 2 — breathing gradient glow
             osc = (math.sin(t * STEADY_SPEED * 2 * math.pi) + 1) / 2
-            intensity = STEADY_MIN + (1.0 - STEADY_MIN) * osc
-            return intensity, 0
+            # Glow radius breathes between 40% and 100% of GLOW_RADIUS
+            radius = int(GLOW_RADIUS * (0.4 + 0.6 * osc))
+            # Box itself stays at full brightness
+            return 1.0, -radius  # negative = phase-2 gradient mode
 
         # Phase 1 — attention-grab flash
-        # Envelope: starts at peak, decays linearly over PULSE_DURATION
         env = 1.0 - (t / PULSE_DURATION)  # 1.0 → 0.0
-        # Oscillation: 0..1 sinusoidal at PULSE_SPEED Hz
         osc = (math.sin(t * PULSE_SPEED * 2 * math.pi) + 1) / 2
-        # Combined intensity never drops below PULSE_INTENSITY_MIN
         intensity = PULSE_INTENSITY_MIN + (1.0 - PULSE_INTENSITY_MIN) * (
             env * osc + (1 - env))
         glow_px = int(PULSE_GLOW_MAX * env * (0.5 + 0.5 * osc))
@@ -701,6 +703,36 @@ class ObjectHighlighter:
                              (0, 0, gw, gh), 2)
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
+    def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
+        """Draw an alpha-gradient glow radiating outward from the box.
+
+        Renders GLOW_STEPS concentric rect outlines from the box edge
+        outward to glow_radius pixels, each at progressively lower alpha.
+        The effect is a smooth red gradient halo. Alpha at the box edge
+        is ~GLOW_PEAK_ALPHA, falling to 0 at glow_radius.
+        """
+        bw = sx2 - sx1
+        bh = sy2 - sy1
+        steps = min(GLOW_STEPS, glow_radius)
+        if steps < 2:
+            return
+
+        for i in range(steps, 0, -1):
+            frac = i / steps  # 1.0 at outer edge → ~0 at box edge
+            # Linear-to-quadratic falloff for a softer gradient
+            alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
+            if alpha < 3:
+                continue
+            pad = max(1, int(glow_radius * frac))
+            gw = int(bw + pad * 2)
+            gh = int(bh + pad * 2)
+            if gw <= 0 or gh <= 0:
+                continue
+            glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+            pygame.draw.rect(glow_surf, (*BOX_COLOR, alpha),
+                             (0, 0, gw, gh), 2)
+            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
+
     def _box_color_at(self, intensity):
         """Return BOX_COLOR scaled by intensity (toward black)."""
         return (
@@ -715,8 +747,12 @@ class ObjectHighlighter:
         intensity, glow_px = self._pulse_envelope()
         box_color = self._box_color_at(intensity)
 
-        # Expanding glow halos during pulse phase
-        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
+        if glow_px < 0:
+            # Phase 2 — breathing gradient glow
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, -glow_px)
+        elif glow_px > 0:
+            # Phase 1 — expanding glow halos
+            self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
 
         # Semi-transparent fill
         fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
@@ -769,8 +805,12 @@ class ObjectHighlighter:
         intensity, glow_px = self._pulse_envelope()
         box_color = self._box_color_at(intensity)
 
-        # Expanding glow halos during pulse phase
-        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
+        if glow_px < 0:
+            # Phase 2 — breathing gradient glow
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, -glow_px)
+        elif glow_px > 0:
+            # Phase 1 — expanding glow halos
+            self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
 
         # Bright outline
         pygame.draw.rect(screen, box_color,
