@@ -1082,9 +1082,9 @@ class Wanderer:
         For the current viewport Y range, find the rightmost/leftmost content;
         for the current X range, find the bottommost/topmost content.
 
-        Uses the 15th/85th percentile of edge positions (not max/min) so that
-        85% of the viewport edge has content and only ~15% (the extreme
-        diamond corners) may show small blank.
+        Uses max/min of content edge positions (the furthest content pixel),
+        so the viewport can always scroll to see any content.  A generous
+        margin accounts for the diamond taper at corners.
 
         Returns (min_x, max_x, min_y, max_y).
         """
@@ -1092,7 +1092,6 @@ class Wanderer:
             return self.min_x, self.max_x, self.min_y, self.max_y
 
         m = self._edge_margin
-        PCT = 15  # percentile: 85% of rows/cols covered
 
         # ── X limits depend on Y range (which viewport rows are visible) ──
         y_top_mask = max(0, int(y / self._mask_cell_h))
@@ -1105,17 +1104,13 @@ class Wanderer:
             valid_right = right_edges[right_edges >= 0]
             valid_left = left_edges[left_edges < self._mask_cols_total]
             if len(valid_right) > 0:
-                # 15th pct: 85% of rows have content at least this far right
-                r_col = int(np.percentile(valid_right, PCT))
-                content_right_px = (r_col + 1) * self._mask_cell_w
+                content_right_px = (int(valid_right.max()) + 1) * self._mask_cell_w
                 dyn_max_x = max(self.min_x,
                                 content_right_px + m - self.view_w)
             else:
                 dyn_max_x = self.max_x
             if len(valid_left) > 0:
-                # 85th pct: 85% of rows have content at least this far left
-                l_col = int(np.percentile(valid_left, 100 - PCT))
-                content_left_px = l_col * self._mask_cell_w
+                content_left_px = int(valid_left.min()) * self._mask_cell_w
                 dyn_min_x = max(self.min_x,
                                 min(self.max_x,
                                     content_left_px - m))
@@ -1135,15 +1130,13 @@ class Wanderer:
             valid_bottom = bottom_edges[bottom_edges >= 0]
             valid_top = top_edges[top_edges < self._mask_rows_total]
             if len(valid_bottom) > 0:
-                b_row = int(np.percentile(valid_bottom, PCT))
-                content_bottom_px = (b_row + 1) * self._mask_cell_h
+                content_bottom_px = (int(valid_bottom.max()) + 1) * self._mask_cell_h
                 dyn_max_y = max(self.min_y,
                                 content_bottom_px + m - self.view_h)
             else:
                 dyn_max_y = self.max_y
             if len(valid_top) > 0:
-                t_row = int(np.percentile(valid_top, 100 - PCT))
-                content_top_px = t_row * self._mask_cell_h
+                content_top_px = int(valid_top.min()) * self._mask_cell_h
                 dyn_min_y = max(self.min_y,
                                 min(self.max_y,
                                     content_top_px - m))
@@ -1370,16 +1363,6 @@ class Wanderer:
 
         self.x = max(self.min_x, min(self.max_x, self.x))
         self.y = max(self.min_y, min(self.max_y, self.y))
-
-        # ── Phase 1b: Dynamic edge clamping ──
-        # After global clamping, apply per-position content-edge limits.
-        # This prevents the viewport from scrolling past content tips at the
-        # non-rectangular isometric border.  Clamp iteratively: the Y clamp
-        # depends on X and vice versa, so 2 passes converge quickly.
-        for _ in range(2):
-            dl_min_x, dl_max_x, dl_min_y, dl_max_y = self._dynamic_limits(self.x, self.y)
-            self.x = max(dl_min_x, min(dl_max_x, self.x))
-            self.y = max(dl_min_y, min(dl_max_y, self.y))
 
         # ── Phase 2: Track fully-viewed tiles ──
         fully = self._tiles_fully_visible(self.x, self.y)
