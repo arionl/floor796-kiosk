@@ -136,21 +136,40 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
     so we need a larger cache. Scale linearly with viewport area, then
     cap by available memory (each strip ~96 MB).
+
+    On low-memory boards (e.g. 2 GB Pi 5), the memory cap MUST be able
+    to drop below MAX_TILES_BASE — otherwise the budget is ignored and
+    the kiosk gets OOM-killed (issue: kiosk OOM every ~5 min on 2 GB Pi).
+    The previous `max(MAX_TILES_BASE, ...)` floor defeated mem_cap on
+    those boards because mem_cap (5) < MAX_TILES_BASE (15).
     """
     # Scale factor relative to 1080p baseline
     vp_area = view_w * view_h
     base_area = 1920 * 1080
     area_scale = vp_area / base_area
-
-    # Memory ceiling: leave ~2 GB for OS + other app overhead
-    if total_mem_mb > 0:
-        mem_budget_mb = max(500, total_mem_mb - 2048)
-        mem_cap = int(mem_budget_mb / 96)  # 96 MB per strip
-    else:
-        mem_cap = MAX_TILES_CAP
-
     max_t = int(MAX_TILES_BASE * area_scale)
-    return max(MAX_TILES_BASE, min(max_t, mem_cap, MAX_TILES_CAP))
+
+    # Memory ceiling: reserve a baseline for OS + pygame framebuffer +
+    # hologram cache + python itself. The reserve scales with board RAM —
+    # small boards need most of their RAM for the OS, large boards can
+    # spare proportionally more for the tile cache.
+    #
+    #   2 GB board: reserve 1.2 GB → ~800 MB budget → 8 tiles (~768 MB)
+    #   4 GB board: reserve 2.0 GB → ~2.0 GB budget → 15 tiles (cap at base)
+    #   8 GB board: reserve 2.5 GB → ~5.5 GB budget → 40 tiles (cap)
+    #
+    # The mem_cap MUST be able to drop below MAX_TILES_BASE on constrained
+    # boards — the previous `max(MAX_TILES_BASE, ...)` floor defeated it
+    # entirely and caused OOM kills every ~5 min on 2 GB Pi 5 boards.
+    if total_mem_mb > 0 and total_mem_mb < 4096:
+        # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
+        reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
+        mem_budget_mb = max(0, total_mem_mb - reserve_mb)
+        mem_cap = max(2, int(mem_budget_mb / 96))  # 96 MB per strip
+        return min(max_t, mem_cap, MAX_TILES_CAP)
+
+    # 4 GB+ board: scale with viewport, cap at MAX_TILES_CAP.
+    return min(max_t, MAX_TILES_CAP)
 
 # ─── Status Display ───────────────────────────────────────────────────────────
 
@@ -408,10 +427,24 @@ class TileCache:
         with self._lock:
             ready = dict(self._results)
             self._results.clear()
+        # Enforce max_tiles here too, not just in set_needed(). The background
+        # worker can load several queued tiles into _results between
+        # set_needed() calls; without this check, cache overshoots max_tiles
+        # by the size of ready, which on memory-constrained boards (2 GB Pi)
+        # triggers the OOM killer before the next set_needed() can evict.
         for tid, (surf, num_frames) in ready.items():
             # Surface is already converted to 16-bit by the background thread.
             self.cache[tid] = (surf, num_frames)
             self.load_count += 1
+        # Evict down to max_tiles if we overshot. Prefer keeping visible /
+        # margin tiles (caller will re-issue set_needed next frame, but this
+        # bounds peak memory between frames).
+        if len(self.cache) > self.max_tiles:
+            with self._lock:
+                # Evict oldest-inserted first (dict preserves insertion order
+                # in Python 3.7+); caller's set_needed will refine further.
+                while len(self.cache) > self.max_tiles:
+                    self.cache.pop(next(iter(self.cache)))
 
     def preload_all(self, tile_ids, status=None, status_label=""):
         total = len(tile_ids)
