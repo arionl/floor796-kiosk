@@ -60,6 +60,14 @@ CORNER_PANEL_BORDER = (60, 60, 80)
 #   An alpha-channel gradient radiates outward from the box for
 #   GLOW_RADIUS pixels, gently expanding/contracting and fading in/
 #   out at STEADY_SPEED Hz. Runs for the entire highlight duration.
+#
+# Zoom-on intro:
+#   The box smoothly expands from ZOOM_START scale to full size over
+#   ZOOM_DURATION seconds with an ease-out curve, then transitions
+#   seamlessly into the breathing glow.
+ZOOM_START = 0.35               # initial scale factor (35% of full size)
+ZOOM_DURATION = 0.45            # seconds for zoom to complete
+
 STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
 GLOW_RADIUS = 24                 # outward gradient extent in pixels
 GLOW_STEPS = 20                  # number of concentric rect layers
@@ -632,6 +640,21 @@ class ObjectHighlighter:
         sy1 = seg.abs_y1 - pos_y
         sx2 = seg.abs_x2 - pos_x
         sy2 = seg.abs_y2 - pos_y
+
+        # Zoom-on intro: scale box from center during first ZOOM_DURATION
+        t = self._timer
+        if t < ZOOM_DURATION:
+            # Ease-out cubic: fast start, gentle settle
+            raw = t / ZOOM_DURATION
+            eased = 1.0 - (1.0 - raw) ** 3
+            scale = ZOOM_START + (1.0 - ZOOM_START) * eased
+            cx = (sx1 + sx2) / 2
+            cy = (sy1 + sy2) / 2
+            sx1 = cx + (sx1 - cx) * scale
+            sy1 = cy + (sy1 - cy) * scale
+            sx2 = cx + (sx2 - cx) * scale
+            sy2 = cy + (sy2 - cy) * scale
+
         bw = sx2 - sx1
         bh = sy2 - sy1
 
