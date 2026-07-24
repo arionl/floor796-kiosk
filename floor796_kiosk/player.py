@@ -1352,6 +1352,7 @@ def main():
     total_mem_mb = _detect_total_memory_mb()
     log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
 
+    resolution_capped = False
     if total_mem_mb > 0 and total_mem_mb <= MAX_RES_1080P_MEM_MB:
         if args.width > 1920 or args.height > 1080:
             log.info("Capping display from %dx%d to 1920x1080 "
@@ -1360,6 +1361,7 @@ def main():
                      MAX_RES_1080P_MEM_MB)
             args.width = 1920
             args.height = 1080
+            resolution_capped = True
 
     # ── 4K handling ──
     # Only 8 GB+ boards with native 4K displays reach this path (low-RAM
@@ -1379,13 +1381,24 @@ def main():
 
     log.info("Display: %dx%d", args.width, args.height)
     log.info("Overscan margin: %dpx per side", args.overscan_margin)
-    # With KMSDRM, FULLSCREEN | SCALED uses hardware GLES rendering via
-    # the SDL renderer (Panthor on OrangePi, V3D on Pi 5).  SCALED gives
-    # us vsync + page-flip.
+
+    # Display flags: When rendering at native resolution, SCALED gives us
+    # vsync + page-flip via SDL's internal renderer (hardware GLES on V3D /
+    # Panthor).  But when we capped below native (e.g. 1080p on a 1440p
+    # display), SCALED would make SDL upscale every frame via a GLES texture
+    # blit that isn't perfectly synchronised with the DRM page-flip — causing
+    # visible tearing while wandering.
+    #
+    # Dropping SCALED when resolution_capped lets KMSDRM negotiate the actual
+    # lower-resolution DRM mode (e.g. 1920x1080) directly.  The monitor's
+    # hardware scaler then handles the panel-native upscale, which is tear-free.
+    # KMSDRM still page-flips via DRM atomic commits with vsync.
     if args.fullscreen:
-        flags = pygame.FULLSCREEN | pygame.SCALED
+        flags = pygame.FULLSCREEN
+        if not resolution_capped:
+            flags |= pygame.SCALED
     else:
-        flags = pygame.SCALED
+        flags = 0 if resolution_capped else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
