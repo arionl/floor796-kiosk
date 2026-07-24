@@ -47,24 +47,33 @@ CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
-BOX_COLOR = (255, 220, 80)       # bright yellow
-BOX_FILL = (255, 220, 80, 35)    # semi-transparent yellow fill
+BOX_COLOR = (255, 50, 50)        # bright red
+BOX_FILL = (255, 50, 50, 35)     # semi-transparent red fill
 BOX_OUTLINE = 3                   # pixels
 LABEL_BG = (15, 15, 20, 220)
 LABEL_TEXT = (255, 255, 255)
-LABEL_ACCENT = (255, 220, 80)
+LABEL_ACCENT = (255, 50, 50)
 CORNER_PANEL_BG = (15, 15, 20, 230)
 CORNER_PANEL_BORDER = (60, 60, 80)
 
-# Pulse animation for drawing attention to the highlight box.
-# For the first PULSE_DURATION seconds of each highlight, the border
-# pulses with a glow effect — expanding/halos and intensity oscillation.
-# After that it settles into a steady outline so it's not distracting.
-PULSE_DURATION = 1.8             # seconds of pulsing at start
-PULSE_SPEED = 5.0                # Hz — oscillations per second
-PULSE_GLOW_MAX = 8               # max glow radius in pixels
-PULSE_INTENSITY_MIN = 0.35       # brightness floor (0=dim, 1=full)
-PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha
+# Two-phase highlight animation:
+#
+# Phase 1 — Attention grab (first PULSE_DURATION seconds):
+#   Intense flashing with expanding glow halos and brightness oscillation.
+#   Decays from full intensity to settle into phase 2.
+#
+# Phase 2 — Subtle steady-state pulse (rest of highlight):
+#   A slow, gentle breathing effect that keeps the box alive without
+#   being distracting.  Brightness gently oscillates between
+#   STEADY_MIN and 1.0 at STEADY_SPEED Hz.
+PULSE_DURATION = 1.8             # seconds of attention-grab flash
+PULSE_SPEED = 5.0                # Hz — flash oscillations during phase 1
+PULSE_GLOW_MAX = 8               # max glow radius in pixels during phase 1
+PULSE_INTENSITY_MIN = 0.35       # brightness floor during phase 1
+PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha during phase 1
+
+STEADY_SPEED = 0.7               # Hz — slow breathing pulse (~1.4s/cycle)
+STEADY_MIN = 0.65                # intensity floor during steady-state pulse
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
 # The corner panel becomes vertical to accommodate a thumbnail image.
@@ -644,14 +653,22 @@ class ObjectHighlighter:
     def _pulse_envelope(self):
         """Return (intensity, glow_px) for the current timer position.
 
-        During the first PULSE_DURATION seconds the box pulses to draw
-        attention.  After that it settles to a steady outline.  intensity
-        is 0..1 (how bright the inner box is), glow_px is how far the
-        surrounding glow extends.
+        Two phases:
+          Phase 1 (0..PULSE_DURATION): attention-grab flash with glow
+            halos and fast brightness oscillation, decaying envelope.
+          Phase 2 (PULSE_DURATION..end): subtle steady-state breathing
+            pulse. Brightness slowly oscillates between STEADY_MIN and
+            1.0 at STEADY_SPEED Hz. No glow halos.
         """
         t = self._timer
+
         if t >= PULSE_DURATION:
-            return 1.0, 0
+            # Phase 2 — subtle breathing pulse
+            osc = (math.sin(t * STEADY_SPEED * 2 * math.pi) + 1) / 2
+            intensity = STEADY_MIN + (1.0 - STEADY_MIN) * osc
+            return intensity, 0
+
+        # Phase 1 — attention-grab flash
         # Envelope: starts at peak, decays linearly over PULSE_DURATION
         env = 1.0 - (t / PULSE_DURATION)  # 1.0 → 0.0
         # Oscillation: 0..1 sinusoidal at PULSE_SPEED Hz
