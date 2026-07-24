@@ -640,17 +640,15 @@ class ObjectHighlighter:
         box_sx2 = seg.abs_x2 - pos_x
         box_sy2 = seg.abs_y2 - pos_y
 
-        # Zoom-on intro: interpolate from full viewport bounds to box bounds
         t = self._timer
-        if t < ZOOM_DURATION:
+        zooming = t < ZOOM_DURATION
+
+        if zooming:
+            # Zoom-on intro: interpolate from full viewport bounds to box
             raw = t / ZOOM_DURATION
-            # Ease-out cubic: fast start, gentle settle
             eased = 1.0 - (1.0 - raw) ** 3
-            # Start from full viewport bounds, zoom into box bounds
-            vp_sx1 = 0
-            vp_sy1 = 0
-            vp_sx2 = self._screen_w
-            vp_sy2 = self._screen_h
+            vp_sx1, vp_sy1 = 0, 0
+            vp_sx2, vp_sy2 = self._screen_w, self._screen_h
             sx1 = vp_sx1 + (box_sx1 - vp_sx1) * eased
             sy1 = vp_sy1 + (box_sy1 - vp_sy1) * eased
             sx2 = vp_sx2 + (box_sx2 - vp_sx2) * eased
@@ -663,9 +661,11 @@ class ObjectHighlighter:
         bh = sy2 - sy1
 
         if self.label_mode == LABEL_INLINE:
-            self._render_inline(screen, seg, sx1, sy1, sx2, sy2, bw, bh)
+            self._render_inline(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                                skip_glow=zooming)
         else:
-            self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh)
+            self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                                skip_glow=zooming)
 
     def _pulse_envelope(self):
         """Return (intensity, glow_radius) for the current timer position.
@@ -711,12 +711,13 @@ class ObjectHighlighter:
                 glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
-    def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
+    def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                       skip_glow=False):
         """Draw bounding box with label text next to it."""
 
-        _intensity, glow_radius = self._pulse_envelope()
-
-        self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
+        if not skip_glow:
+            _intensity, glow_radius = self._pulse_envelope()
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
         # Semi-transparent fill
         fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
@@ -763,12 +764,13 @@ class ObjectHighlighter:
             if date_y + date_surf.get_height() < self._screen_h:
                 screen.blit(date_surf, (label_x, date_y))
 
-    def _render_corner(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
+    def _render_corner(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                       skip_glow=False):
         """Draw bounding box outline + info panel in lower-right corner."""
 
-        _intensity, glow_radius = self._pulse_envelope()
-
-        self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
+        if not skip_glow:
+            _intensity, glow_radius = self._pulse_envelope()
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
         # Bright outline
         pygame.draw.rect(screen, BOX_COLOR,
