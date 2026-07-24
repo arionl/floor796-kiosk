@@ -49,7 +49,8 @@ CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
 BOX_COLOR = (255, 20, 20)        # bright red
 BOX_FILL = (255, 20, 20, 35)     # semi-transparent red fill
-BOX_OUTLINE = 3                   # pixels
+BOX_OUTLINE = 3                   # pixels (normal)
+ZOOM_OUTLINE = 6                 # pixels (thicker during zoom intro)
 LABEL_BG = (15, 15, 20, 220)
 LABEL_TEXT = (255, 255, 255)
 LABEL_ACCENT = (255, 20, 20)
@@ -726,10 +727,11 @@ class ObjectHighlighter:
         fill_surf.fill((*BOX_COLOR[:3], fill_alpha))
         screen.blit(fill_surf, (int(sx1), int(sy1)))
 
-        # Bright outline
+        # Bright outline (thicker during zoom)
+        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
-                         BOX_OUTLINE)
+                         outline_w)
 
         # Label text — position above the box if space, else below
         title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
@@ -772,10 +774,11 @@ class ObjectHighlighter:
             _intensity, glow_radius = self._pulse_envelope()
             self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
-        # Bright outline
+        # Bright outline (thicker during zoom)
+        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
-                         BOX_OUTLINE)
+                         outline_w)
 
         # Corner brackets for extra emphasis
         cl = 8  # corner length
@@ -785,10 +788,10 @@ class ObjectHighlighter:
         ]:
             pygame.draw.line(screen, BOX_COLOR,
                              (int(cx), int(cy)),
-                             (int(cx + dx * cl), int(cy)), BOX_OUTLINE)
+                             (int(cx + dx * cl), int(cy)), outline_w)
             pygame.draw.line(screen, BOX_COLOR,
                              (int(cx), int(cy)),
-                             (int(cx), int(cy + dy * cl)), BOX_OUTLINE)
+                             (int(cx), int(cy + dy * cl)), outline_w)
 
         # Info panel in lower-right corner
         self._render_corner_panel(screen, seg)
