@@ -827,10 +827,43 @@ class Wanderer:
 
         self.map_w = map_w
         self.map_h = map_h
-        self.min_x = 0
-        self.max_x = max(1, map_w - view_w)
-        self.min_y = 0
-        self.max_y = max(1, map_h - view_h)
+
+        # ── Content-aware scroll limits ──
+        # Instead of allowing the viewport to scroll to the full map-grid
+        # edges (which include large blank isometric-diamond triangles),
+        # compute a tight bounding box of actual pixel-art content and
+        # clamp the viewport to hug that border.  When the outermost
+        # content tip is fully inside the viewport, scrolling stops.
+        EDGE_MARGIN = 50  # px of breathing room past content edge
+        if self.content_bounds:
+            cb_x0s, cb_y0s, cb_x1s, cb_y1s = [], [], [], []
+            for (r, c), cb in self.content_bounds.items():
+                tile_left = c * SPACING_W
+                tile_top = r * SPACING_H
+                cb_x0s.append(tile_left + cb[0])
+                cb_y0s.append(tile_top + cb[1])
+                cb_x1s.append(tile_left + cb[2])
+                cb_y1s.append(tile_top + cb[3])
+            content_min_x = min(cb_x0s)
+            content_max_x = max(cb_x1s)
+            content_min_y = min(cb_y0s)
+            content_max_y = max(cb_y1s)
+            self.min_x = max(0, content_min_x - EDGE_MARGIN)
+            self.max_x = max(self.min_x, content_max_x + EDGE_MARGIN - view_w)
+            self.min_y = max(0, content_min_y - EDGE_MARGIN)
+            self.max_y = max(self.min_y, content_max_y + EDGE_MARGIN - view_h)
+            log.info("Content bounds: x[%d-%d] y[%d-%d] | "
+                     "scroll limits: x[%.0f-%.0f] y[%.0f-%.0f] | "
+                     "map: %dx%d",
+                     content_min_x, content_max_x,
+                     content_min_y, content_max_y,
+                     self.min_x, self.max_x, self.min_y, self.max_y,
+                     map_w, map_h)
+        else:
+            self.min_x = 0
+            self.max_x = max(1, map_w - view_w)
+            self.min_y = 0
+            self.max_y = max(1, map_h - view_h)
 
         # ── Precompute safe region and optimal positions ──
         log.info("Precomputing navigation grid...")
