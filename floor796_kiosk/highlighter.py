@@ -62,11 +62,10 @@ CORNER_PANEL_BORDER = (60, 60, 80)
 #   out at STEADY_SPEED Hz. Runs for the entire highlight duration.
 #
 # Zoom-on intro:
-#   The box smoothly expands from ZOOM_START scale to full size over
-#   ZOOM_DURATION seconds with an ease-out curve, then transitions
-#   seamlessly into the breathing glow.
-ZOOM_START = 0.35               # initial scale factor (35% of full size)
-ZOOM_DURATION = 0.45            # seconds for zoom to complete
+#   The box smoothly expands from the full viewport bounds to the
+#   object's actual bounding box over ZOOM_DURATION seconds with an
+#   ease-out cubic curve, then transitions seamlessly into breathing.
+ZOOM_DURATION = 0.5             # seconds for zoom to complete
 
 STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
 GLOW_RADIUS = 24                 # outward gradient extent in pixels
@@ -636,24 +635,29 @@ class ObjectHighlighter:
         seg = self._current_seg
 
         # Convert absolute map coords to screen coords
-        sx1 = seg.abs_x1 - pos_x
-        sy1 = seg.abs_y1 - pos_y
-        sx2 = seg.abs_x2 - pos_x
-        sy2 = seg.abs_y2 - pos_y
+        box_sx1 = seg.abs_x1 - pos_x
+        box_sy1 = seg.abs_y1 - pos_y
+        box_sx2 = seg.abs_x2 - pos_x
+        box_sy2 = seg.abs_y2 - pos_y
 
-        # Zoom-on intro: scale box from center during first ZOOM_DURATION
+        # Zoom-on intro: interpolate from full viewport bounds to box bounds
         t = self._timer
         if t < ZOOM_DURATION:
-            # Ease-out cubic: fast start, gentle settle
             raw = t / ZOOM_DURATION
+            # Ease-out cubic: fast start, gentle settle
             eased = 1.0 - (1.0 - raw) ** 3
-            scale = ZOOM_START + (1.0 - ZOOM_START) * eased
-            cx = (sx1 + sx2) / 2
-            cy = (sy1 + sy2) / 2
-            sx1 = cx + (sx1 - cx) * scale
-            sy1 = cy + (sy1 - cy) * scale
-            sx2 = cx + (sx2 - cx) * scale
-            sy2 = cy + (sy2 - cy) * scale
+            # Start from full viewport bounds, zoom into box bounds
+            vp_sx1 = 0
+            vp_sy1 = 0
+            vp_sx2 = self._screen_w
+            vp_sy2 = self._screen_h
+            sx1 = vp_sx1 + (box_sx1 - vp_sx1) * eased
+            sy1 = vp_sy1 + (box_sy1 - vp_sy1) * eased
+            sx2 = vp_sx2 + (box_sx2 - vp_sx2) * eased
+            sy2 = vp_sy2 + (box_sy2 - vp_sy2) * eased
+        else:
+            sx1, sy1 = box_sx1, box_sy1
+            sx2, sy2 = box_sx2, box_sy2
 
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -676,12 +680,12 @@ class ObjectHighlighter:
         return 1.0, radius
 
     def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
-        """Draw an alpha-gradient glow radiating outward from the box.
+        """Draw a smooth alpha-gradient glow radiating outward from the box.
 
-        Renders GLOW_STEPS concentric rect outlines from the box edge
-        outward to glow_radius pixels, each at progressively lower alpha.
-        The effect is a smooth red gradient halo. Alpha at the box edge
-        is ~GLOW_PEAK_ALPHA, falling to 0 at glow_radius.
+        Draws GLOW_STEPS filled rectangles from outermost (largest, lowest
+        alpha) to innermost (box edge, highest alpha), each covering the
+        previous. This painter's-algorithm approach produces a continuous
+        gradient with no gaps or banding, unlike hollow outlines.
         """
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -690,10 +694,9 @@ class ObjectHighlighter:
             return
 
         for i in range(steps, 0, -1):
-            frac = i / steps  # 1.0 at outer edge → ~0 at box edge
-            # Linear-to-quadratic falloff for a softer gradient
+            frac = i / steps  # 1.0 at outer edge → 0 at box edge
             alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
-            if alpha < 3:
+            if alpha < 2:
                 continue
             pad = max(1, int(glow_radius * frac))
             gw = int(bw + pad * 2)
@@ -701,8 +704,7 @@ class ObjectHighlighter:
             if gw <= 0 or gh <= 0:
                 continue
             glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*BOX_COLOR, alpha),
-                             (0, 0, gw, gh), 2)
+            glow_surf.fill((*BOX_COLOR, alpha))
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
