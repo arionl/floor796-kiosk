@@ -69,7 +69,7 @@ ZOOM_DURATION = 0.5             # seconds for zoom to complete
 
 STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
 GLOW_RADIUS = 24                 # outward gradient extent in pixels
-GLOW_STEPS = 20                  # number of concentric rect layers
+GLOW_STEPS = 16                  # number of concentric rect layers
 GLOW_PEAK_ALPHA = 90             # peak alpha at box edge when breathing peaks
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
