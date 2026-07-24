@@ -28,3 +28,6 @@ Thumbs.db
 
 # Simulation outputs
 wander_heatmap*.png
+
+# Local backups (deployed code snapshots from kiosks)
+.backup-*/
