@@ -3,8 +3,8 @@
 # Starts the player with the correct rendering path based on board type.
 #
 #   - OrangePi 5 Max (RK3588 + Panthor): KMSDRM direct rendering, no X server
-#   - Raspberry Pi 5 (V3D): X server + SDL X11 driver
-#   - Generic: X server + SDL X11 driver
+#   - Raspberry Pi 5 (V3D):              KMSDRM direct rendering, no X server
+#   - Generic:                           X11 fallback (if KMSDRM unavailable)
 #
 # Board detection is handled by floor796_kiosk.board_detect (Python).
 set -e
@@ -29,11 +29,12 @@ fi
 eval "$(python3 -m floor796_kiosk.board_detect --shell 2>/dev/null)"
 
 if [ "${NEEDS_X11}" = "0" ]; then
-    # OrangePi 5 Max (RK3588 + Mesa Panthor): KMSDRM direct rendering (no X11)
+    # OrangePi 5 Max or Raspberry Pi 5: KMSDRM direct rendering (no X11).
     # KMSDRM needs root for DRM master access (page flip).
     exec "${SCRIPT_DIR}/kiosk-launch.sh"
 else
-    # Raspberry Pi 5 or generic: X server starts as root (needs VT7 access).
+    # Generic / unknown board: X11 fallback.
+    # X server starts as root (needs VT7 access).
     # The player runs via the launch script as the kiosk user.
     xinit "${SCRIPT_DIR}/kiosk-launch.sh" \
         -- \
