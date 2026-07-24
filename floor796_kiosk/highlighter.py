@@ -684,8 +684,9 @@ class ObjectHighlighter:
 
         Draws GLOW_STEPS filled rectangles from outermost (largest, lowest
         alpha) to innermost (box edge, highest alpha), each covering the
-        previous. This painter's-algorithm approach produces a continuous
-        gradient with no gaps or banding, unlike hollow outlines.
+        previous. The box interior is cut out of each layer so only the
+        outward ring area receives glow. This painter's-algorithm approach
+        produces a continuous gradient with no gaps or banding.
         """
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -705,6 +706,9 @@ class ObjectHighlighter:
                 continue
             glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
             glow_surf.fill((*BOX_COLOR, alpha))
+            # Cut out the box interior so glow only covers the ring area
+            if int(bw) > 0 and int(bh) > 0:
+                glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
