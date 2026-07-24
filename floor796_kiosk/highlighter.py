@@ -438,10 +438,11 @@ class ObjectHighlighter:
     """Manages the automatic object highlight cycle."""
 
     def __init__(self, segments, screen_w, screen_h,
-                 spacing_w=1016, spacing_h=812):
+                 spacing_w=1016, spacing_h=812, overscan_margin=0):
         self._index = TileObjectIndex(segments, spacing_w, spacing_h)
         self._screen_w = screen_w
         self._screen_h = screen_h
+        self._overscan_margin = overscan_margin
 
         # State machine
         self.enabled = True
@@ -539,8 +540,10 @@ class ObjectHighlighter:
         edge_zone_y = vp_h * 0.20
 
         # Panel footprint in screen coords (bottom-right corner)
-        panel_x1 = self._screen_w - PANEL_EXCLUDE_W
-        panel_y1 = self._screen_h - PANEL_EXCLUDE_H
+        # Account for overscan margin so the exclusion zone matches the
+        # actual panel position.
+        panel_x1 = self._screen_w - PANEL_EXCLUDE_W - self._overscan_margin
+        panel_y1 = self._screen_h - PANEL_EXCLUDE_H - self._overscan_margin
 
         # Wander speed for prediction
         wander_speed = math.hypot(vel_x, vel_y)
@@ -1005,8 +1008,8 @@ class ObjectHighlighter:
             panel_w = PANEL_W_NO_THUMB
             panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
 
-        panel_x = self._screen_w - panel_w - PANEL_MARGIN
-        panel_y = self._screen_h - panel_h - PANEL_MARGIN
+        panel_x = self._screen_w - panel_w - PANEL_MARGIN - self._overscan_margin
+        panel_y = self._screen_h - panel_h - PANEL_MARGIN - self._overscan_margin
 
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
