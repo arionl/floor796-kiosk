@@ -114,21 +114,38 @@ def _extract_og_image(html_bytes):
             return m.group(1)
 
     # Fallback: first <img> tag src (useful for floor796 pages without og:image)
-    m = _IMG_TAG_RE.search(html)
-    if m:
-        return m.group(1)
+    # Skip SVGs and other pygame-unsupported formats
+    for m in _IMG_TAG_RE.finditer(html):
+        src = m.group(1)
+        lower = src.lower().split("?")[0]
+        if lower.endswith((".svg", ".avif", ".heic", ".heif")):
+            continue
+        return src
 
     return None
 
 
 def _resolve_url(url, base=None):
-    """Resolve a possibly-relative URL against a base URL."""
+    """Resolve a possibly-relative URL against a base URL.
+
+    Uses urllib.parse.urljoin for correct relative path resolution.
+    Strips the query string from the base first, so './image.png'
+    relative to 'page.html?foo' resolves to the page's directory.
+    """
     if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("/"):
-        return (base or BASE_URL).rstrip("/") + url
-    if not url.startswith("http"):
-        return (base or BASE_URL).rstrip("/") + "/" + url
+        url = "https:" + url
+        if base:
+            base = base.split("?")[0]
+        return url
+
+    if base:
+        # Strip query string and fragment from base for correct resolution
+        base = base.split("?")[0].split("#")[0]
+
+    if not url.startswith(("http", "//")):
+        # Relative URL — use urljoin for correct directory semantics
+        return urllib.parse.urljoin(base or BASE_URL, url)
+
     return url
 
 
@@ -284,6 +301,42 @@ def resolve_thumb_url(link):
 
     # event://, none, etc.
     return lt, None, None
+
+
+def _decode_image(raw_bytes, obj_id=0, title=""):
+    """Decode raw image bytes into a pygame Surface.
+
+    Tries pygame.image.load first. If that fails (e.g. WEBP, AVIF,
+    or other unsupported formats), falls back to Pillow which has
+    broader format support (WEBP, AVIF via pillow-avif, etc.).
+    Returns a 24/32-bit Surface, or None on failure.
+    """
+    # ── Try pygame first ──
+    try:
+        src_surf = pygame.image.load(io.BytesIO(raw_bytes))
+        if src_surf.get_bitsize() < 24:
+            src_surf = src_surf.convert(32)
+        return src_surf
+    except pygame.error:
+        pass  # Fall through to Pillow
+
+    # ── Pillow fallback for formats pygame can't decode ──
+    try:
+        from PIL import Image
+    except ImportError:
+        log.warning("Save failed for obj %d (%s): pygame can't decode format "
+                    "and Pillow not installed", obj_id, title[:40])
+        return None
+
+    try:
+        pil_img = Image.open(io.BytesIO(raw_bytes))
+        pil_img = pil_img.convert("RGBA")
+        w, h = pil_img.size
+        src_surf = pygame.image.frombuffer(pil_img.tobytes(), (w, h), "RGBA")
+        return src_surf
+    except Exception as e:
+        log.warning("Save failed for obj %d (%s): %s", obj_id, title[:40], e)
+        return None
 
 
 def main():
@@ -457,11 +510,9 @@ def main():
 
     for i, (raw_bytes, cache_file, obj_id, title) in enumerate(pending_resizes, 1):
         try:
-            src_surf = pygame.image.load(io.BytesIO(raw_bytes))
-            # Ensure surface is 24/32-bit before smoothscale (GIFs load
-            # as 8-bit palette which smoothscale can't handle)
-            if src_surf.get_bitsize() < 24:
-                src_surf = src_surf.convert(32)
+            src_surf = _decode_image(raw_bytes, obj_id, title)
+            if src_surf is None:
+                continue  # error already logged
             thumb = _resize_cover(src_surf, THUMB_W, THUMB_H)
             if thumb is not None:
                 pygame.image.save(thumb, cache_file)
