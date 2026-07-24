@@ -113,6 +113,11 @@ BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
 ACCENT_COLOR = (0, 200, 100)
 
+# Overscan compensation in pixels per side.  Most modern HDMI displays do
+# NOT apply overscan, so the default is 0 (disabled).  Set via
+# --overscan-margin for older TVs that crop the screen edges.
+DEFAULT_OVERSCAN_MARGIN = 0
+
 log = logging.getLogger("floor796")
 
 
@@ -212,6 +217,41 @@ class StatusDisplay:
             self.screen.blit(pct, pct_rect)
 
         pygame.display.flip()
+
+
+class MemoryWarningBanner:
+    """Persistent on-screen banner for low-RAM devices.
+
+    Shown when total system RAM < 4 GB.  The tile cache is too small to
+    keep all in-view tiles loaded, so the user sees blank/missing tiles
+    while wandering.  The banner pre-renders once and is blitted every
+    frame — zero per-frame allocation cost.
+    """
+
+    BANNER_H = 44
+
+    def __init__(self, screen, total_mem_mb, overscan_margin=0):
+        w = screen.get_width()
+        self.overscan_margin = overscan_margin
+        self.surf = pygame.Surface((w, self.BANNER_H), pygame.SRCALPHA)
+
+        # Semi-transparent amber background
+        self.surf.fill((180, 100, 0, 210))
+        # Bottom border line for visual separation
+        pygame.draw.line(self.surf, (255, 180, 0, 255),
+                         (0, self.BANNER_H - 1), (w, self.BANNER_H - 1), 2)
+
+        font = pygame.font.Font(None, 26)
+        ram_gb = total_mem_mb / 1024
+        msg = (f"WARNING: {ram_gb:.0f} GB RAM detected — "
+               f"4 GB recommended for smooth playback. "
+               f"Some tiles may appear blank.")
+        text = font.render(msg, True, (255, 240, 200))
+        text_rect = text.get_rect(center=(w // 2, self.BANNER_H // 2))
+        self.surf.blit(text, text_rect)
+
+    def render(self, screen):
+        screen.blit(self.surf, (0, self.overscan_margin))
 
 
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
@@ -1200,6 +1240,9 @@ def main():
     parser.add_argument("--no-wander", action="store_true")
     parser.add_argument("--wander-speed", type=float, default=DEFAULT_WANDER_SPEED,
                         help="Wander pan speed in pixels/sec (default: 15)")
+    parser.add_argument("--overscan-margin", type=int, default=DEFAULT_OVERSCAN_MARGIN,
+                        help="Pixels to inset all content/UI for TV overscan (default: %d, 0=off)"
+                             % DEFAULT_OVERSCAN_MARGIN)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1322,6 +1365,7 @@ def main():
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
+    log.info("Overscan margin: %dpx per side", args.overscan_margin)
     # With KMSDRM + Panthor GPU, both FULLSCREEN and SCALED use hardware GLES
     # rendering via the SDL renderer.  SCALED gives us vsync + page-flip.
     # With X11 (Pi 5), SCALED also uses the SDL renderer (Mesa V3D GPU).
@@ -1337,7 +1381,26 @@ def main():
     clock = pygame.time.Clock()
 
     status = StatusDisplay(screen)
-    status.show("Floor796 Kiosk", "Starting up...")
+
+    # ── Low-memory startup warning ──
+    # This is the very first thing the user sees. If the board has less
+    # than 4 GB RAM the tile cache will be too small to keep all in-view
+    # tiles loaded — we tell the user up front.
+    low_memory = 0 < total_mem_mb < 4096
+    if low_memory:
+        ram_gb = total_mem_mb / 1024
+        log.warning("Low memory: %d MB (%.0f GB) — below 4 GB recommendation. "
+                    "Banner will be shown.", total_mem_mb, ram_gb)
+        status.show(
+            f"WARNING: {ram_gb:.0f} GB RAM",
+            "4 GB recommended for smooth playback. "
+            "Some tiles may appear blank.",
+        )
+        time.sleep(4)
+    else:
+        status.show("Floor796 Kiosk", "Starting up...")
+        time.sleep(0.5)
+
     ensure_dirs()
 
     # ── Check for tile updates (graceful offline fallback) ──
@@ -1505,7 +1568,8 @@ def main():
             if hl_objects:
                 object_highlighter = ObjectHighlighter(
                     hl_objects, args.width, args.height,
-                    spacing_w=SPACING_W, spacing_h=SPACING_H)
+                    spacing_w=SPACING_W, spacing_h=SPACING_H,
+                    overscan_margin=args.overscan_margin)
                 log.info("Object highlighter: %d objects loaded",
                          len(hl_objects))
             else:
@@ -1517,6 +1581,14 @@ def main():
     # Wire highlighter into stats collector for telemetry
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
+
+    # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
+    mem_banner = None
+    if low_memory:
+        mem_banner = MemoryWarningBanner(screen, total_mem_mb,
+                                         overscan_margin=args.overscan_margin)
+        log.info("Memory warning banner enabled (%d MB < 4 GB, overscan margin %dpx)",
+                 total_mem_mb, args.overscan_margin)
 
     running = True
     while running:
@@ -1684,6 +1756,10 @@ def main():
         if stats_collector and stats_collector.overlay_enabled:
             snap = stats_collector.snapshot()
             stats_overlay.render(screen, snap)
+
+        # ── Persistent low-memory warning banner ──
+        if mem_banner:
+            mem_banner.render(screen)
 
         pygame.display.flip()
 
