@@ -829,64 +829,12 @@ class Wanderer:
         self.map_h = map_h
 
         # ── Content-aware scroll limits ──
-        # The isometric diamond layout means the actual pixel-art boundary
-        # is NOT rectangular — it tapers at edges.  A single global bbox
-        # still lets the viewport scroll past content tips into blank space.
-        # Solution: precompute per-row and per-col content-edge profiles from
-        # the density mask, then dynamically clamp at runtime so the viewport
-        # hugs the content border at its current position.
-        #
-        # Global limits are kept as wide safety bounds; the tight per-position
-        # clamping happens in _dynamic_limits() called every frame.
+        # Compute a tight bounding box from per-tile content_bounds (derived
+        # from the density mask) and clamp the viewport to hug the actual
+        # pixel-art content edge, not the raw tile-grid border (which includes
+        # large blank isometric-diamond triangles).
         EDGE_MARGIN = 50  # px of breathing room past content edge
-        self._edge_margin = EDGE_MARGIN
-
-        if self.content_density:
-            # Tiles are placed at SPACING intervals (not TILE intervals —
-            # tiles overlap by 8px).  The full_mask has MASK_ROWS per
-            # tile-row and MASK_COLS per tile-col, so the correct global
-            # pixel-to-mask-cell size is SPACING/MASK, not TILE/MASK.
-            # Using TILE here caused an accumulating offset that made
-            # _dynamic_limits read the wrong mask rows.
-            mask_cell_w = SPACING_W / MASK_COLS
-            mask_cell_h = SPACING_H / MASK_ROWS
-
-            # Build a full-map density array from per-tile masks
-            gr = self._grid_rows
-            gc = self._grid_cols
-            full_mask = np.zeros((gr * MASK_ROWS, gc * MASK_COLS),
-                                 dtype=np.float32)
-            for (r, c), dmask in self.content_density.items():
-                full_mask[r*MASK_ROWS:(r+1)*MASK_ROWS,
-                          c*MASK_COLS:(c+1)*MASK_COLS] = dmask
-
-            has_content = full_mask > 0.15  # threshold for "real" content
-            mask_h, mask_w_arr = full_mask.shape
-
-            # Per-mask-row: rightmost and leftmost content column
-            self._right_edge_row = np.full(mask_h, -1, dtype=np.int32)
-            self._left_edge_row = np.full(mask_h, mask_w_arr, dtype=np.int32)
-            for my in range(mask_h):
-                cols = np.where(has_content[my])[0]
-                if len(cols) > 0:
-                    self._right_edge_row[my] = cols[-1]
-                    self._left_edge_row[my] = cols[0]
-
-            # Per-mask-col: bottommost and topmost content row
-            self._bottom_edge_col = np.full(mask_w_arr, -1, dtype=np.int32)
-            self._top_edge_col = np.full(mask_w_arr, mask_h, dtype=np.int32)
-            for mx in range(mask_w_arr):
-                rows = np.where(has_content[:, mx])[0]
-                if len(rows) > 0:
-                    self._bottom_edge_col[mx] = rows[-1]
-                    self._top_edge_col[mx] = rows[0]
-
-            self._mask_cell_w = mask_cell_w
-            self._mask_cell_h = mask_cell_h
-            self._mask_rows_total = mask_h
-            self._mask_cols_total = mask_w_arr
-
-            # Global limits (loose — used as safety bounds)
+        if self.content_bounds:
             cb_x0s, cb_y0s, cb_x1s, cb_y1s = [], [], [], []
             for (r, c), cb in self.content_bounds.items():
                 tile_left = c * SPACING_W
@@ -899,14 +847,11 @@ class Wanderer:
             self.max_x = max(self.min_x, max(cb_x1s) + EDGE_MARGIN - view_w)
             self.min_y = max(0, min(cb_y0s) - EDGE_MARGIN)
             self.max_y = max(self.min_y, max(cb_y1s) + EDGE_MARGIN - view_h)
-
-            log.info("Content edge profiles built: %d mask rows, %d mask cols | "
-                     "global scroll: x[%.0f-%.0f] y[%.0f-%.0f] | map: %dx%d",
-                     mask_h, mask_w_arr,
+            log.info("Content-aware scroll limits: x[%.0f-%.0f] y[%.0f-%.0f] | "
+                     "map: %dx%d",
                      self.min_x, self.max_x, self.min_y, self.max_y,
                      map_w, map_h)
         else:
-            self._right_edge_row = None
             self.min_x = 0
             self.max_x = max(1, map_w - view_w)
             self.min_y = 0
@@ -1074,78 +1019,6 @@ class Wanderer:
                 self.tip_tiles.add((r, c))
 
     # ── Blank ratio (for compatibility) ────────────────────────────────
-
-    def _dynamic_limits(self, x, y):
-        """Compute position-dependent scroll limits that hug the content edge.
-
-        The isometric layout means content boundaries taper at edges.
-        For the current viewport Y range, find the rightmost/leftmost content;
-        for the current X range, find the bottommost/topmost content.
-
-        Uses max/min of content edge positions (the furthest content pixel),
-        so the viewport can always scroll to see any content.  A generous
-        margin accounts for the diamond taper at corners.
-
-        Returns (min_x, max_x, min_y, max_y).
-        """
-        if self._right_edge_row is None:
-            return self.min_x, self.max_x, self.min_y, self.max_y
-
-        m = self._edge_margin
-
-        # ── X limits depend on Y range (which viewport rows are visible) ──
-        y_top_mask = max(0, int(y / self._mask_cell_h))
-        y_bot_mask = min(self._mask_rows_total - 1,
-                         int((y + self.view_h) / self._mask_cell_h))
-
-        if y_top_mask <= y_bot_mask and y_bot_mask >= 0:
-            right_edges = self._right_edge_row[y_top_mask:y_bot_mask + 1]
-            left_edges = self._left_edge_row[y_top_mask:y_bot_mask + 1]
-            valid_right = right_edges[right_edges >= 0]
-            valid_left = left_edges[left_edges < self._mask_cols_total]
-            if len(valid_right) > 0:
-                content_right_px = (int(valid_right.max()) + 1) * self._mask_cell_w
-                dyn_max_x = max(self.min_x,
-                                content_right_px + m - self.view_w)
-            else:
-                dyn_max_x = self.max_x
-            if len(valid_left) > 0:
-                content_left_px = int(valid_left.min()) * self._mask_cell_w
-                dyn_min_x = max(self.min_x,
-                                min(self.max_x,
-                                    content_left_px - m))
-            else:
-                dyn_min_x = self.min_x
-        else:
-            dyn_min_x, dyn_max_x = self.min_x, self.max_x
-
-        # ── Y limits depend on X range (which viewport cols are visible) ──
-        x_left_mask = max(0, int(x / self._mask_cell_w))
-        x_right_mask = min(self._mask_cols_total - 1,
-                           int((x + self.view_w) / self._mask_cell_w))
-
-        if x_left_mask <= x_right_mask and x_right_mask >= 0:
-            bottom_edges = self._bottom_edge_col[x_left_mask:x_right_mask + 1]
-            top_edges = self._top_edge_col[x_left_mask:x_right_mask + 1]
-            valid_bottom = bottom_edges[bottom_edges >= 0]
-            valid_top = top_edges[top_edges < self._mask_rows_total]
-            if len(valid_bottom) > 0:
-                content_bottom_px = (int(valid_bottom.max()) + 1) * self._mask_cell_h
-                dyn_max_y = max(self.min_y,
-                                content_bottom_px + m - self.view_h)
-            else:
-                dyn_max_y = self.max_y
-            if len(valid_top) > 0:
-                content_top_px = int(valid_top.min()) * self._mask_cell_h
-                dyn_min_y = max(self.min_y,
-                                min(self.max_y,
-                                    content_top_px - m))
-            else:
-                dyn_min_y = self.min_y
-        else:
-            dyn_min_y, dyn_max_y = self.min_y, self.max_y
-
-        return dyn_min_x, dyn_max_x, dyn_min_y, dyn_max_y
 
     def _blank_ratio(self, x, y):
         return _blank_ratio_px(x, y, self.view_w, self.view_h,
