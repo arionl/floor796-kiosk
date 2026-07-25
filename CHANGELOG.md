@@ -5,6 +5,82 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.3 — KMSDRM unification, highlighter rewrite, multi-board hardening (2026-07-24)
+
+### Added
+- **KMSDRM unified rendering** — Raspberry Pi 5 now uses the same KMSDRM code
+  path as the OrangePi 5 Max (via V3D driver instead of X11).  Both board types
+  boot directly to KMSDRM with no X11 overhead.  X11 is retained only as a
+  fallback for generic/unknown boards.
+- **Overscan support** — `KIOSK_OVERSCAN_MARGIN` environment variable (read by
+  `kiosk-launch.sh`, passed as `--overscan-margin`) insets all content and UI by
+  N pixels per side for displays with overscan.  The highlighter, stats overlay,
+  and memory warning banner all respect the margin.
+- **Low-memory warning banner** — on boards below 3900 MB RAM, a semi-transparent
+  amber banner appears at startup advising that 4 GB+ is recommended.  Threshold
+  configurable via `LOW_MEM_THRESHOLD_MB`.
+- **Thumbnail prefetch tool** (`tools/prefetch_thumbnails.py`) — pre-fetches all
+  804 thumbnails offline before deployment.  Supports all link types: YouTube
+  (`mqdefault.jpg`), images (direct), video (`ffmpeg` frame extraction), Wikipedia
+  (REST API), interactive (`floor796.com/interactive/` og:image), web (HTML
+  og:image → twitter:image → first `<img>`).  SVG via `cairosvg`, HEIC/HEIF via
+  `pillow-heif`, AVIF native in Pillow 12+ or via `pillow-heif`.  `--types` flag
+  to filter by entry type.  Image URL resolution via `urllib.parse.urljoin()`.
+- **Image format fallback chain** — pygame fast path → Pillow → format-specific
+  plugins (`cairosvg`, `pillow-heif`).  All optional imports guarded with
+  try/except for graceful degradation.
+- **`install.sh`** now installs `libcairo2` (apt), `cairosvg` + `pillow-heif`
+  (pip) for full image format support.
+
+### Changed
+- **Highlighter selection rewrite** — replaced weighted random sampling (5-factor
+  scoring with `score³` temperature) with deterministic LRU.  Candidates are
+  filtered (in viewport, large enough, won't scroll off, not in cooldown), then
+  the oldest `last_shown` object is selected.  Never-shown objects have priority.
+  Guarantees every object is shown before any repeats.  Net −130 lines.
+- **Highlighter visual effects** — new zoom-in intro (0.5s ease-out cubic,
+  viewport bounds → object bbox), followed by single-phase breathing glow (16
+  filled-rect layers, 24px max radius, quadratic alpha falloff, painter's
+  algorithm, box interior cutout, 0.6 Hz breathing, color `(255, 20, 20)`).
+  Glow skipped during zoom to prevent 170MB/frame surface allocation.  Outline
+  6px during zoom for visibility.  `PAUSE_DURATION` 2.0s → 0.5s.
+- **Content-aware scroll limits** — viewport scroll range now derived from
+  per-tile content bounds (tight pixel-art bounding boxes from the density mask)
+  rather than raw tile-grid dimensions.  50px margin past content edge.  Prevents
+  wandering into blank isometric-diamond triangles at tile borders.
+- **Resolution cap** — boards with ≤4096 MB RAM (`MAX_RES_1080P_MEM_MB`) are
+  capped at 1080p regardless of the display's native resolution.  Prevents OOM
+  from excessive tile cache at 1440p/4K.  `SDL_SCALED` is dropped when resolution
+  is capped to prevent GLES upscale-tearing.
+- **Priority-aware tile eviction** — `poll_results()` evicts in order: unneeded
+  → margin → never visible.  Adaptive margin sizing shrinks `CACHE_MARGIN` to fit
+  the cache budget on memory-constrained boards.
+
+### Fixed
+- **OOM on 2GB Pi 5** — two memory bugs in `TileCache`: (1) late loads after
+  direction changes triggered unnecessary tile loads, causing OOM; (2) eviction
+  order didn't prioritize truly unneeded tiles.  Fixed with priority-aware
+  eviction + adaptive margin.
+- **Tearing below native resolution** — `SDL_SCALED` caused GLES upscale blit
+  that tore at 1440p→1080p.  Fixed by dropping `SDL_SCALED` when resolution is
+  capped.
+- **Tile eviction churn** — three fixes for constrained-cache boards: (1)
+  directional prefetch loads only tiles ahead of movement, (2) adaptive margin
+  shrinks to fit budget, (3) late loads after direction change are skipped if
+  tile is no longer needed.
+- **prefetch image bugs** — (1) relative URL resolution used string concat
+  instead of `urljoin`, breaking paths like `index-v1.html?2/./disk-prop1.png`;
+  (2) `<img>` fallback picked up SVG logos (e.g. Tenor); (3) WEBP images failed
+  to decode in pygame (now falls back to Pillow).
+
+### Performance
+- **2GB Pi 5**: stable at 1080p with 8-tile cache.  ~1.5 GB RSS, ~450 MB swap.
+  Low-memory banner shown.  Verified over extended uptime.
+- **4GB Pi 5**: stable at 1080p (capped from 1440p).  ~2.4 GB RSS, 0 swap.
+- **OrangePi 5 Max**: 60 FPS at native resolution via KMSDRM + Panthor.
+
+---
+
 ## v2.2 — Multi-board support: OrangePi 5 Max + Raspberry Pi 5 (2026-07-07)
 
 ### Added

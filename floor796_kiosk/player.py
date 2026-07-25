@@ -98,6 +98,9 @@ SPACING_H = int(812 * SCALE)       # 812
 DEFAULT_WANDER_SPEED = 15.0
 ANIM_FPS = 12
 CACHE_MARGIN = 2               # prefetch 2 rings beyond viewport (directional)
+# On boards with small tile caches, the full margin ring can exceed max_tiles.
+# We compute an effective margin that fits within the cache budget after
+# reserving slots for visible tiles, preventing load-evict-reload churn.
 COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 
 # Memory budget on 4 GB Pi (1080p):
@@ -106,12 +109,27 @@ COVERAGE_LOG_INTERVAL = 300.0     # seconds between coverage log lines
 #   max_tiles=15 -> ~1.4 GB cache; 2 scenes -> ~240 MB holo; ~200 MB other
 # At 4K (3840x2160) the viewport shows ~4× more tiles; scale max_tiles
 # accordingly, but cap by available memory.
-MAX_TILES_BASE = 15          # baseline for 1080p + 4 GB RAM
+MAX_TILES_BASE = 18          # baseline for 1080p + 4 GB RAM (9 visible + 9 margin)
 MAX_TILES_CAP = 40           # hard ceiling (strip cache ~3.8 GB)
+
+# Boards with <= 4 GB usable RAM (most 4 GB boards report ~4000-4050 MB).
+# Set slightly below 4096 so 4 GB boards (which typically report ~4000-4050 MB
+# usable) don't trigger the low-memory banner.  2 GB boards report ~2000 MB.
+LOW_MEM_THRESHOLD_MB = 3900
+
+# Boards with <= 4 GB RAM are capped at 1080p regardless of the attached
+# display's native resolution.  Higher resolutions need too many tiles in
+# the viewport cache, causing OOM on 2-4 GB boards.
+MAX_RES_1080P_MEM_MB = 4096
 
 BG_COLOR = (0, 0, 0)
 STATUS_COLOR = (220, 220, 220)
 ACCENT_COLOR = (0, 200, 100)
+
+# Overscan compensation in pixels per side.  Most modern HDMI displays do
+# NOT apply overscan, so the default is 0 (disabled).  Set via
+# --overscan-margin for older TVs that crop the screen edges.
+DEFAULT_OVERSCAN_MARGIN = 0
 
 log = logging.getLogger("floor796")
 
@@ -136,23 +154,74 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
     so we need a larger cache. Scale linearly with viewport area, then
     cap by available memory (each strip ~96 MB).
+
+    On low-memory boards (e.g. 2 GB Pi 5), the memory cap MUST be able
+    to drop below MAX_TILES_BASE — otherwise the budget is ignored and
+    the kiosk gets OOM-killed (issue: kiosk OOM every ~5 min on 2 GB Pi).
+    The previous `max(MAX_TILES_BASE, ...)` floor defeated mem_cap on
+    those boards because mem_cap (5) < MAX_TILES_BASE (15).
     """
     # Scale factor relative to 1080p baseline
     vp_area = view_w * view_h
     base_area = 1920 * 1080
     area_scale = vp_area / base_area
-
-    # Memory ceiling: leave ~2 GB for OS + other app overhead
-    if total_mem_mb > 0:
-        mem_budget_mb = max(500, total_mem_mb - 2048)
-        mem_cap = int(mem_budget_mb / 96)  # 96 MB per strip
-    else:
-        mem_cap = MAX_TILES_CAP
-
     max_t = int(MAX_TILES_BASE * area_scale)
-    return max(MAX_TILES_BASE, min(max_t, mem_cap, MAX_TILES_CAP))
+
+    # Memory ceiling: reserve a baseline for OS + pygame framebuffer +
+    # hologram cache + python itself. The reserve scales with board RAM —
+    # small boards need most of their RAM for the OS, large boards can
+    # spare proportionally more for the tile cache.
+    #
+    #   2 GB board: reserve 1.2 GB → ~800 MB budget → 8 tiles (~768 MB)
+    #   4 GB board: reserve 2.0 GB → ~2.0 GB budget → 15 tiles (cap at base)
+    #   8 GB board: reserve 2.5 GB → ~5.5 GB budget → 40 tiles (cap)
+    #
+    # The mem_cap MUST be able to drop below MAX_TILES_BASE on constrained
+    # boards — the previous `max(MAX_TILES_BASE, ...)` floor defeated it
+    # entirely and caused OOM kills every ~5 min on 2 GB Pi 5 boards.
+    if total_mem_mb > 0 and total_mem_mb < LOW_MEM_THRESHOLD_MB:
+        # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
+        reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
+        mem_budget_mb = max(0, total_mem_mb - reserve_mb)
+        mem_cap = max(2, int(mem_budget_mb / 96))  # 96 MB per strip
+        return min(max_t, mem_cap, MAX_TILES_CAP)
+
+    # 4 GB+ board: scale with viewport, cap at MAX_TILES_CAP.
+    return min(max_t, MAX_TILES_CAP)
 
 # ─── Status Display ───────────────────────────────────────────────────────────
+
+def _compute_effective_margin(max_tiles, view_w, view_h):
+    """Shrink the margin ring to fit within the tile cache budget.
+
+    The visible tiles at 1080p occupy ~6-9 slots (with partial overlaps
+    at tile boundaries).  With max_tiles=15, that leaves ~6-9 slots for
+    margin.  A 2-ring margin can request up to ~40 tiles, far exceeding the
+    budget — causing load-evict-reload churn.
+
+    We pick the largest margin (0, 1, or 2) whose estimated tile count fits
+    in the remaining budget, so the background worker only loads tiles we
+    can keep.  Estimates account for partial-tile overlaps (visible count is
+    ~1 tile more per axis) and directional filtering (~halves margin tiles).
+    """
+    cols = max(1, math.ceil(view_w / SPACING_W))
+    rows = max(1, math.ceil(view_h / SPACING_H))
+    # Account for partial-tile overlap: the viewport straddles tile boundaries,
+    # so it typically shows (cols+1) × (rows+1) tiles.
+    vis_count = (cols + 1) * (rows + 1)
+    budget = max_tiles - vis_count
+    for margin in range(CACHE_MARGIN, -1, -1):
+        if margin <= 0:
+            return 0
+        ring_cols = cols + 1 + 2 * margin
+        ring_rows = rows + 1 + 2 * margin
+        full_ring = ring_cols * ring_rows - vis_count
+        # Directional filtering keeps roughly half the margin ring.
+        margin_tiles = math.ceil(full_ring / 2)
+        if margin_tiles <= budget:
+            return margin
+    return 0
+
 
 class StatusDisplay:
     """Renders loading / progress messages on the pygame window."""
@@ -193,6 +262,41 @@ class StatusDisplay:
             self.screen.blit(pct, pct_rect)
 
         pygame.display.flip()
+
+
+class MemoryWarningBanner:
+    """Persistent on-screen banner for low-RAM devices.
+
+    Shown when total system RAM < 4 GB.  The tile cache is too small to
+    keep all in-view tiles loaded, so the user sees blank/missing tiles
+    while wandering.  The banner pre-renders once and is blitted every
+    frame — zero per-frame allocation cost.
+    """
+
+    BANNER_H = 44
+
+    def __init__(self, screen, total_mem_mb, overscan_margin=0):
+        w = screen.get_width()
+        self.overscan_margin = overscan_margin
+        self.surf = pygame.Surface((w, self.BANNER_H), pygame.SRCALPHA)
+
+        # Semi-transparent amber background
+        self.surf.fill((180, 100, 0, 210))
+        # Bottom border line for visual separation
+        pygame.draw.line(self.surf, (255, 180, 0, 255),
+                         (0, self.BANNER_H - 1), (w, self.BANNER_H - 1), 2)
+
+        font = pygame.font.Font(None, 26)
+        ram_gb = total_mem_mb / 1024
+        msg = (f"WARNING: {ram_gb:.0f} GB RAM detected — "
+               f"4 GB recommended for smooth playback. "
+               f"Some tiles may appear blank.")
+        text = font.render(msg, True, (255, 240, 200))
+        text_rect = text.get_rect(center=(w // 2, self.BANNER_H // 2))
+        self.surf.blit(text, text_rect)
+
+    def render(self, screen):
+        screen.blit(self.surf, (0, self.overscan_margin))
 
 
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
@@ -293,6 +397,10 @@ class TileCache:
         self._lock = threading.Lock()
         self._worker = None
         self._stop_flag = False
+        # Last-known tile priority sets from set_needed(). Used by
+        # poll_results() to do intelligent eviction (never evict visible).
+        self._visible_ids = set()
+        self._needed_ids = set()
 
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
@@ -351,6 +459,9 @@ class TileCache:
 
     def set_needed(self, visible_ids, margin_ids):
         needed = visible_ids | margin_ids
+        # Stash priority sets for poll_results() intelligent eviction.
+        self._visible_ids = visible_ids
+        self._needed_ids = needed
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
@@ -408,10 +519,28 @@ class TileCache:
         with self._lock:
             ready = dict(self._results)
             self._results.clear()
+        # Enforce max_tiles here too, not just in set_needed(). The background
+        # worker can load several queued tiles into _results between
+        # set_needed() calls; without this check, cache overshoots max_tiles
+        # by the size of ready, which on memory-constrained boards (2 GB Pi)
+        # triggers the OOM killer before the next set_needed() can evict.
         for tid, (surf, num_frames) in ready.items():
-            # Surface is already converted to 16-bit by the background thread.
             self.cache[tid] = (surf, num_frames)
             self.load_count += 1
+        # Intelligent eviction using last-known priority from set_needed().
+        # NEVER evict visible tiles — that causes on-screen blanking.
+        if len(self.cache) > self.max_tiles:
+            vis = self._visible_ids
+            needed = self._needed_ids
+            # Priority 1: evict tiles not in the needed set at all
+            evictable = [t for t in self.cache if t not in needed]
+            while len(self.cache) > self.max_tiles and evictable:
+                self.cache.pop(evictable.pop(0))
+            # Priority 2: evict needed-but-not-visible (margin tiles)
+            if len(self.cache) > self.max_tiles:
+                evictable = [t for t in self.cache if t not in vis]
+                while len(self.cache) > self.max_tiles and evictable:
+                    self.cache.pop(evictable.pop())
 
     def preload_all(self, tile_ids, status=None, status_label=""):
         total = len(tile_ids)
@@ -698,10 +827,35 @@ class Wanderer:
 
         self.map_w = map_w
         self.map_h = map_h
-        self.min_x = 0
-        self.max_x = max(1, map_w - view_w)
-        self.min_y = 0
-        self.max_y = max(1, map_h - view_h)
+
+        # ── Content-aware scroll limits ──
+        # Compute a tight bounding box from per-tile content_bounds (derived
+        # from the density mask) and clamp the viewport to hug the actual
+        # pixel-art content edge, not the raw tile-grid border (which includes
+        # large blank isometric-diamond triangles).
+        EDGE_MARGIN = 50  # px of breathing room past content edge
+        if self.content_bounds:
+            cb_x0s, cb_y0s, cb_x1s, cb_y1s = [], [], [], []
+            for (r, c), cb in self.content_bounds.items():
+                tile_left = c * SPACING_W
+                tile_top = r * SPACING_H
+                cb_x0s.append(tile_left + cb[0])
+                cb_y0s.append(tile_top + cb[1])
+                cb_x1s.append(tile_left + cb[2])
+                cb_y1s.append(tile_top + cb[3])
+            self.min_x = max(0, min(cb_x0s) - EDGE_MARGIN)
+            self.max_x = max(self.min_x, max(cb_x1s) + EDGE_MARGIN - view_w)
+            self.min_y = max(0, min(cb_y0s) - EDGE_MARGIN)
+            self.max_y = max(self.min_y, max(cb_y1s) + EDGE_MARGIN - view_h)
+            log.info("Content-aware scroll limits: x[%.0f-%.0f] y[%.0f-%.0f] | "
+                     "map: %dx%d",
+                     self.min_x, self.max_x, self.min_y, self.max_y,
+                     map_w, map_h)
+        else:
+            self.min_x = 0
+            self.max_x = max(1, map_w - view_w)
+            self.min_y = 0
+            self.max_y = max(1, map_h - view_h)
 
         # ── Precompute safe region and optimal positions ──
         log.info("Precomputing navigation grid...")
@@ -1167,6 +1321,9 @@ def main():
     parser.add_argument("--no-wander", action="store_true")
     parser.add_argument("--wander-speed", type=float, default=DEFAULT_WANDER_SPEED,
                         help="Wander pan speed in pixels/sec (default: 15)")
+    parser.add_argument("--overscan-margin", type=int, default=DEFAULT_OVERSCAN_MARGIN,
+                        help="Pixels to inset all content/UI for TV overscan (default: %d, 0=off)"
+                             % DEFAULT_OVERSCAN_MARGIN)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1183,7 +1340,7 @@ def main():
     # ── Select SDL2 video driver (board-specific) ──
     # Board detection is centralized in floor796_kiosk.board_detect.
     #   - OrangePi 5 Max (RK3588 + Mesa Panthor) → KMSDRM, no X11
-    #   - Raspberry Pi 5 (Mesa V3D)              → X11
+    #   - Raspberry Pi 5 (Mesa V3D)              → KMSDRM, no X11
     #   - Generic / unknown                       → X11 fallback
     # Allow override via SDL_VIDEODRIVER env var.
     if "SDL_VIDEODRIVER" not in os.environ:
@@ -1213,98 +1370,86 @@ def main():
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
 
-    # ── 4K handling ──
-    # Four board+display scenarios to handle:
-    #
-    #   1. Pi 5 + 4K display:     Downscale to 1080p via xrandr (4 GB RAM
-    #      can't handle native 4K). Monitor hardware upscales to 3840×2160.
-    #
-    #   2. Pi 5 + 1080p display:  No action needed — render at native 1080p.
-    #
-    #   3. OrangePi + 4K display: Render at native 4K (8 GB RAM + Panthor
-    #      GPU acceleration is sufficient). KMSDRM doesn't use xrandr.
-    #
-    #   4. OrangePi + 1080p:      No action needed — render at native 1080p.
-    #      KMSDRM detects the display's native mode. Panthor handles 1080p
-    #      effortlessly. The 4K downscale block below is skipped because
-    #      args.width (1920) is not > 3000.
-    #
-    # After xrandr, pygame must be quit+re-init so it picks up the new
-    # display mode — otherwise set_mode() uses stale dimensions and the
-    # fullscreen window ends up positioned in a corner.
-    #
-    # NOTE: xrandr is X11-only.  When using KMSDRM (OrangePi with Panthor),
-    # we skip the downscale — KMSDRM uses the display's native mode directly.
-    physical_w = args.width
-    physical_h = args.height
+    # ── Resolution cap for low-RAM boards ──
+    # Boards with <= 4 GB RAM are capped at 1080p even if a higher-res
+    # display is attached (e.g. 1440p/4K monitor).  Higher resolutions need
+    # too many tiles in the viewport cache for the memory budget.
     total_mem_mb = _detect_total_memory_mb()
     log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
 
-    using_kmsdrm = os.environ.get("SDL_VIDEODRIVER") == "kmsdrm"
+    resolution_capped = False
+    if total_mem_mb > 0 and total_mem_mb <= MAX_RES_1080P_MEM_MB:
+        if args.width > 1920 or args.height > 1080:
+            log.info("Capping display from %dx%d to 1920x1080 "
+                     "(%d MB RAM <= %d MB threshold)",
+                     args.width, args.height, total_mem_mb,
+                     MAX_RES_1080P_MEM_MB)
+            args.width = 1920
+            args.height = 1080
+            resolution_capped = True
 
-    if args.width > 3000 and total_mem_mb < 6144 and not using_kmsdrm:
-        # Pi 5 (or low-RAM board) + 4K display + X11:
-        # Not enough RAM for native 4K — downscale to 1080p via xrandr.
-        # The monitor's hardware scaler upscales 1080p → 3840×2160.
-        render_w = 1920
-        render_h = 1080
-        try:
-            subprocess.run(
-                ["xrandr", "-s", f"{render_w}x{render_h}"],
-                env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")},
-                capture_output=True, timeout=5,
-            )
-            time.sleep(1.0)
-            # Force pygame to re-read the display after the mode switch.
-            # display.quit() invalidates the font module's rendering
-            # context, so we must re-init it too — otherwise status/
-            # loading text renders garbled.
-            pygame.display.quit()
-            pygame.display.init()
-            pygame.font.init()
-            info = pygame.display.Info()
-            args.width = info.current_w
-            args.height = info.current_h
-            log.info("4K display detected — switched X to %dx%d "
-                     "(monitor hardware upscales to %dx%d, pygame sees %dx%d)",
-                     render_w, render_h, physical_w, physical_h,
-                     args.width, args.height)
-        except Exception as e:
-            log.warning("Could not switch display mode: %s — "
-                       "rendering at native %dx%d", e, args.width, args.height)
-    elif args.width > 3000 and total_mem_mb < 6144 and using_kmsdrm:
-        # OrangePi (or low-RAM KMSDRM board) + 4K display + < 6 GB RAM:
-        # Can't use xrandr (KMSDRM doesn't support it). KMSDRM will render
-        # at the display's native 4K mode, but memory may be tight.
-        # Reduce tile cache to fit available memory — _compute_max_tiles()
-        # already caps by RAM, so we just log a warning.
-        log.warning("4K display on low-RAM KMSDRM board (%d MB) — "
+    # ── 4K handling ──
+    # Only 8 GB+ boards with native 4K displays reach this path (low-RAM
+    # boards are capped at 1080p above).  _compute_max_tiles() caps the
+    # tile cache by RAM as a defense in depth.
+    physical_w = args.width
+    physical_h = args.height
+
+    if args.width > 3000 and total_mem_mb < 6144:
+        log.warning("4K display on low-RAM board (%d MB) — "
                     "rendering at native %dx%d, tile cache will be "
                     "memory-constrained", total_mem_mb, args.width, args.height)
     elif args.width > 3000:
-        # OrangePi + 4K display with sufficient RAM, or any board with
-        # ≥ 6 GB RAM on a 4K display.
         log.info("4K display detected — rendering at native %dx%d "
                  "(%d MB RAM sufficient for native 4K)",
                  args.width, args.height, total_mem_mb)
 
     log.info("Display: %dx%d", args.width, args.height)
-    # With KMSDRM + Panthor GPU, both FULLSCREEN and SCALED use hardware GLES
-    # rendering via the SDL renderer.  SCALED gives us vsync + page-flip.
-    # With X11 (Pi 5), SCALED also uses the SDL renderer (Mesa V3D GPU).
-    # At 4K with X11 + llvmpipe (old config), FULLSCREEN was faster because
-    # SCALED added GL compositing overhead — but that path is no longer used.
+    log.info("Overscan margin: %dpx per side", args.overscan_margin)
+
+    # Display flags: When rendering at native resolution, SCALED gives us
+    # vsync + page-flip via SDL's internal renderer (hardware GLES on V3D /
+    # Panthor).  But when we capped below native (e.g. 1080p on a 1440p
+    # display), SCALED would make SDL upscale every frame via a GLES texture
+    # blit that isn't perfectly synchronised with the DRM page-flip — causing
+    # visible tearing while wandering.
+    #
+    # Dropping SCALED when resolution_capped lets KMSDRM negotiate the actual
+    # lower-resolution DRM mode (e.g. 1920x1080) directly.  The monitor's
+    # hardware scaler then handles the panel-native upscale, which is tear-free.
+    # KMSDRM still page-flips via DRM atomic commits with vsync.
     if args.fullscreen:
-        flags = pygame.FULLSCREEN | pygame.SCALED
+        flags = pygame.FULLSCREEN
+        if not resolution_capped:
+            flags |= pygame.SCALED
     else:
-        flags = pygame.SCALED
+        flags = 0 if resolution_capped else pygame.SCALED
     screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
     status = StatusDisplay(screen)
-    status.show("Floor796 Kiosk", "Starting up...")
+
+    # ── Low-memory startup warning ──
+    # This is the very first thing the user sees. If the board has less
+    # than ~4 GB RAM the tile cache will be too small to keep all in-view
+    # tiles loaded — we tell the user up front.
+    low_memory = 0 < total_mem_mb < LOW_MEM_THRESHOLD_MB
+    if low_memory:
+        ram_gb = total_mem_mb / 1024
+        log.warning("Low memory: %d MB (%.0f GB) — below 4 GB recommendation. "
+                    "Banner will be shown.", total_mem_mb, ram_gb)
+        status.show(
+            f"WARNING: {ram_gb:.0f} GB RAM",
+            "4 GB recommended for smooth playback. "
+            "Some tiles may appear blank.",
+        )
+        time.sleep(4)
+    else:
+        status.show("Floor796 Kiosk", "Starting up...")
+        time.sleep(0.5)
+
     ensure_dirs()
 
     # ── Check for tile updates (graceful offline fallback) ──
@@ -1402,12 +1547,13 @@ def main():
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
     max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
-    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM)",
-             max_tiles, args.width, args.height, total_mem_mb)
+    effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
+    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM, margin=%d)",
+             max_tiles, args.width, args.height, total_mem_mb, effective_margin)
     cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
-        grid_cols, grid_rows, tiles_meta, CACHE_MARGIN, tile_grid=tile_grid,
+        grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
     )
     cache.preload_all(visible_tile_ids, status=status,
                       status_label="Loading visible tiles")
@@ -1472,7 +1618,8 @@ def main():
             if hl_objects:
                 object_highlighter = ObjectHighlighter(
                     hl_objects, args.width, args.height,
-                    spacing_w=SPACING_W, spacing_h=SPACING_H)
+                    spacing_w=SPACING_W, spacing_h=SPACING_H,
+                    overscan_margin=args.overscan_margin)
                 log.info("Object highlighter: %d objects loaded",
                          len(hl_objects))
             else:
@@ -1484,6 +1631,14 @@ def main():
     # Wire highlighter into stats collector for telemetry
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
+
+    # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
+    mem_banner = None
+    if low_memory:
+        mem_banner = MemoryWarningBanner(screen, total_mem_mb,
+                                         overscan_margin=args.overscan_margin)
+        log.info("Memory warning banner enabled (%d MB < %d MB, overscan margin %dpx)",
+                 total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
 
     running = True
     while running:
@@ -1558,7 +1713,7 @@ def main():
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
             tiles_meta=tiles_meta,
-            margin=CACHE_MARGIN, tile_grid=tile_grid,
+            margin=effective_margin, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
             vel_x=wanderer.heading()[0] if wandering else 0,
             vel_y=wanderer.heading()[1] if wandering else 0,
@@ -1651,6 +1806,10 @@ def main():
         if stats_collector and stats_collector.overlay_enabled:
             snap = stats_collector.snapshot()
             stats_overlay.render(screen, snap)
+
+        # ── Persistent low-memory warning banner ──
+        if mem_banner:
+            mem_banner.render(screen)
 
         pygame.display.flip()
 

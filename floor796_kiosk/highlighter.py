@@ -20,7 +20,6 @@ import json
 import logging
 import math
 import os
-import random
 import time
 import urllib.request
 
@@ -33,42 +32,14 @@ log = logging.getLogger("floor796")
 # ── Tunable parameters ───────────────────────────────────────────────────────
 
 HIGHLIGHT_DURATION = 10.0  # seconds an object is shown
-PAUSE_DURATION = 2.0       # seconds between objects
+PAUSE_DURATION = 0.5      # brief pause between objects (near-continuous)
 MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
-EDGE_MARGIN = 0.04         # hard margin — bbox must be at least this
-                           # far inside the viewport (4%) to prevent
-                           # it from being partially off-screen
-EDGE_PENALTY = 0.50        # score reduction for objects near edges
 
-# Panel exclusion: the info panel occupies the bottom-right corner.
-# Objects whose bbox falls under the panel footprint are penalized.
-# Panel is at most 360px wide + 20px margin, ~340px tall + 20px margin.
-PANEL_EXCLUDE_W = 380
-PANEL_EXCLUDE_H = 360
-PANEL_EXCLUDE_PENALTY = 0.30  # up to 70% score reduction if under panel
-
-# Wander velocity prediction: when the viewport is moving, predict
-# where the object will be relative to the viewport at the end of the
-# highlight duration.  If it would scroll off, penalize heavily.
-WANDER_SPEED_DEFAULT = 15.0   # px/s — fallback if no velocity given
-
-# Recency-weighted selection: prefer objects not recently viewed.
-# After RECENCY_HALFLIFE seconds, a previously-viewed object's penalty
-# decays by half.  Objects within RECENT_BLACKLIST seconds are never
-# re-selected (hard cooldown).  Never-viewed objects get a bonus.
-RECENCY_HALFLIFE = 600.0   # 10 minutes
-RECENT_BLACKLIST = 45.0    # hard cooldown (> HIGHLIGHT + PAUSE)
-RECENT_PENALTY = 0.90      # max score reduction for just-viewed (90%)
-NEVER_VIEWED_BONUS = 1.15  # 15% score boost for never-viewed objects
-
-# Weighted random sampling: instead of always picking the highest-scored
-# object (pure argmax), we sample proportional to score^TEMPERATURE.
-# Higher TEMPERATURE = more deterministic (always picks best).
-# TEMPERATURE = 1.0 = purely proportional to score.
-# TEMPERATURE = 3.0 = heavily favours top candidates but still varies.
-# This prevents the same object always being picked first on startup
-# when all objects have identical recency scores.
-SELECTION_TEMPERATURE = 3.0
+# Recency selection: the least-recently-displayed object wins.
+# Objects within RECENT_BLACKLIST seconds are never re-selected
+# (hard cooldown). Must be > HIGHLIGHT + PAUSE to prevent the same
+# object being re-picked immediately.
+RECENT_BLACKLIST = 12.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
 CHANGELOG_URL = "https://floor796.com/data/changelog.json"
@@ -76,24 +47,31 @@ CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
-BOX_COLOR = (255, 220, 80)       # bright yellow
-BOX_FILL = (255, 220, 80, 35)    # semi-transparent yellow fill
-BOX_OUTLINE = 3                   # pixels
+BOX_COLOR = (255, 20, 20)        # bright red
+BOX_FILL = (255, 20, 20, 35)     # semi-transparent red fill
+BOX_OUTLINE = 3                   # pixels (normal)
+ZOOM_OUTLINE = 6                 # pixels (thicker during zoom intro)
 LABEL_BG = (15, 15, 20, 220)
 LABEL_TEXT = (255, 255, 255)
-LABEL_ACCENT = (255, 220, 80)
+LABEL_ACCENT = (255, 20, 20)
 CORNER_PANEL_BG = (15, 15, 20, 230)
 CORNER_PANEL_BORDER = (60, 60, 80)
 
-# Pulse animation for drawing attention to the highlight box.
-# For the first PULSE_DURATION seconds of each highlight, the border
-# pulses with a glow effect — expanding/halos and intensity oscillation.
-# After that it settles into a steady outline so it's not distracting.
-PULSE_DURATION = 1.8             # seconds of pulsing at start
-PULSE_SPEED = 5.0                # Hz — oscillations per second
-PULSE_GLOW_MAX = 8               # max glow radius in pixels
-PULSE_INTENSITY_MIN = 0.35       # brightness floor (0=dim, 1=full)
-PULSE_BOX_ALPHA_MAX = 180        # peak glow surface alpha
+# Breathing glow animation:
+#   An alpha-channel gradient radiates outward from the box for
+#   GLOW_RADIUS pixels, gently expanding/contracting and fading in/
+#   out at STEADY_SPEED Hz. Runs for the entire highlight duration.
+#
+# Zoom-on intro:
+#   The box smoothly expands from the full viewport bounds to the
+#   object's actual bounding box over ZOOM_DURATION seconds with an
+#   ease-out cubic curve, then transitions seamlessly into breathing.
+ZOOM_DURATION = 0.5             # seconds for zoom to complete
+
+STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
+GLOW_RADIUS = 24                 # outward gradient extent in pixels
+GLOW_STEPS = 16                  # number of concentric rect layers
+GLOW_PEAK_ALPHA = 90             # peak alpha at box edge when breathing peaks
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
 # The corner panel becomes vertical to accommodate a thumbnail image.
@@ -438,10 +416,11 @@ class ObjectHighlighter:
     """Manages the automatic object highlight cycle."""
 
     def __init__(self, segments, screen_w, screen_h,
-                 spacing_w=1016, spacing_h=812):
+                 spacing_w=1016, spacing_h=812, overscan_margin=0):
         self._index = TileObjectIndex(segments, spacing_w, spacing_h)
         self._screen_w = screen_w
         self._screen_h = screen_h
+        self._overscan_margin = overscan_margin
 
         # State machine
         self.enabled = True
@@ -484,39 +463,25 @@ class ObjectHighlighter:
         self._font_link = pygame.font.Font(None, 15)
         self._fonts_ready = True
 
-    def _recency_score(self, obj_id, now):
-        """Return a multiplier (0..~1.15) for how preferable this object is.
-
-        - Never viewed: NEVER_VIEWED_BONUS (1.15)
-        - Viewed recently: decaying penalty (down to ~0.1 at t=0)
-        - After RECENCY_HALFLIFE: penalty halves again each halflife
-        """
-        last = self._last_shown.get(obj_id)
-        if last is None:
-            return NEVER_VIEWED_BONUS
-        elapsed = now - last
-        # Exponential decay: penalty = RECENT_PENALTY * 0.5^(elapsed/halflife)
-        penalty = RECENT_PENALTY * (0.5 ** (elapsed / RECENCY_HALFLIFE))
-        return max(0.05, 1.0 - penalty)
-
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2,
                         vel_x=0, vel_y=0):
         """Select the best segment to highlight in the current viewport.
 
-        Scoring factors:
-          1. Spatial proximity to viewport center (primary).
-          2. Edge safety: soft penalty for objects near viewport edges.
-             Only hard-skips if the bbox would be partially off-screen
-             (< EDGE_MARGIN inside).
-          3. Panel exclusion: penalize objects under the bottom-right
-             panel footprint (where the info panel renders).
-          4. Velocity prediction: penalize objects that would scroll
-             off-screen during the highlight duration based on wander
-             velocity.  Objects ahead of the viewport (will move toward
-             center) get a bonus.
-          5. Recency: prefer not-recently-viewed objects.
+        Selection is deterministic: pick the LEAST-RECENTLY-DISPLAYED
+        object that is fully visible in the viewport and will remain
+        visible for the entire highlight duration (accounting for
+        wander velocity). Ties are broken by distance from viewport
+        center (closer wins).
 
-        Objects within RECENT_BLACKLIST seconds are skipped entirely.
+        Filtering (hard skips):
+          - Too-small segments (< MIN_BBOX_SIZE)
+          - Bbox partially off-screen (must be fully inside viewport)
+          - Would scroll off-screen during HIGHLIGHT_DURATION
+          - Currently within RECENT_BLACKLIST cooldown
+
+        From the remaining candidates, returns the one with the
+        oldest last-shown timestamp. Objects never shown before get
+        timestamp 0 (highest priority).
         """
         candidates = self._index.query_viewport(vp_x1, vp_y1, vp_x2, vp_y2)
         if not candidates:
@@ -528,26 +493,16 @@ class ObjectHighlighter:
         vp_cx = (vp_x1 + vp_x2) / 2
         vp_cy = (vp_y1 + vp_y2) / 2
 
-        # Hard margin — bbox must be at least this far inside to be
-        # fully visible.  This is small (4%) just to prevent clipping.
-        margin_x = vp_w * EDGE_MARGIN
-        margin_y = vp_h * EDGE_MARGIN
+        # Hard margin — bbox must be fully inside the viewport (1.5%
+        # tolerance to allow edge-of-map objects).
+        clip_margin_x = vp_w * 0.015
+        clip_margin_y = vp_h * 0.015
 
-        # Edge penalty zone: between hard margin and 20% from edge,
-        # objects get a progressively heavier penalty.
-        edge_zone_x = vp_w * 0.20
-        edge_zone_y = vp_h * 0.20
-
-        # Panel footprint in screen coords (bottom-right corner)
-        panel_x1 = self._screen_w - PANEL_EXCLUDE_W
-        panel_y1 = self._screen_h - PANEL_EXCLUDE_H
-
-        # Wander speed for prediction
+        # Wander prediction
         wander_speed = math.hypot(vel_x, vel_y)
-        # How far the viewport will move during the highlight
         predict_dist = wander_speed * HIGHLIGHT_DURATION
 
-        scored_candidates = []
+        eligible = []
 
         for seg in candidates:
             # Skip too-small segments
@@ -559,140 +514,48 @@ class ObjectHighlighter:
             if last is not None and (now - last) < RECENT_BLACKLIST:
                 continue
 
-            # Hard skip: bbox must be fully inside the viewport.  Use a
-            # reduced margin (1.5%) for the actual pixel-clipping check,
-            # to allow objects that barely overflow the 4% scoring margin
-            # at their only reachable viewport positions (edge-of-map
-            # objects like #383).
-            clip_margin_x = vp_w * 0.015
-            clip_margin_y = vp_h * 0.015
+            # Hard skip: bbox must be fully inside the viewport
             if (seg.abs_x1 < vp_x1 + clip_margin_x or
                     seg.abs_x2 > vp_x2 - clip_margin_x or
                     seg.abs_y1 < vp_y1 + clip_margin_y or
                     seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
-            # ── Spatial score: 1.0 at center, 0.0 at edges ──
-            dx = (seg.cx - vp_cx) / (vp_w / 2)
-            dy = (seg.cy - vp_cy) / (vp_h / 2)
-            dist_sq = dx * dx + dy * dy
-            spatial_score = max(0.0, 1.0 - dist_sq)
-
-            # ── Edge proximity penalty (soft) ──
-            # Distance from viewport edges (normalized 0..1 where 1=safe)
-            seg_right_dist = (vp_x2 - seg.abs_x2) / edge_zone_x
-            seg_left_dist = (seg.abs_x1 - vp_x1) / edge_zone_x
-            seg_bottom_dist = (vp_y2 - seg.abs_y2) / edge_zone_y
-            seg_top_dist = (seg.abs_y1 - vp_y1) / edge_zone_y
-            min_edge_dist = min(seg_right_dist, seg_left_dist,
-                                seg_bottom_dist, seg_top_dist)
-            if min_edge_dist < 1.0:
-                edge_mult = 1.0 - EDGE_PENALTY * (1.0 - min_edge_dist)
-            else:
-                edge_mult = 1.0
-
-            # ── Panel overlap penalty ──
-            # Convert bbox to screen coords
-            sx1 = seg.abs_x1 - vp_x1
-            sy1 = seg.abs_y1 - vp_y1
-            sx2 = seg.abs_x2 - vp_x1
-            sy2 = seg.abs_y2 - vp_y1
-            # Compute overlap fraction with panel footprint
-            ox1 = max(sx1, panel_x1)
-            oy1 = max(sy1, panel_y1)
-            ox2 = min(sx2, self._screen_w)
-            oy2 = min(sy2, self._screen_h)
-            if ox2 > ox1 and oy2 > oy1:
-                overlap_area = (ox2 - ox1) * (oy2 - oy1)
-                seg_area = max(1, (sx2 - sx1) * (sy2 - sy1))
-                overlap_frac = overlap_area / seg_area
-                panel_mult = 1.0 - PANEL_EXCLUDE_PENALTY * overlap_frac
-            else:
-                panel_mult = 1.0
-
-            # ── Velocity prediction ──
-            # At 15px/s over 10s, the viewport moves 150px.
-            # An object near the leading edge will move toward center
-            # (good).  An object near the trailing edge will scroll off
-            # (bad).  We predict where the bbox will be relative to the
-            # viewport at t+HIGHLIGHT_DURATION.
+            # Velocity prediction: skip objects that would scroll off
+            # during the highlight duration
             if predict_dist > 1:
-                # Object's future position relative to viewport
-                # (viewport moves, object stays — so relative to
-                # viewport, the object moves backward by predict_dist)
-                clip_m = vp_w * 0.015
+                sx1 = seg.abs_x1 - vp_x1
+                sy1 = seg.abs_y1 - vp_y1
+                sx2 = seg.abs_x2 - vp_x1
+                sy2 = seg.abs_y2 - vp_y1
                 future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
                 future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
                 future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
                 future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
-
-                # Check if the object would still be visible (using
-                # the relaxed clip margin)
-                visible = (future_x2 > clip_m and
-                           future_x1 < self._screen_w - clip_m and
-                           future_y2 > clip_m and
-                           future_y1 < self._screen_h - clip_m)
+                visible = (future_x2 > clip_margin_x and
+                           future_x1 < self._screen_w - clip_margin_x and
+                           future_y2 > clip_margin_y and
+                           future_y1 < self._screen_h - clip_margin_y)
                 if not visible:
-                    # Would scroll off — skip this one
                     continue
 
-                # Bonus for objects ahead of the viewport (moving toward
-                # center): the further ahead, the more it'll be centered
-                # during the highlight
-                future_cx = (future_x1 + future_x2) / 2
-                future_cy = (future_y1 + future_y2) / 2
-                future_center_dist = math.hypot(
-                    (future_cx - self._screen_w / 2) / (self._screen_w / 2),
-                    (future_cy - self._screen_h / 2) / (self._screen_h / 2))
-                # Objects that will be MORE centered get a small bonus
-                vel_mult = 1.0 + 0.10 * max(0, 1.0 - future_center_dist)
-            else:
-                vel_mult = 1.0
+            # Distance from viewport center (for tie-breaking only)
+            dx = (seg.cx - vp_cx) / (vp_w / 2)
+            dy = (seg.cy - vp_cy) / (vp_h / 2)
+            center_dist = dx * dx + dy * dy
 
-            # ── Recency multiplier ──
-            recency = self._recency_score(seg.obj_id, now)
+            # last_shown timestamp (0 = never shown = highest priority)
+            last_ts = last if last is not None else 0.0
 
-            # ── Combined score ──
-            score = (spatial_score *
-                     edge_mult *
-                     panel_mult *
-                     vel_mult *
-                     recency)
+            eligible.append((last_ts, center_dist, seg))
 
-            scored_candidates.append((score, seg))
-
-        if not scored_candidates:
+        if not eligible:
             return None
 
-        # Weighted random sampling: sample proportional to score^temperature.
-        # This ensures variety while still strongly preferring high-scoring
-        # objects.  Prevents the same first/third/fifth object on every boot.
-        max_score = max(s for s, _ in scored_candidates)
-        if max_score <= 0:
-            return None
-
-        # Apply temperature: scores are normalized to [0,1] then raised
-        # to the power of TEMPERATURE.  At temp=3, the top candidate is
-        # ~27x more likely than one at half its score, but still not
-        # guaranteed — providing variety across boots.
-        weights = []
-        for score, _ in scored_candidates:
-            normalized = score / max_score
-            weights.append(normalized ** SELECTION_TEMPERATURE)
-
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            # All-zero weights (shouldn't happen) — fall back to uniform
-            return random.choice(scored_candidates)[1]
-
-        r = random.random() * total_weight
-        cumulative = 0.0
-        for weight, (score, seg) in zip(weights, scored_candidates):
-            cumulative += weight
-            if r <= cumulative:
-                return seg
-
-        return scored_candidates[-1][1]
+        # Sort by last_shown ascending (oldest first = least-recently shown),
+        # then by center distance ascending (closest to center) as tie-breaker
+        eligible.sort(key=lambda t: (t[0], t[1]))
+        return eligible[0][2]
 
     def update(self, dt, pos_x, pos_y, vel_x=0, vel_y=0):
         """Advance the state machine.  Called once per frame.
@@ -721,6 +584,10 @@ class ObjectHighlighter:
                 self.highlights_shown += 1
                 # Record view timestamp
                 now = time.time()
+                last = self._last_shown.get(seg.obj_id)
+                ago = f"first time" if last is None else f"{now - last:.0f}s ago"
+                log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
+                         seg.obj_id, seg.title[:40], ago, len(self._last_shown))
                 self._last_shown[seg.obj_id] = now
                 history = self._view_history.setdefault(seg.obj_id, [])
                 history.append(now)
@@ -731,6 +598,25 @@ class ObjectHighlighter:
                 self._thumbs.get(seg.obj_id, seg.link)
 
         elif self._state == STATE_HIGHLIGHT:
+            # Mid-highlight check: if the current object has scrolled
+            # off-screen (e.g. wander direction changed), abort early
+            # and immediately pick a new one.
+            if self._current_seg is not None:
+                seg = self._current_seg
+                clip_margin_x = self._screen_w * 0.015
+                clip_margin_y = self._screen_h * 0.015
+                if (seg.abs_x2 < vp_x1 + clip_margin_x or
+                        seg.abs_x1 > vp_x2 - clip_margin_x or
+                        seg.abs_y2 < vp_y1 + clip_margin_y or
+                        seg.abs_y1 > vp_y2 - clip_margin_y):
+                    # Scrolled off — immediately select next
+                    log.info("Scroll-off abort: obj %d '%s' left viewport at %.1fs",
+                             seg.obj_id, seg.title[:30], self._timer)
+                    self._current_seg = None
+                    self._state = STATE_IDLE
+                    self._timer = 0.0
+                    return
+
             if self._timer >= HIGHLIGHT_DURATION:
                 self._current_seg = None
                 self._state = STATE_PAUSE
@@ -750,89 +636,102 @@ class ObjectHighlighter:
         seg = self._current_seg
 
         # Convert absolute map coords to screen coords
-        sx1 = seg.abs_x1 - pos_x
-        sy1 = seg.abs_y1 - pos_y
-        sx2 = seg.abs_x2 - pos_x
-        sy2 = seg.abs_y2 - pos_y
+        box_sx1 = seg.abs_x1 - pos_x
+        box_sy1 = seg.abs_y1 - pos_y
+        box_sx2 = seg.abs_x2 - pos_x
+        box_sy2 = seg.abs_y2 - pos_y
+
+        t = self._timer
+        zooming = t < ZOOM_DURATION
+
+        if zooming:
+            # Zoom-on intro: interpolate from full viewport bounds to box
+            raw = t / ZOOM_DURATION
+            eased = 1.0 - (1.0 - raw) ** 3
+            vp_sx1, vp_sy1 = 0, 0
+            vp_sx2, vp_sy2 = self._screen_w, self._screen_h
+            sx1 = vp_sx1 + (box_sx1 - vp_sx1) * eased
+            sy1 = vp_sy1 + (box_sy1 - vp_sy1) * eased
+            sx2 = vp_sx2 + (box_sx2 - vp_sx2) * eased
+            sy2 = vp_sy2 + (box_sy2 - vp_sy2) * eased
+        else:
+            sx1, sy1 = box_sx1, box_sy1
+            sx2, sy2 = box_sx2, box_sy2
+
         bw = sx2 - sx1
         bh = sy2 - sy1
 
         if self.label_mode == LABEL_INLINE:
-            self._render_inline(screen, seg, sx1, sy1, sx2, sy2, bw, bh)
+            self._render_inline(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                                skip_glow=zooming)
         else:
-            self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh)
+            self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                                skip_glow=zooming)
 
     def _pulse_envelope(self):
-        """Return (intensity, glow_px) for the current timer position.
+        """Return (intensity, glow_radius) for the current timer position.
 
-        During the first PULSE_DURATION seconds the box pulses to draw
-        attention.  After that it settles to a steady outline.  intensity
-        is 0..1 (how bright the inner box is), glow_px is how far the
-        surrounding glow extends.
+        Single-phase breathing glow that runs for the entire highlight.
+        Returns (1.0, radius) where radius oscillates between 40% and
+        100% of GLOW_RADIUS at STEADY_SPEED Hz.
         """
         t = self._timer
-        if t >= PULSE_DURATION:
-            return 1.0, 0
-        # Envelope: starts at peak, decays linearly over PULSE_DURATION
-        env = 1.0 - (t / PULSE_DURATION)  # 1.0 → 0.0
-        # Oscillation: 0..1 sinusoidal at PULSE_SPEED Hz
-        osc = (math.sin(t * PULSE_SPEED * 2 * math.pi) + 1) / 2
-        # Combined intensity never drops below PULSE_INTENSITY_MIN
-        intensity = PULSE_INTENSITY_MIN + (1.0 - PULSE_INTENSITY_MIN) * (
-            env * osc + (1 - env))
-        glow_px = int(PULSE_GLOW_MAX * env * (0.5 + 0.5 * osc))
-        return intensity, glow_px
+        osc = (math.sin(t * STEADY_SPEED * 2 * math.pi) + 1) / 2
+        radius = int(GLOW_RADIUS * (0.4 + 0.6 * osc))
+        return 1.0, radius
 
-    def _draw_pulse_glow(self, screen, sx1, sy1, sx2, sy2, intensity, glow_px):
-        """Draw expanding glow halos around the highlight box during pulse."""
-        if glow_px <= 0:
-            return
+    def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
+        """Draw a smooth alpha-gradient glow radiating outward from the box.
+
+        Draws GLOW_STEPS filled rectangles from outermost (largest, lowest
+        alpha) to innermost (box edge, highest alpha), each covering the
+        previous. The box interior is cut out of each layer so only the
+        outward ring area receives glow. This painter's-algorithm approach
+        produces a continuous gradient with no gaps or banding.
+        """
         bw = sx2 - sx1
         bh = sy2 - sy1
-        # Draw 2-3 concentric expanding outlines at decreasing alpha
-        for i in range(glow_px, 0, -2):
-            alpha = int(PULSE_BOX_ALPHA_MAX * intensity *
-                        (1 - i / (glow_px + 1)) ** 2)
-            if alpha < 8:
+        steps = min(GLOW_STEPS, glow_radius)
+        if steps < 2:
+            return
+
+        for i in range(steps, 0, -1):
+            frac = i / steps  # 1.0 at outer edge → 0 at box edge
+            alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
+            if alpha < 2:
                 continue
-            pad = i
+            pad = max(1, int(glow_radius * frac))
             gw = int(bw + pad * 2)
             gh = int(bh + pad * 2)
             if gw <= 0 or gh <= 0:
                 continue
             glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*BOX_COLOR, alpha),
-                             (0, 0, gw, gh), 2)
+            glow_surf.fill((*BOX_COLOR, alpha))
+            # Cut out the box interior so glow only covers the ring area
+            if int(bw) > 0 and int(bh) > 0:
+                glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
-    def _box_color_at(self, intensity):
-        """Return BOX_COLOR scaled by intensity (toward black)."""
-        return (
-            int(BOX_COLOR[0] * intensity),
-            int(BOX_COLOR[1] * intensity),
-            int(BOX_COLOR[2] * intensity),
-        )
-
-    def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
+    def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                       skip_glow=False):
         """Draw bounding box with label text next to it."""
 
-        intensity, glow_px = self._pulse_envelope()
-        box_color = self._box_color_at(intensity)
-
-        # Expanding glow halos during pulse phase
-        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
+        if not skip_glow:
+            _intensity, glow_radius = self._pulse_envelope()
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
         # Semi-transparent fill
         fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
                                     pygame.SRCALPHA)
-        fill_alpha = int(BOX_FILL[3] * intensity)
+        fill_alpha = int(BOX_FILL[3])
         fill_surf.fill((*BOX_COLOR[:3], fill_alpha))
         screen.blit(fill_surf, (int(sx1), int(sy1)))
 
-        # Bright outline
-        pygame.draw.rect(screen, box_color,
+        # Bright outline (thicker during zoom)
+        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
-                         BOX_OUTLINE)
+                         outline_w)
 
         # Label text — position above the box if space, else below
         title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
@@ -867,19 +766,19 @@ class ObjectHighlighter:
             if date_y + date_surf.get_height() < self._screen_h:
                 screen.blit(date_surf, (label_x, date_y))
 
-    def _render_corner(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh):
+    def _render_corner(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
+                       skip_glow=False):
         """Draw bounding box outline + info panel in lower-right corner."""
 
-        intensity, glow_px = self._pulse_envelope()
-        box_color = self._box_color_at(intensity)
+        if not skip_glow:
+            _intensity, glow_radius = self._pulse_envelope()
+            self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
-        # Expanding glow halos during pulse phase
-        self._draw_pulse_glow(screen, sx1, sy1, sx2, sy2, intensity, glow_px)
-
-        # Bright outline
-        pygame.draw.rect(screen, box_color,
+        # Bright outline (thicker during zoom)
+        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
-                         BOX_OUTLINE)
+                         outline_w)
 
         # Corner brackets for extra emphasis
         cl = 8  # corner length
@@ -887,12 +786,12 @@ class ObjectHighlighter:
             (sx1, sy1, 1, 1), (sx2, sy1, -1, 1),
             (sx1, sy2, 1, -1), (sx2, sy2, -1, -1)
         ]:
-            pygame.draw.line(screen, box_color,
+            pygame.draw.line(screen, BOX_COLOR,
                              (int(cx), int(cy)),
-                             (int(cx + dx * cl), int(cy)), BOX_OUTLINE)
-            pygame.draw.line(screen, box_color,
+                             (int(cx + dx * cl), int(cy)), outline_w)
+            pygame.draw.line(screen, BOX_COLOR,
                              (int(cx), int(cy)),
-                             (int(cx), int(cy + dy * cl)), BOX_OUTLINE)
+                             (int(cx), int(cy + dy * cl)), outline_w)
 
         # Info panel in lower-right corner
         self._render_corner_panel(screen, seg)
@@ -1005,8 +904,8 @@ class ObjectHighlighter:
             panel_w = PANEL_W_NO_THUMB
             panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
 
-        panel_x = self._screen_w - panel_w - PANEL_MARGIN
-        panel_y = self._screen_h - panel_h - PANEL_MARGIN
+        panel_x = self._screen_w - panel_w - PANEL_MARGIN - self._overscan_margin
+        panel_y = self._screen_h - panel_h - PANEL_MARGIN - self._overscan_margin
 
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)

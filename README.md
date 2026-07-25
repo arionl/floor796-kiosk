@@ -2,15 +2,16 @@
 
 A self-contained animated pixel-art kiosk that displays the
 [floor796.com](https://floor796.com) interactive isometric map on a dedicated
-display — designed for Raspberry Pi 5 (4 GB+).
+display — designed for Raspberry Pi 5 and OrangePi 5 Max.
 
 The player boots from cold-start, automatically pans across the full animated
 scene ensuring every tile is visited, and keeps the display on 24/7 with no
 screensaver or sleep.  As objects scroll into view, the highlighter identifies
-them from floor796.com's changelog, drawing a bounding box and info panel with
-title, date, and thumbnail (YouTube, image, video, or Wikipedia).  When the
-floor796 author publishes new tiles, they are automatically downloaded and
-incorporated on the next boot.
+them from floor796.com's changelog, drawing a bounding box with a zoom-in
+animation, breathing glow, and info panel with title, date, and thumbnail
+(YouTube, image, video, Wikipedia, or interactive).  When the floor796 author
+publishes new tiles, they are automatically downloaded and incorporated on the
+next boot.
 
 ![Floor796 Kiosk — object highlighter](screenshot.png)
 
@@ -20,13 +21,22 @@ incorporated on the next boot.
 
 - **Full-resolution pixel art** — 1024×820 tiles rendered at native resolution
   (no scaling artifacts).
+- **KMSDRM unified rendering** — both Raspberry Pi 5 (V3D) and OrangePi 5 Max
+  (Panthor) render directly through KMSDRM with no X11 overhead.  Boards ≤4 GB
+  RAM are capped at 1080p to prevent OOM; higher memory boards render at native
+  resolution.
 - **Coverage-weighted wandering** — a visit heat map ensures all 50+ animated
-  tiles are toured evenly; a blank-ratio guard keeps the viewport on content.
+  tiles are toured evenly.  Content-aware scroll limits (derived from the
+  pixel-level density mask) keep the viewport hugging actual pixel-art content,
+  not blank tile-grid borders.  A* pathfinding through a safe-region grid
+  ensures transit stays on content.
 - **Object highlighter** — automatically identifies and labels 804 objects from
-  floor796.com's changelog as they scroll into view.  Each highlight shows a
-  bounding box with pulse animation, plus an info panel with title, date, and
-  thumbnail (YouTube, images, video frames, Wikipedia extracts).  Selection uses
-  weighted random sampling with recency rotation so objects cycle evenly.
+  floor796.com's changelog as they scroll into view.  Each highlight features a
+  zoom-in intro animation (viewport bounds contract to the object over 0.5s),
+  followed by a breathing glow effect.  Deterministic LRU selection ensures
+  every object is shown before any repeats, with scroll-off safety checks.
+- **Overscan support** — `KIOSK_OVERSCAN_MARGIN` environment variable insets all
+  content and UI for displays with overscan (configured in the systemd unit).
 - **Telemetry & stats** — in-process HTTP API on `127.0.0.1:8796` provides live
   metrics: FPS, memory, CPU, tile cache, coverage heatmaps, per-object highlight
   stats, and more.  An on-screen overlay (toggled with `S`) shows real-time
@@ -49,13 +59,18 @@ incorporated on the next boot.
 
 ## Requirements
 
-| Component          | Specification                          |
-|--------------------|----------------------------------------|
-| Hardware           | Raspberry Pi 5 (4 GB minimum)          |
-| OS                 | Raspberry Pi OS (Bookworm or Trixie)   |
-| Display            | HDMI (1920×1080 or 1920×1200)          |
-| Network            | Internet for initial download + updates|
-| Storage            | 4 GB free (tiles + decoded strips)    |
+| Component          | Specification                                    |
+|--------------------|--------------------------------------------------|
+| Hardware           | Raspberry Pi 5 (2 GB min, 4 GB+ recommended) or  |
+|                    | OrangePi 5 Max (8 GB)                            |
+| OS                 | Raspberry Pi OS / Armbian (Bookworm or Trixie)   |
+| Display            | HDMI (1920×1080 native, or higher with 4 GB+)    |
+| Network            | Internet for initial download + updates          |
+| Storage            | 4 GB free (tiles + decoded strips)               |
+
+> **2 GB boards** (e.g. Raspberry Pi 5 2 GB) are supported with a reduced tile
+> cache (8 tiles vs 18) and a low-memory warning banner.  The player uses ~1.5 GB
+> RSS and relies on swap under heavy load.  4 GB+ is recommended for headroom.
 
 ---
 
@@ -94,12 +109,14 @@ floor796-kiosk/
 │   ├── __init__.py
 │   ├── __main__.py               Entry point: python -m floor796_kiosk
 │   ├── paths.py                  Centralized path management
+│   ├── board_detect.py           Board detection (Pi 5 / OrangePi / generic)
 │   ├── player.py                 Main player (rendering + wandering)
 │   ├── tile_manager.py           Tile download + auto-update logic
 │   ├── content_mask.py           Content density mask generator
 │   ├── hologram.py               Hologram scene overlay
-│   ├── highlighter.py            Object highlighter (804 objects, selection)
+│   ├── highlighter.py            Object highlighter (804 objects, LRU selection)
 │   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki)
+│   ├── cpu_affinity.py           big.LITTLE CPU core pinning
 │   └── stats/
 │       ├── __init__.py
 │       ├── collector.py          Telemetry collector (ring buffers, heatmaps)
@@ -116,14 +133,15 @@ floor796-kiosk/
 │   └── thumbnails/               Resized label thumbnails
 ├── tools/                        Simulations & CLI tools
 │   ├── kiosk_status.py           Query the stats API from CLI
+│   ├── prefetch_thumbnails.py    Pre-fetch all thumbnails offline (all link types)
 │   ├── sim_heatmap.py            Wanderer heatmap simulation + visualization
 │   ├── sim_wander.py             Wanderer coverage simulation
 │   ├── sim_prefetch.py           Tile prefetch strategy simulation
 │   └── sim_prefetch_v3.py        Extended prefetch simulation
 ├── deploy/                       Installation & systemd
-│   ├── install.sh                One-shot installer for fresh Raspbian
-│   ├── run.sh                    Boot wrapper (starts bare X server)
-│   ├── kiosk-launch.sh           Player launcher (runs inside X session)
+│   ├── install.sh                One-shot installer for fresh Pi/OrangePi
+│   ├── run.sh                    Boot wrapper (KMSDRM or X11 fallback)
+│   ├── kiosk-launch.sh           Player launcher (env setup, overscan margin)
 │   └── floor796-kiosk.service    systemd unit (cold-boot auto-start)
 ├── screenshot.png                Main screenshot (highlighter)
 ├── stats_overlay_screenshot.png  Stats overlay screenshot
@@ -164,19 +182,25 @@ floor796.com front-end.  This overlap is critical for pixel-perfect alignment.
 ### Wandering Algorithm
 
 The `Wanderer` class in `player.py` implements coverage-weighted waypoint
-navigation:
+navigation with content-aware edge clamping:
 
-1. **Visit heat map** — counts how many frames each animated tile has been
-   visible in the viewport.
-2. **Waypoint scoring** — least-visited tiles get the lowest score (highest
-   priority); anti-oscillation penalties prevent ping-ponging between adjacent
-   tiles.
-3. **Blank-ratio guard** — positions where the viewport would be more than 25%
-   static content get a large penalty, keeping the camera on animated areas.
-4. **Smooth steering** — gradual angle interpolation toward the next waypoint
+1. **Content-aware scroll limits** — at startup, per-tile content bounds (tight
+   boxes around actual pixel art, derived from the density mask) are aggregated
+   into a global content bounding box.  Scroll limits are set to hug this border
+   with a 50 px margin, preventing the viewport from wandering into the large
+   blank isometric-diamond triangles at tile edges.
+2. **Safe-region grid** — a boolean grid of viewport positions where the blank
+   ratio ≤ 30%.  Only positions where the viewport is mostly content are
+   considered safe for transit.  A* pathfinding routes through this grid.
+3. **Optimal viewing positions** — for each animated tile, the viewport position
+   that contains all of the tile's content pixels while minimizing blank ratio.
+   Tiles whose optimal position is in the safe region are "normal"; others are
+   "tip" tiles requiring an excursion.
+4. **Content-density tour ordering** — tiles are visited in density order: CORE
+   (dense interior) first, EDGE next, sparse TIP tiles last, keeping the viewport
+   in low-blank territory for most of the tour.
+5. **Smooth steering** — gradual angle interpolation toward each sub-waypoint
    with momentum blending for natural-looking movement.
-5. **Dynamic timeout** — far tiles get longer timeouts based on distance and
-   speed, ensuring the full scene is reachable.
 
 Full coverage of all animated tiles is typically achieved in ~25 minutes.
 
@@ -206,21 +230,29 @@ The `ObjectHighlighter` class in `highlighter.py` automatically identifies and
 labels objects from floor796.com's changelog (804 objects) as the wanderer
 brings them into view.
 
-**Selection algorithm** — for each highlight cycle, all objects in the viewport
-are scored on five factors:
+**Selection algorithm** — deterministic LRU (least-recently-used):
 
-| Factor | Description |
-|--------|-------------|
-| Spatial proximity | Objects near viewport center score higher |
-| Edge safety | Objects near screen edges get up to 50% penalty (soft) |
-| Panel exclusion | Objects under the info panel footprint get penalized |
-| Velocity prediction | Objects that would scroll off-screen during the highlight are skipped; objects ahead of the wander direction get a bonus |
-| Recency | Recently-viewed objects get exponentially decaying penalty (10-min half-life); never-viewed objects get 15% bonus |
+1. **Filter** — candidates must be fully in the viewport, large enough to
+   highlight, won't scroll off-screen during the 10-second highlight duration,
+   and not in cooldown.
+2. **Select** — the object with the oldest `last_shown` timestamp is picked
+   (never-shown objects have timestamp 0 = highest priority).  Ties are broken
+   by closeness to viewport center.
+3. **Scroll-off safety** — mid-highlight, if the object scrolls out of view
+   (due to wanderer movement), the highlight is aborted cleanly.
 
-Instead of always picking the top-scoring object (pure argmax), candidates are
-sampled with probability proportional to `score³` (weighted random sampling).
-This prevents the same first/second/third object on every boot while still
-strongly preferring well-positioned candidates.
+This guarantees every reachable object is highlighted before any repeats — no
+random sampling, no scoring weights.
+
+**Visual effects:**
+
+- **Zoom-in intro** (0.5s) — the bounding box interpolates from full viewport
+  bounds to the object's bounding box with ease-out cubic, like a camera
+  focusing.  Outline is 6 px thick during zoom for visibility.
+- **Breathing glow** — 16 concentric filled-rect layers radiate outward to 24 px
+  max radius, with quadratic alpha falloff.  Painter's algorithm (outer→inner).
+  The box interior is cut out so glow doesn't tint the content.  Breathing at
+  0.6 Hz.  Color: bright red `(255, 20, 20)`.
 
 **Thumbnail types** — the highlighter fetches and displays:
 
@@ -230,7 +262,10 @@ strongly preferring well-positioned candidates.
 | Image | Direct download (imgur, etc.) |
 | Video | Frame extraction via `ffmpeg` at ~1s timestamp |
 | Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
-| Web / other | No thumbnail; compact text-only panel |
+| Interactive | `og:image` from `floor796.com/interactive/` pages |
+| Web | HTML `og:image` → `twitter:image` → first `<img>` |
+| SVG | Rendered to PNG via `cairosvg` |
+| AVIF / HEIC | Decoded via `pillow-heif` or native Pillow 12+ |
 
 Thumbnails are cached in `cache/thumbnails/` and fetched in background threads.
 
@@ -275,6 +310,20 @@ data directories (e.g., to a faster SD card or RAM disk), change them there.
 | `DEFAULT_WANDER_SPEED` | 15.0 | Pan speed in pixels/sec                  |
 | `CACHE_MARGIN`      | 2       | Extra tile ring to prefetch              |
 | `COVERAGE_LOG_INTERVAL` | 300 | Seconds between coverage log lines     |
+
+### Overscan
+
+Some displays (particularly older TVs) crop a few pixels at each edge —
+"overscan".  Set `KIOSK_OVERSCAN_MARGIN` in the systemd unit to inset all
+content and UI by that many pixels per side:
+
+```ini
+# /etc/systemd/system/floor796-kiosk.service
+Environment=KIOSK_OVERSCAN_MARGIN=60
+```
+
+After changing, run `sudo systemctl daemon-reload && sudo systemctl restart
+floor796-kiosk`.  Default is 0 (no inset).
 
 ### Display Resolution
 
@@ -352,8 +401,11 @@ When a keyboard/mouse is connected during maintenance:
 
 ### Display goes to sleep
 
-- The installer disables DPMS at the X server level (`-dpms`, `-s 0`).
-- Also check `/boot/firmware/config.txt` for `hdmi_blanking=1`.
+- KMSDRM mode: DPMS is handled by the DRM driver.  Ensure
+  `hdmi_blanking=1` is NOT set in `/boot/firmware/config.txt` (it forces
+  blanking).
+- X11 fallback mode: the installer disables DPMS at the X server level
+  (`-dpms`, `-s 0`).
 - Some displays have their own sleep timer — check the monitor's OSD menu.
 
 ### Tiles not updating
@@ -382,16 +434,21 @@ and re-fetch thumbnails on next boot.
 
 ## Performance
 
-| Metric              | Value (Pi 5, 4 GB)              |
-|---------------------|---------------------------------|
-| Render rate         | 30 fps (vsync)                 |
-| Animation rate      | 12 fps (60-frame, 5s loop)     |
-| Memory (RSS)        | ~2.7 GB                        |
-| Swap                | 0 MB                           |
-| CPU                 | ~50% (one core)                |
-| Cold-boot to display| ~20s (warm), ~10 min (first run)|
-| Full coverage       | ~25 minutes                    |
-| Objects highlighted | 804 (100% reachable)           |
+| Metric              | Pi 5 (4 GB)      | Pi 5 (2 GB)      | OrangePi 5 Max   |
+|---------------------|------------------|------------------|------------------|
+| Render rate         | 30 fps (vsync)   | 30 fps (vsync)   | 60 fps           |
+| Animation rate      | 12 fps           | 12 fps           | 12 fps           |
+| Resolution          | 1080p (capped)   | 1080p (capped)   | native (up to 4K)|
+| Memory (RSS)        | ~2.4 GB          | ~1.5 GB          | ~2.7 GB          |
+| Swap                | 0 MB             | ~450 MB          | 0 MB             |
+| Tile cache          | 18 tiles         | 8 tiles          | 18+ tiles        |
+| CPU                 | ~50% (1 core)    | ~50% (1 core)    | ~30% (1 big core)|
+| Cold-boot (warm)    | ~20s             | ~20s             | ~20s             |
+| Full coverage       | ~25 min          | ~25 min          | ~25 min          |
+
+> Boards with ≤4 GB RAM are automatically capped at 1080p to prevent OOM.
+> The 2 GB Pi 5 uses a reduced tile cache (8 tiles) and shows a low-memory
+> warning banner.  All boards use identical KMSDRM rendering with hardware GLES.
 
 ---
 

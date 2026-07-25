@@ -1,14 +1,15 @@
 #!/bin/sh
 # Floor796 Kiosk — player launcher
-# Called by run.sh. On OrangePi, runs as root; on Pi 5, drops to kiosk user.
+# Called by run.sh. On KMSDRM boards (Pi 5, OrangePi 5), runs as root.
+# On generic X11 boards, runs as the kiosk user.
 #
 # Board detection is handled by floor796_kiosk.board_detect (Python).
 # The player code in player.py also calls detect_board() and sets
 # SDL_VIDEODRIVER accordingly — this script just provides the right
 # env vars and decides whether to run as root or the kiosk user.
 #
-#   - OrangePi 5 Max (Panthor): KMSDRM, runs as root (DRM master access)
-#   - Raspberry Pi 5 (V3D):     X11, runs as kiosk user
+#   - OrangePi 5 Max (Panthor):  KMSDRM, runs as root
+#   - Raspberry Pi 5 (V3D):      KMSDRM, runs as root
 #   - Generic:                   X11, runs as kiosk user
 
 export HOME=/home/kiosk
@@ -22,29 +23,29 @@ INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WIDTH="${KIOSK_WIDTH:-0}"
 HEIGHT="${KIOSK_HEIGHT:-0}"
 
+# KIOSK_OVERSCAN_MARGIN: pixels to inset UI elements for TVs with
+# overscan.  0 = disabled (default, correct for modern displays).
+OVERSCAN="${KIOSK_OVERSCAN_MARGIN:-0}"
+
 cd "${INSTALL_DIR}"
 
 # ── Detect board type and rendering configuration ──
 eval "$(python3 -m floor796_kiosk.board_detect --shell 2>/dev/null)"
 
 if [ "${RUNS_AS_ROOT}" = "1" ]; then
-    # OrangePi 5 Max (RK3588 + Mali-G610 via Mesa Panthor):
-    # Use KMSDRM for direct GPU access — no X11 needed.
-    # Panthor + Mesa provides EGL/OpenGL ES via standard DRM/GBM.
-    #
+    # OrangePi 5 Max or Raspberry Pi 5: KMSDRM direct rendering.
     # KMSDRM requires DRM master access for page flipping. On this kiosk
     # appliance (no desktop session manager), only root can acquire DRM
-    # master without a logind seat session. The player runs as root
-    # directly — this is a dedicated kiosk with no other users.
+    # master without a logind seat session.
     # SDL_VIDEODRIVER is set by the player code (kmsdrm)
-
     exec /usr/bin/python3 \
         -m floor796_kiosk \
         --fullscreen \
         --width "${WIDTH}" \
-        --height "${HEIGHT}"
+        --height "${HEIGHT}" \
+        --overscan-margin "${OVERSCAN}"
 else
-    # Raspberry Pi 5 (Mesa V3D via X11) or generic board:
+    # Generic / unknown board (X11 fallback):
     # X is started by xinit in run.sh; this script runs inside that X session.
     # The kiosk user can access the display through X.
     export SDL_VIDEODRIVER=x11
@@ -54,5 +55,6 @@ else
         -m floor796_kiosk \
         --fullscreen \
         --width "${WIDTH}" \
-        --height "${HEIGHT}"
+        --height "${HEIGHT}" \
+        --overscan-margin "${OVERSCAN}"
 fi
