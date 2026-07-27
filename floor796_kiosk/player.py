@@ -402,6 +402,7 @@ class TileCache:
         # poll_results() to do intelligent eviction (never evict visible).
         self._visible_ids = set()
         self._needed_ids = set()
+        self._last_margin_ids = set()
 
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
@@ -459,10 +460,17 @@ class TileCache:
             self._worker.join(timeout=2)
 
     def set_needed(self, visible_ids, margin_ids):
+        # Fast path: if tile sets haven't changed since last call, skip
+        # all the queue/eviction work. At 15px/s the viewport crosses a
+        # tile boundary only ~once every 60s, so 99% of frames are no-ops.
+        if visible_ids == self._visible_ids and margin_ids == self._last_margin_ids:
+            return
+
         needed = visible_ids | margin_ids
         # Stash priority sets for poll_results() intelligent eviction.
         self._visible_ids = visible_ids
         self._needed_ids = needed
+        self._last_margin_ids = margin_ids
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
@@ -1709,15 +1717,13 @@ def main():
         pos_x = max(0, min(map_w - args.width, pos_x))
         pos_y = max(0, min(map_h - args.height, pos_y))
 
+        # Compute heading once per frame (was called 3×)
+        heading = wanderer.heading() if wandering else (0.0, 0.0)
+
         # Object highlighter state machine
         if object_highlighter:
-            hl_vel_x = 0
-            hl_vel_y = 0
-            if wandering:
-                hv = wanderer.heading()
-                hl_vel_x, hl_vel_y = hv[0], hv[1]
             object_highlighter.update(dt, pos_x, pos_y,
-                                       hl_vel_x, hl_vel_y)
+                                       heading[0], heading[1])
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
@@ -1733,8 +1739,7 @@ def main():
             tiles_meta=tiles_meta,
             margin=effective_margin, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
-            vel_x=wanderer.heading()[0] if wandering else 0,
-            vel_y=wanderer.heading()[1] if wandering else 0,
+            vel_x=heading[0], vel_y=heading[1],
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()
@@ -1743,18 +1748,21 @@ def main():
             wanderer.record_visits(visible_ids)
 
         now = time.time()
+        # Coverage stats computed once per frame — coverage_stats() runs
+        # _blank_ratio() which iterates visible tiles with numpy, so
+        # calling it twice (coverage log + stats_collector) is wasteful.
+        cov_visited, cov_total, cov_mn, cov_mx, cov_blank = \
+            wanderer.coverage_stats()
+
         if now - last_coverage_log > COVERAGE_LOG_INTERVAL:
-            visited, total_t, mn, mx, blank = wanderer.coverage_stats()
             log.info("[Coverage] %d/%d tiles visited | visits: min=%d max=%d | "
                      "blank: %d%% | waypoints: %d",
-                     visited, total_t, mn, mx, int(blank * 100),
-                     wanderer.waypoints_picked)
+                     cov_visited, cov_total, cov_mn, cov_mx,
+                     int(cov_blank * 100), wanderer.waypoints_picked)
             last_coverage_log = now
 
         # ── Stats collection (once per frame) ──
         if stats_collector:
-            heading = wanderer.heading() if wandering else (0, 0)
-            visited, total_t, mn, mx, blank = wanderer.coverage_stats()
             holo_scene = 0
             if hologram:
                 holo_scene = getattr(hologram, "_scene_idx", 0)
@@ -1766,11 +1774,11 @@ def main():
                 "cache_max": cache.max_tiles,
                 "cache_pending": cache.pending_count,
                 "cache_total_loads": cache.load_count,
-                "tiles_visited": visited,
-                "tiles_total": total_t,
+                "tiles_visited": cov_visited,
+                "tiles_total": cov_total,
                 "tiles_fully_viewed": len(wanderer.fully_viewed),
-                "visit_counts": dict(wanderer.visit_counts),
-                "blank_ratio": blank,
+                "visit_counts": wanderer.visit_counts,
+                "blank_ratio": cov_blank,
                 "current_target": wanderer.target_rc,
                 "waypoints_picked": wanderer.waypoints_picked,
                 "frame_idx": frame_idx,
