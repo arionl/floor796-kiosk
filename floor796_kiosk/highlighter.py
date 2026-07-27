@@ -87,7 +87,7 @@ ZOOM_DURATION = 0.5             # seconds for zoom to complete
 
 STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
 GLOW_RADIUS = 24                 # outward gradient extent in pixels
-GLOW_STEPS = 16                  # number of concentric rect layers
+GLOW_STEPS = 8                   # number of concentric rect layers (was 16)
 GLOW_PEAK_ALPHA = 90             # peak alpha at box edge when breathing peaks
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
@@ -779,8 +779,9 @@ class ObjectHighlighter:
         produces a continuous gradient with no gaps or banding.
 
         Glow surfaces are cached per (radius, box_width, box_height) to
-        avoid allocating 16 SRCALPHA surfaces per frame. The cache is
-        invalidated when the glow radius breathes to a new value.
+        avoid allocating SRCALPHA surfaces per frame. Only the surfaces
+        are cached — the blit position is computed each frame since the
+        viewport scrolls continuously.
         """
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -807,7 +808,8 @@ class ObjectHighlighter:
                 # Cut out the box interior so glow only covers the ring area
                 if int(bw) > 0 and int(bh) > 0:
                     glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
-                layers.append((glow_surf, int(sx1 - pad), int(sy1 - pad)))
+                # Store (surface, pad) — position computed at blit time
+                layers.append((glow_surf, pad))
             self._glow_cache[cache_key] = layers
             # Evict old entries if cache is growing (keep last 8 sizes)
             if len(self._glow_cache) > 8:
@@ -815,8 +817,8 @@ class ObjectHighlighter:
         else:
             layers = cached
 
-        for glow_surf, dx, dy in layers:
-            screen.blit(glow_surf, (dx, dy))
+        for glow_surf, pad in layers:
+            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                        skip_glow=False):
