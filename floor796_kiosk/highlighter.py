@@ -476,6 +476,17 @@ class ObjectHighlighter:
 
         # Thumbnail cache
         self._thumbs = ThumbnailCache()
+        # Scaled thumbnail cache: obj_id → scaled Surface.
+        # Avoids re-scaling the thumbnail every frame during a highlight.
+        self._scaled_thumb_cache = {}
+        # Cached panel background (bg + border + accent bar) keyed by
+        # (obj_id, has_thumb) — rebuilt only when the highlighted object
+        # changes, not every frame.
+        self._panel_bg_cache = {}  # (obj_id, has_thumb) → (Surface, panel_w, panel_h)
+        # Cached glow surfaces keyed by (radius, box_w, box_h).
+        # The glow breathes between ~10 radius values; each gets cached
+        # so we don't allocate 16 SRCALPHA surfaces per frame.
+        self._glow_cache = {}
 
         # Fonts (lazily initialized when first render is called)
         self._font_title = None
@@ -766,6 +777,10 @@ class ObjectHighlighter:
         previous. The box interior is cut out of each layer so only the
         outward ring area receives glow. This painter's-algorithm approach
         produces a continuous gradient with no gaps or banding.
+
+        Glow surfaces are cached per (radius, box_width, box_height) to
+        avoid allocating 16 SRCALPHA surfaces per frame. The cache is
+        invalidated when the glow radius breathes to a new value.
         """
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -773,22 +788,35 @@ class ObjectHighlighter:
         if steps < 2:
             return
 
-        for i in range(steps, 0, -1):
-            frac = i / steps  # 1.0 at outer edge → 0 at box edge
-            alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
-            if alpha < 2:
-                continue
-            pad = max(1, int(glow_radius * frac))
-            gw = int(bw + pad * 2)
-            gh = int(bh + pad * 2)
-            if gw <= 0 or gh <= 0:
-                continue
-            glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
-            glow_surf.fill((*BOX_COLOR, alpha))
-            # Cut out the box interior so glow only covers the ring area
-            if int(bw) > 0 and int(bh) > 0:
-                glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
-            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
+        cache_key = (glow_radius, int(bw), int(bh))
+        cached = self._glow_cache.get(cache_key)
+        if cached is None:
+            layers = []
+            for i in range(steps, 0, -1):
+                frac = i / steps  # 1.0 at outer edge → 0 at box edge
+                alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
+                if alpha < 2:
+                    continue
+                pad = max(1, int(glow_radius * frac))
+                gw = int(bw + pad * 2)
+                gh = int(bh + pad * 2)
+                if gw <= 0 or gh <= 0:
+                    continue
+                glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+                glow_surf.fill((*BOX_COLOR, alpha))
+                # Cut out the box interior so glow only covers the ring area
+                if int(bw) > 0 and int(bh) > 0:
+                    glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
+                layers.append((glow_surf, int(sx1 - pad), int(sy1 - pad)))
+            self._glow_cache[cache_key] = layers
+            # Evict old entries if cache is growing (keep last 8 sizes)
+            if len(self._glow_cache) > 8:
+                self._glow_cache.pop(next(iter(self._glow_cache)))
+        else:
+            layers = cached
+
+        for glow_surf, dx, dy in layers:
+            screen.blit(glow_surf, (dx, dy))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                        skip_glow=False):
@@ -988,15 +1016,19 @@ class ObjectHighlighter:
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
 
-        # ── Draw panel background ──
-        panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        panel_surf.fill(CORNER_PANEL_BG)
-        pygame.draw.rect(panel_surf, CORNER_PANEL_BORDER,
-                         (0, 0, panel_w, panel_h), 1)
-
-        # Left accent bar
-        accent_w = max(2, int(4 * self._ui_scale))
-        pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, accent_w, panel_h))
+        # ── Draw panel background (cached per object) ──
+        cache_key = (seg.obj_id, has_thumb)
+        cached_bg = self._panel_bg_cache.get(cache_key)
+        if cached_bg is None or cached_bg[1] != panel_w or cached_bg[2] != panel_h:
+            panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+            panel_surf.fill(CORNER_PANEL_BG)
+            pygame.draw.rect(panel_surf, CORNER_PANEL_BORDER,
+                             (0, 0, panel_w, panel_h), 1)
+            accent_w = max(2, int(4 * self._ui_scale))
+            pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, accent_w, panel_h))
+            self._panel_bg_cache[cache_key] = (panel_surf, panel_w, panel_h)
+        else:
+            panel_surf = cached_bg[0]
 
         screen.blit(panel_surf, (panel_x, panel_y))
 
@@ -1015,12 +1047,13 @@ class ObjectHighlighter:
             img_y = panel_y + title_bar_h + int(4 * self._ui_scale)
 
             if thumb_surf is not None:
-                # Scale thumbnail to match ui_scale
-                if (thumb_surf.get_width() != self._thumb_w or
-                        thumb_surf.get_height() != self._thumb_h):
-                    thumb_surf = pygame.transform.smoothscale(
+                # Scale thumbnail to match ui_scale (cached per obj_id)
+                scaled = self._scaled_thumb_cache.get(seg.obj_id)
+                if scaled is None:
+                    scaled = pygame.transform.smoothscale(
                         thumb_surf, (self._thumb_w, self._thumb_h))
-                screen.blit(thumb_surf, (img_x, img_y))
+                    self._scaled_thumb_cache[seg.obj_id] = scaled
+                screen.blit(scaled, (img_x, img_y))
             else:
                 # Draw loading placeholder
                 self._render_placeholder(screen, img_x, img_y,

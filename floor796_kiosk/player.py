@@ -1649,7 +1649,17 @@ def main():
                  total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
 
     running = True
+
+    # ── Frame timing instrumentation ──
+    # Logs slow frames (>40ms) with per-section breakdown, every 5s max.
+    # Set FLOOR796_FRAME_DEBUG=1 for all frames.
+    from collections import deque
+    _frame_times = deque(maxlen=600)
+    _last_slow_log = 0.0
+    _frame_debug = os.environ.get("FLOOR796_FRAME_DEBUG", "")
+
     while running:
+        _ft0 = time.perf_counter()
         dt = clock.tick(30) / 1000.0
         dt = min(dt, 1 / 15)
 
@@ -1777,6 +1787,7 @@ def main():
             })
 
         # ── Render ──
+        _t_blit0 = time.perf_counter()
         screen.fill(BG_COLOR)
 
         tile_col_start = max(0, int(pos_x // SPACING_W))
@@ -1800,7 +1811,10 @@ def main():
                 dest_y = tr * SPACING_H - int(pos_y)
                 screen.blit(strip_surf, (dest_x, dest_y), area=src_rect)
 
+        _t_blit = (time.perf_counter() - _t_blit0) * 1000
+
         # ── Hologram overlay ──
+        _t_holo0 = time.perf_counter()
         if hologram:
             hologram.poll_scenes()
             hologram.update(frame_idx)
@@ -1809,6 +1823,7 @@ def main():
         # ── Object highlighter ──
         if object_highlighter:
             object_highlighter.render(screen, pos_x, pos_y)
+        _t_overlay = (time.perf_counter() - _t_holo0) * 1000
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
         if stats_collector and stats_collector.overlay_enabled:
@@ -1822,6 +1837,7 @@ def main():
         # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
         # The HTTP /screenshot endpoint signals a capture request; we copy
         # the fully-composed screen surface here and hand back PNG bytes.
+        _t_ss0 = time.perf_counter()
         if stats_collector and stats_collector.poll_screenshot_request():
             try:
                 buf = io.BytesIO()
@@ -1830,8 +1846,31 @@ def main():
             except Exception as e:
                 log.warning("Screenshot capture failed: %s", e)
                 stats_collector.complete_screenshot(None)
+        _t_ss = (time.perf_counter() - _t_ss0) * 1000
 
+        _t_flip0 = time.perf_counter()
         pygame.display.flip()
+        _t_flip = (time.perf_counter() - _t_flip0) * 1000
+
+        # ── Frame timing log ──
+        _ft_total = (time.perf_counter() - _ft0) * 1000
+        _frame_times.append(_ft_total)
+        _should_log = (_ft_total > 40.0 and
+                       (time.perf_counter() - _last_slow_log) > 5.0)
+        if _frame_debug:
+            _should_log = True
+        if _should_log:
+            _sorted_ft = sorted(_frame_times)
+            _p50 = _sorted_ft[len(_sorted_ft) // 2]
+            _avg = sum(_frame_times) / len(_frame_times)
+            log.info(
+                "[FRAME] %.1fms (avg=%.1f p50=%.1f n=%d) "
+                "blit=%.1f overlay=%.1f ss=%.1f flip=%.1f pending=%d",
+                _ft_total, _avg, _p50, len(_frame_times),
+                _t_blit, _t_overlay, _t_ss, _t_flip,
+                cache.pending_count,
+            )
+            _last_slow_log = time.perf_counter()
 
     cache.stop()
     if hologram:
