@@ -42,6 +42,23 @@ MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
 RECENT_BLACKLIST = 12.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
+# Panel exclusion zone: objects whose bbox overlaps this rectangle in
+# the bottom-right corner are skipped during selection, since they'd
+# be visually hidden behind the info panel that shows title, thumbnail,
+# and link type. Covers the maximum panel footprint (thumbnail + 2-line
+# title + wiki extract + margin).
+PANEL_EXCLUDE_W = 380    # panel width + margin
+PANEL_EXCLUDE_H = 360    # max panel height + margin (with thumbnail)
+
+# Edge viewing buffer: at the END of the highlight duration, the object
+# must still have at least this fraction of the viewport as clearance
+# from each edge. This is deliberately larger than the 1.5% hard clip
+# margin (which only prevents pixel-clipping) to ensure the object stays
+# *comfortably* visible — not barely on-screen — giving viewers enough
+# time to notice and study the highlight before it scrolls off from
+# wandering.
+EDGE_BUFFER = 0.05  # 5% (~96px horizontal, ~54px vertical at 1920x1080)
+
 CHANGELOG_URL = "https://floor796.com/data/changelog.json"
 CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
@@ -463,20 +480,35 @@ class ObjectHighlighter:
         self._font_link = pygame.font.Font(None, 15)
         self._fonts_ready = True
 
+    def _panel_rect(self):
+        """Return (px1, py1, px2, py2) of the info panel in screen coords.
+
+        The panel sits in the bottom-right corner.  This is used to exclude
+        objects that would be hidden behind the panel.  We use the maximum
+        panel footprint (with thumbnail) so that even after the panel grows
+        during the highlight, no previously-occluded object was selected.
+        """
+        p2x = self._screen_w - PANEL_MARGIN - self._overscan_margin
+        p1x = p2x - PANEL_EXCLUDE_W
+        p2y = self._screen_h - PANEL_MARGIN - self._overscan_margin
+        p1y = p2y - PANEL_EXCLUDE_H
+        return p1x, p1y, p2x, p2y
+
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2,
                         vel_x=0, vel_y=0):
         """Select the best segment to highlight in the current viewport.
 
         Selection is deterministic: pick the LEAST-RECENTLY-DISPLAYED
         object that is fully visible in the viewport and will remain
-        visible for the entire highlight duration (accounting for
-        wander velocity). Ties are broken by distance from viewport
+        comfortably visible for the entire highlight duration (accounting
+        for wander velocity). Ties are broken by distance from viewport
         center (closer wins).
 
         Filtering (hard skips):
           - Too-small segments (< MIN_BBOX_SIZE)
           - Bbox partially off-screen (must be fully inside viewport)
-          - Would scroll off-screen during HIGHLIGHT_DURATION
+          - Bbox overlaps the info panel in the bottom-right corner
+          - Would scroll too close to the screen edge during HIGHLIGHT_DURATION
           - Currently within RECENT_BLACKLIST cooldown
 
         From the remaining candidates, returns the one with the
@@ -498,9 +530,20 @@ class ObjectHighlighter:
         clip_margin_x = vp_w * 0.015
         clip_margin_y = vp_h * 0.015
 
+        # Panel exclusion rectangle in screen coordinates (for the panel
+        # occlusion check — objects behind the info panel are not visible).
+        panel_x1, panel_y1, panel_x2, panel_y2 = self._panel_rect()
+
         # Wander prediction
         wander_speed = math.hypot(vel_x, vel_y)
         predict_dist = wander_speed * HIGHLIGHT_DURATION
+
+        # Edge buffer: at the END of the highlight, the object must still
+        # have this much clearance from each viewport edge. This ensures
+        # viewers have enough time to see the highlight before it scrolls
+        # off-screen from wandering.
+        edge_buf_x = self._screen_w * EDGE_BUFFER
+        edge_buf_y = self._screen_h * EDGE_BUFFER
 
         eligible = []
 
@@ -521,21 +564,32 @@ class ObjectHighlighter:
                     seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
-            # Velocity prediction: skip objects that would scroll off
-            # during the highlight duration
+            # Panel occlusion: skip objects behind the bottom-right info
+            # panel. The panel is opaque and would hide the highlighted
+            # object (and its bounding box).
+            sx1 = seg.abs_x1 - vp_x1
+            sy1 = seg.abs_y1 - vp_y1
+            sx2 = seg.abs_x2 - vp_x1
+            sy2 = seg.abs_y2 - vp_y1
+            if (sx2 > panel_x1 and sx1 < panel_x2 and
+                    sy2 > panel_y1 and sy1 < panel_y2):
+                continue
+
+            # Velocity prediction with edge buffer: skip objects that
+            # would scroll too close to the screen edge during the
+            # highlight duration.  We predict the bbox position at the
+            # end of HIGHLIGHT_DURATION and require it to still have
+            # EDGE_BUFFER clearance from every edge — not just barely
+            # on-screen. This gives viewers enough viewing time.
             if predict_dist > 1:
-                sx1 = seg.abs_x1 - vp_x1
-                sy1 = seg.abs_y1 - vp_y1
-                sx2 = seg.abs_x2 - vp_x1
-                sy2 = seg.abs_y2 - vp_y1
                 future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
                 future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
                 future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
                 future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
-                visible = (future_x2 > clip_margin_x and
-                           future_x1 < self._screen_w - clip_margin_x and
-                           future_y2 > clip_margin_y and
-                           future_y1 < self._screen_h - clip_margin_y)
+                visible = (future_x2 > edge_buf_x and
+                           future_x1 < self._screen_w - edge_buf_x and
+                           future_y2 > edge_buf_y and
+                           future_y1 < self._screen_h - edge_buf_y)
                 if not visible:
                     continue
 
