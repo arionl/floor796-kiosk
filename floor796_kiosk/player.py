@@ -1604,6 +1604,12 @@ def main():
             stats_collector = None
 
     # ── Object highlighter ──
+    # UI scale: at 1080p height the panel is sized as-designed (1.0x).
+    # At higher resolutions (1440p, 4K) the overlay scales proportionally
+    # so it occupies the same fraction of screen.
+    ui_scale = args.height / 1080.0
+    log.info("Highlighter UI scale: %.2fx (%dx%d)", ui_scale, args.width, args.height)
+
     object_highlighter = None
     if HIGHLIGHTER_AVAILABLE:
         changelog_path = CHANGELOG_PATH
@@ -1620,7 +1626,8 @@ def main():
                 object_highlighter = ObjectHighlighter(
                     hl_objects, args.width, args.height,
                     spacing_w=SPACING_W, spacing_h=SPACING_H,
-                    overscan_margin=args.overscan_margin)
+                    overscan_margin=args.overscan_margin,
+                    ui_scale=ui_scale)
                 log.info("Object highlighter: %d objects loaded",
                          len(hl_objects))
             else:

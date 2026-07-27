@@ -433,11 +433,34 @@ class ObjectHighlighter:
     """Manages the automatic object highlight cycle."""
 
     def __init__(self, segments, screen_w, screen_h,
-                 spacing_w=1016, spacing_h=812, overscan_margin=0):
+                 spacing_w=1016, spacing_h=812, overscan_margin=0,
+                 ui_scale=1.0):
         self._index = TileObjectIndex(segments, spacing_w, spacing_h)
         self._screen_w = screen_w
         self._screen_h = screen_h
         self._overscan_margin = overscan_margin
+
+        # UI scale factor for high-DPI displays (1.0 at 1080p, 1.5 at 4K).
+        # All panel dimensions, fonts, outlines, and glow are multiplied
+        # by this factor so the overlay occupies the same screen fraction
+        # regardless of resolution.
+        self._ui_scale = ui_scale
+        s = ui_scale  # shorthand
+        self._thumb_w = int(THUMB_W * s)
+        self._thumb_h = int(THUMB_H * s)
+        self._panel_margin = int(PANEL_MARGIN * s)
+        self._panel_padding = int(PANEL_PADDING * s)
+        self._panel_w = int(PANEL_W * s)
+        self._panel_w_no_thumb = int(PANEL_W_NO_THUMB * s)
+        self._panel_h_title_bar = int(PANEL_H_TITLE_BAR * s)
+        self._panel_h_thumb = int(PANEL_H_THUMB * s)
+        self._panel_h_footer = int(PANEL_H_FOOTER * s)
+        self._box_outline = max(1, int(BOX_OUTLINE * s))
+        self._zoom_outline = max(2, int(ZOOM_OUTLINE * s))
+        self._glow_radius = int(GLOW_RADIUS * s)
+        self._panel_exclude_w = int(PANEL_EXCLUDE_W * s)
+        self._panel_exclude_h = int(PANEL_EXCLUDE_H * s)
+        self._corner_len = max(6, int(8 * s))
 
         # State machine
         self.enabled = True
@@ -474,10 +497,11 @@ class ObjectHighlighter:
     def _init_fonts(self):
         if self._fonts_ready:
             return
-        self._font_title = pygame.font.Font(None, 22)
-        self._font_body = pygame.font.Font(None, 18)
-        self._font_small = pygame.font.Font(None, 16)
-        self._font_link = pygame.font.Font(None, 15)
+        s = self._ui_scale
+        self._font_title = pygame.font.Font(None, max(8, int(22 * s)))
+        self._font_body = pygame.font.Font(None, max(8, int(18 * s)))
+        self._font_small = pygame.font.Font(None, max(8, int(16 * s)))
+        self._font_link = pygame.font.Font(None, max(8, int(15 * s)))
         self._fonts_ready = True
 
     def _panel_rect(self):
@@ -488,10 +512,10 @@ class ObjectHighlighter:
         panel footprint (with thumbnail) so that even after the panel grows
         during the highlight, no previously-occluded object was selected.
         """
-        p2x = self._screen_w - PANEL_MARGIN - self._overscan_margin
-        p1x = p2x - PANEL_EXCLUDE_W
-        p2y = self._screen_h - PANEL_MARGIN - self._overscan_margin
-        p1y = p2y - PANEL_EXCLUDE_H
+        p2x = self._screen_w - self._panel_margin - self._overscan_margin
+        p1x = p2x - self._panel_exclude_w
+        p2y = self._screen_h - self._panel_margin - self._overscan_margin
+        p1y = p2y - self._panel_exclude_h
         return p1x, p1y, p2x, p2y
 
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2,
@@ -727,11 +751,11 @@ class ObjectHighlighter:
 
         Single-phase breathing glow that runs for the entire highlight.
         Returns (1.0, radius) where radius oscillates between 40% and
-        100% of GLOW_RADIUS at STEADY_SPEED Hz.
+        100% of the scaled GLOW_RADIUS at STEADY_SPEED Hz.
         """
         t = self._timer
         osc = (math.sin(t * STEADY_SPEED * 2 * math.pi) + 1) / 2
-        radius = int(GLOW_RADIUS * (0.4 + 0.6 * osc))
+        radius = int(self._glow_radius * (0.4 + 0.6 * osc))
         return 1.0, radius
 
     def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
@@ -782,7 +806,7 @@ class ObjectHighlighter:
         screen.blit(fill_surf, (int(sx1), int(sy1)))
 
         # Bright outline (thicker during zoom)
-        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        outline_w = self._zoom_outline if skip_glow else self._box_outline
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          outline_w)
@@ -792,7 +816,7 @@ class ObjectHighlighter:
         tw = title_surf.get_width()
         th = title_surf.get_height()
 
-        label_y = int(sy1) - th - 8
+        label_y = int(sy1) - th - int(8 * self._ui_scale)
         if label_y < 5:
             label_y = int(sy2) + 5  # below instead
 
@@ -800,7 +824,7 @@ class ObjectHighlighter:
         label_x = max(5, min(self._screen_w - tw - 5, label_x))
 
         # Label background
-        pad = 6
+        pad = int(6 * self._ui_scale)
         bg_rect = (label_x - pad, label_y - 3, tw + pad * 2, th + 6)
         bg_surf = pygame.Surface((bg_rect[2], bg_rect[3]), pygame.SRCALPHA)
         bg_surf.fill(LABEL_BG)
@@ -829,13 +853,13 @@ class ObjectHighlighter:
             self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
         # Bright outline (thicker during zoom)
-        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        outline_w = self._zoom_outline if skip_glow else self._box_outline
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          outline_w)
 
         # Corner brackets for extra emphasis
-        cl = 8  # corner length
+        cl = self._corner_len
         for cx, cy, dx, dy in [
             (sx1, sy1, 1, 1), (sx2, sy1, -1, 1),
             (sx1, sy2, 1, -1), (sx2, sy2, -1, -1)
@@ -931,7 +955,7 @@ class ObjectHighlighter:
             extract_text = self._thumbs.get_extract(seg.obj_id)
 
         # Word-wrap the title (up to 2 lines)
-        max_title_w = PANEL_W - PANEL_PADDING * 2
+        max_title_w = self._panel_w - self._panel_padding * 2
         title_surfaces = self._wrap_title(seg.title, self._font_title,
                                           max_title_w, max_lines=2)
         title_total_h = sum(s.get_height() for s in title_surfaces)
@@ -939,7 +963,7 @@ class ObjectHighlighter:
         # Determine panel dimensions
         # Title bar includes title lines + date line + padding.
         date_h = self._font_small.get_height()
-        title_bar_h = title_total_h + date_h + 16
+        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
 
         # Wrap extract text to compute its height
         extract_lines = []
@@ -948,18 +972,18 @@ class ObjectHighlighter:
             extract_lines = self._wrap_text(
                 extract_text, self._font_small,
                 max_title_w, max_lines=3)
-            extract_h = sum(s.get_height() for s in extract_lines) + 10
+            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
 
         if has_thumb:
-            panel_w = PANEL_W
-            panel_h = (title_bar_h + PANEL_H_THUMB + PANEL_H_FOOTER +
-                       PANEL_PADDING + extract_h)
+            panel_w = self._panel_w
+            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
+                       self._panel_padding + extract_h)
         else:
-            panel_w = PANEL_W_NO_THUMB
-            panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
+            panel_w = self._panel_w_no_thumb
+            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
 
-        panel_x = self._screen_w - panel_w - PANEL_MARGIN - self._overscan_margin
-        panel_y = self._screen_h - panel_h - PANEL_MARGIN - self._overscan_margin
+        panel_x = self._screen_w - panel_w - self._panel_margin - self._overscan_margin
+        panel_y = self._screen_h - panel_h - self._panel_margin - self._overscan_margin
 
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
@@ -971,13 +995,14 @@ class ObjectHighlighter:
                          (0, 0, panel_w, panel_h), 1)
 
         # Left accent bar
-        pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, 4, panel_h))
+        accent_w = max(2, int(4 * self._ui_scale))
+        pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, accent_w, panel_h))
 
         screen.blit(panel_surf, (panel_x, panel_y))
 
         # ── Title (possibly 2 lines) + date ──
-        tx = panel_x + PANEL_PADDING
-        ty = panel_y + 8
+        tx = panel_x + self._panel_padding
+        ty = panel_y + int(8 * self._ui_scale)
         for ts in title_surfaces:
             screen.blit(ts, (tx, ty))
             ty += ts.get_height()
@@ -987,27 +1012,32 @@ class ObjectHighlighter:
         # ── Thumbnail ──
         if has_thumb:
             img_x = tx
-            img_y = panel_y + title_bar_h + 4
+            img_y = panel_y + title_bar_h + int(4 * self._ui_scale)
 
             if thumb_surf is not None:
-                # Draw the thumbnail
+                # Scale thumbnail to match ui_scale
+                if (thumb_surf.get_width() != self._thumb_w or
+                        thumb_surf.get_height() != self._thumb_h):
+                    thumb_surf = pygame.transform.smoothscale(
+                        thumb_surf, (self._thumb_w, self._thumb_h))
                 screen.blit(thumb_surf, (img_x, img_y))
             else:
                 # Draw loading placeholder
-                self._render_placeholder(screen, img_x, img_y, THUMB_W, THUMB_H)
+                self._render_placeholder(screen, img_x, img_y,
+                                         self._thumb_w, self._thumb_h)
 
         # ── Wikipedia extract text (below thumbnail) ──
         if extract_lines:
-            ex_y = panel_y + title_bar_h + PANEL_H_THUMB + 4
+            ex_y = panel_y + title_bar_h + self._panel_h_thumb + int(4 * self._ui_scale)
             for line_surf in extract_lines:
                 screen.blit(line_surf, (tx, ex_y))
                 ex_y += line_surf.get_height()
 
         # ── Footer: link type + progress bar ──
-        footer_y = panel_y + panel_h - PANEL_H_FOOTER
+        footer_y = panel_y + panel_h - self._panel_h_footer
         self._render_footer(screen, seg, link_type,
-                            panel_x + PANEL_PADDING, footer_y,
-                            panel_w - PANEL_PADDING * 2)
+                            panel_x + self._panel_padding, footer_y,
+                            panel_w - self._panel_padding * 2)
 
     def _render_placeholder(self, screen, x, y, w, h):
         """Draw an animated loading placeholder for the thumbnail."""
@@ -1043,8 +1073,8 @@ class ObjectHighlighter:
 
         # Progress bar (right side, takes remaining width)
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
-        bar_h = 3
-        bar_y = fy + 16
+        bar_h = max(2, int(3 * self._ui_scale))
+        bar_y = fy + int(16 * self._ui_scale)
         pygame.draw.rect(screen, (40, 40, 50), (fx, bar_y, fw, bar_h))
         pygame.draw.rect(screen, LABEL_ACCENT,
                          (fx, bar_y, int(fw * progress), bar_h))
