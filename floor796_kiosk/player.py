@@ -27,6 +27,7 @@ The player auto-detects the board type and native display resolution at startup.
 
 import argparse
 import heapq
+import io
 import json
 import logging
 import math
@@ -1810,6 +1811,18 @@ def main():
         # ── Persistent low-memory warning banner ──
         if mem_banner:
             mem_banner.render(screen)
+
+        # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
+        # The HTTP /screenshot endpoint signals a capture request; we copy
+        # the fully-composed screen surface here and hand back PNG bytes.
+        if stats_collector and stats_collector.poll_screenshot_request():
+            try:
+                buf = io.BytesIO()
+                pygame.image.save(screen, buf, "PNG")
+                stats_collector.complete_screenshot(buf.getvalue())
+            except Exception as e:
+                log.warning("Screenshot capture failed: %s", e)
+                stats_collector.complete_screenshot(None)
 
         pygame.display.flip()
 
