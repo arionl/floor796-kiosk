@@ -478,11 +478,17 @@ class ObjectHighlighter:
         self._thumbs = ThumbnailCache()
         # Scaled thumbnail cache: obj_id → scaled Surface.
         # Avoids re-scaling the thumbnail every frame during a highlight.
+        # Bounded: evicts oldest entries beyond MAX_CACHE_ENTRIES to prevent
+        # unbounded memory growth (each 640×400 RGBA surface = ~1MB at 4K).
         self._scaled_thumb_cache = {}
         # Cached panel background (bg + border + accent bar) keyed by
         # (obj_id, has_thumb) — rebuilt only when the highlighted object
         # changes, not every frame.
+        # Bounded: each ~700×600 SRCALPHA surface = ~1.5MB at 4K scale.
         self._panel_bg_cache = {}  # (obj_id, has_thumb) → (Surface, panel_w, panel_h)
+        # Maximum entries in each overlay cache. At ~2.5MB combined per
+        # entry at 4K, 24 entries = ~60MB ceiling.
+        self._max_overlay_cache_entries = 24
         # Cached glow surfaces keyed by (radius, box_w, box_h).
         # The glow breathes between ~10 radius values; each gets cached
         # so we don't allocate 16 SRCALPHA surfaces per frame.
@@ -1029,6 +1035,9 @@ class ObjectHighlighter:
             accent_w = max(2, int(4 * self._ui_scale))
             pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, accent_w, panel_h))
             self._panel_bg_cache[cache_key] = (panel_surf, panel_w, panel_h)
+            # Evict oldest if cache exceeds size limit
+            if len(self._panel_bg_cache) > self._max_overlay_cache_entries:
+                self._panel_bg_cache.pop(next(iter(self._panel_bg_cache)))
         else:
             panel_surf = cached_bg[0]
 
@@ -1055,6 +1064,10 @@ class ObjectHighlighter:
                     scaled = pygame.transform.smoothscale(
                         thumb_surf, (self._thumb_w, self._thumb_h))
                     self._scaled_thumb_cache[seg.obj_id] = scaled
+                    # Evict oldest if cache exceeds size limit
+                    if len(self._scaled_thumb_cache) > self._max_overlay_cache_entries:
+                        self._scaled_thumb_cache.pop(
+                            next(iter(self._scaled_thumb_cache)))
                 screen.blit(scaled, (img_x, img_y))
             else:
                 # Draw loading placeholder
