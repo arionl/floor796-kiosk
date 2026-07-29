@@ -5,6 +5,63 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.4 — 4K optimization, screenshot endpoint, OOM fix (2026-07-29)
+
+### Added
+- **In-process `/screenshot` HTTP endpoint** — captures the live viewport
+  (scene + highlighter overlay) as a PNG via a thread-safe handshake between
+  the HTTP server and the main render loop.  The frame is copied before
+  `display.flip()`, ensuring a clean grab without external tools.  Works under
+  KMSDRM where `scrot` and other X11 screenshot utilities cannot.
+- **Resolution-aware UI scaling** — all highlighter dimensions (fonts,
+  thumbnails, panel geometry, outlines, glow radius, padding) scale
+  proportionally with display height (`screen_height / 1080.0`).  At 4K the
+  UI is rendered at 2.0×, at 1440p at 1.33×, at 1080p at 1.0×.  Ensures crisp,
+  readable text and panels at any resolution without manual tuning.
+- **Highlighter panel occlusion filter** — objects whose bounding box overlaps
+  the info panel footprint are excluded from selection, preventing highlights
+  hidden behind the panel.
+- **Edge viewing buffer** — candidates must maintain 5% clearance from all
+  screen edges at the end of the 10-second highlight (predicted via wander
+  velocity).  Prevents objects from scrolling off-screen mid-highlight.
+- **Frame timing instrumentation** — slow frames (>40 ms) are logged with a
+  per-section breakdown: `[FRAME] Xms (avg=Y p50=Z n=N) blit=B overlay=O ss=S
+  flip=F pending=P`.  Enables precise diagnosis of performance regressions.
+- **Surface caching** — glow layers, scaled thumbnails, and panel backgrounds
+  are cached per-frame to eliminate redundant allocations.  Combined with
+  the FIFO eviction below, overlay cost dropped to ~7 ms steady-state at 4K.
+
+### Changed
+- **GLOW_STEPS reduced 16 → 8** — halves per-frame alpha blits with no
+  perceptible visual change (3 px gradient steps at minimum).  Significant
+  fill-rate savings at 4K where each glow layer is 4× larger than at 1080p.
+- **Per-frame overhead reduced ~8 ms** — `wanderer.heading()` computed once
+  per frame (was 3×), `coverage_stats()` called once (was 2×), per-frame
+  `dict()` copy of visit counts eliminated, and `tile_cache.set_needed()`
+  short-circuits when the visible/margin tile set is unchanged (~99% of
+  frames).
+
+### Fixed
+- **OOM crash on OrangePi 5 Max (4K)** — the 4K overlay caches
+  (`_scaled_thumb_cache`, `_panel_bg_cache`) had no eviction policy, leaking
+  ~2.0 GB of surfaces over 24 h as the highlighter cycled through all 804
+  objects.  Fixed with a 24-entry FIFO cap on both caches (~60 MB ceiling).
+  Combined with the tile cache (~4 GB) and hologram scenes (~360 MB), total
+  memory is now bounded at ~4.4 GB on the 8 GB OrangePi.
+- **Glow cache artifacts** — glow surfaces were cached with absolute screen
+  positions computed at build time, but the wanderer scrolls every frame,
+  causing ghosting/misalignment.  Fixed: cache stores only the surface and
+  padding; blit position is computed fresh from current viewport coordinates
+  each frame.
+
+### Performance
+- **OrangePi 5 Max (4K)**: ~17 fps at 3840×2160 (was crashing within 24 h).
+  Breakdown: blit=26 ms, flip=9 ms, overlay=7 ms, overhead=18 ms.  The blit
+  is memory-bandwidth bound (~33 MB pixel data per frame).  17 fps exceeds
+  the 12 fps source animation rate, so no frames are dropped.
+
+---
+
 ## v2.3 — KMSDRM unification, highlighter rewrite, multi-board hardening (2026-07-24)
 
 ### Added

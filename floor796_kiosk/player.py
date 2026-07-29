@@ -15,7 +15,7 @@ Architecture:
     tile is toured.  A blank-ratio guard keeps the viewport on content.
 
 Controls (for maintenance/testing only):
-  Mouse drag / Arrow keys — Pan manually
+  Arrow keys — Pan manually
   Space                   — Toggle auto-wandering
   V                       — Print coverage heatmap to journal
   ESC                     — Quit

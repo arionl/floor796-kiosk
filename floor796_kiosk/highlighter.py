@@ -491,7 +491,7 @@ class ObjectHighlighter:
         self._max_overlay_cache_entries = 24
         # Cached glow surfaces keyed by (radius, box_w, box_h).
         # The glow breathes between ~10 radius values; each gets cached
-        # so we don't allocate 16 SRCALPHA surfaces per frame.
+        # so we don't allocate GLOW_STEPS SRCALPHA surfaces per frame.
         self._glow_cache = {}
 
         # Fonts (lazily initialized when first render is called)

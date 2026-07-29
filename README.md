@@ -24,7 +24,9 @@ next boot.
 - **KMSDRM unified rendering** — both Raspberry Pi 5 (V3D) and OrangePi 5 Max
   (Panthor) render directly through KMSDRM with no X11 overhead.  Boards ≤4 GB
   RAM are capped at 1080p to prevent OOM; higher memory boards render at native
-  resolution.
+  resolution (up to 4K).  The highlighter UI scales proportionally with display
+  height (2.0× at 4K, 1.33× at 1440p, 1.0× at 1080p) for crisp text and panels
+  at any resolution.
 - **Coverage-weighted wandering** — a visit heat map ensures all 50+ animated
   tiles are toured evenly.  Content-aware scroll limits (derived from the
   pixel-level density mask) keep the viewport hugging actual pixel-art content,
@@ -234,7 +236,9 @@ brings them into view.
 
 1. **Filter** — candidates must be fully in the viewport, large enough to
    highlight, won't scroll off-screen during the 10-second highlight duration,
-   and not in cooldown.
+   not obscured by the info panel footprint, and have comfortable clearance
+   from all screen edges (5% edge buffer) so they remain visible throughout
+   the highlight.
 2. **Select** — the object with the oldest `last_shown` timestamp is picked
    (never-shown objects have timestamp 0 = highest priority).  Ties are broken
    by closeness to viewport center.
@@ -249,10 +253,12 @@ random sampling, no scoring weights.
 - **Zoom-in intro** (0.5s) — the bounding box interpolates from full viewport
   bounds to the object's bounding box with ease-out cubic, like a camera
   focusing.  Outline is 6 px thick during zoom for visibility.
-- **Breathing glow** — 16 concentric filled-rect layers radiate outward to 24 px
+- **Breathing glow** — 8 concentric filled-rect layers radiate outward to 24 px
   max radius, with quadratic alpha falloff.  Painter's algorithm (outer→inner).
   The box interior is cut out so glow doesn't tint the content.  Breathing at
-  0.6 Hz.  Color: bright red `(255, 20, 20)`.
+  0.6 Hz.  Color: bright red `(255, 20, 20)`.  Glow, thumbnail, and panel
+  surfaces are cached and bounded (24-entry FIFO eviction) to prevent memory
+  growth over long uptimes.
 
 **Thumbnail types** — the highlighter fetches and displays:
 
@@ -285,6 +291,7 @@ no external dependencies).  All endpoints return JSON unless noted.
 | `GET /objects/summary?window=30m&limit=10` | Windowed summary: most-viewed, most-recent, coverage % |
 | `POST /overlay` | Toggle on-screen overlay: `{"enabled": true}` |
 | `POST /overlay/window` | Set overlay time window: `{"window": "1h"}` or `{"cycle": true}` |
+| `GET /screenshot` | PNG capture of the live viewport (highlighter + scene) |
 
 **On-screen overlay** — press `S` to toggle a semi-transparent stats panel
 showing live FPS, memory, CPU, tile cache status, wanderer position/heading,
@@ -373,14 +380,12 @@ When a keyboard/mouse is connected during maintenance:
 |-----------------|----------------------------|
 | Space           | Toggle auto-wandering      |
 | Arrow keys      | Pan manually               |
-| Mouse drag      | Pan manually               |
 | V               | Print coverage stats       |
 | O               | Toggle object highlighter  |
 | L               | Switch label mode (corner/inline) |
 | S               | Toggle stats overlay       |
 | T               | Cycle stats time window    |
 | ESC             | Quit (service will restart)|
-| F               | Toggle fullscreen          |
 
 ---
 
@@ -436,7 +441,7 @@ and re-fetch thumbnails on next boot.
 
 | Metric              | Pi 5 (4 GB)      | Pi 5 (2 GB)      | OrangePi 5 Max   |
 |---------------------|------------------|------------------|------------------|
-| Render rate         | 30 fps (vsync)   | 30 fps (vsync)   | 60 fps           |
+| Render rate         | 30 fps (vsync)   | 30 fps (vsync)   | ~17 fps (4K)¹    |
 | Animation rate      | 12 fps           | 12 fps           | 12 fps           |
 | Resolution          | 1080p (capped)   | 1080p (capped)   | native (up to 4K)|
 | Memory (RSS)        | ~2.4 GB          | ~1.5 GB          | ~2.7 GB          |
@@ -446,6 +451,11 @@ and re-fetch thumbnails on next boot.
 | Cold-boot (warm)    | ~20s             | ~20s             | ~20s             |
 | Full coverage       | ~25 min          | ~25 min          | ~25 min          |
 
+> ¹ At 4K (3840×2160), each frame is ~33 MB of pixel data — the render loop is
+> memory-bandwidth bound (~26 ms per blit).  17 fps exceeds the 12 fps source
+> animation rate, so no animation frames are dropped.  At 1080p the OrangePi
+> also achieves 30 fps (vsync).
+>
 > Boards with ≤4 GB RAM are automatically capped at 1080p to prevent OOM.
 > The 2 GB Pi 5 uses a reduced tile cache (8 tiles) and shows a low-memory
 > warning banner.  All boards use identical KMSDRM rendering with hardware GLES.
