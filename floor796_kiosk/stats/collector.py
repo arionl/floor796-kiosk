@@ -294,9 +294,64 @@ class StatsCollector:
         # Object highlighter reference (set by main loop)
         self._highlighter = None
 
+        # Screenshot capture (request/response handshake between HTTP
+        # thread and main render thread — see request_screenshot/poll)
+        self._ss_lock = threading.Lock()
+        self._ss_done = threading.Event()
+        self._ss_requested = False
+        self._ss_result = None
+
     def set_highlighter(self, highlighter):
         """Attach the ObjectHighlighter for object telemetry queries."""
         self._highlighter = highlighter
+
+    # ── Screenshot capture ──────────────────────────────────────────────
+    #
+    # The HTTP server runs in a background thread, but pygame surface
+    # access (screen.copy()) must happen on the main render thread.
+    # We use a simple request/response handshake:
+    #   1. HTTP thread calls request_screenshot() — sets an event
+    #   2. Main loop (before display.flip) checks poll_screenshot(),
+    #      copies the screen surface, stores PNG bytes
+    #   3. HTTP thread blocks on the result event, then sends PNG bytes
+    #
+    # Timeout is 5 seconds — if the main loop is hung, the caller gets
+    # a 503 instead of hanging the HTTP connection.
+
+    SCREENSHOT_TIMEOUT = 5.0  # seconds before the HTTP request gives up
+
+    def request_screenshot(self):
+        """Called from the HTTP thread to request a screenshot.
+
+        Blocks until the main loop captures and returns the PNG data,
+        or until SCREENSHOT_TIMEOUT elapses.
+
+        Returns PNG bytes (str/bytes), or None on timeout.
+        """
+        import threading as _t
+        with self._ss_lock:
+            # Clear any stale result
+            self._ss_result = None
+            self._ss_requested = True
+            self._ss_done.clear()
+        self._ss_done.wait(self.SCREENSHOT_TIMEOUT)
+        with self._ss_lock:
+            return self._ss_result
+
+    def poll_screenshot_request(self):
+        """Called from the main loop to check if a screenshot is requested.
+
+        Returns True if the main loop should capture the screen this frame.
+        """
+        with self._ss_lock:
+            return self._ss_requested
+
+    def complete_screenshot(self, png_bytes):
+        """Called from the main loop to deliver the captured PNG data."""
+        with self._ss_lock:
+            self._ss_result = png_bytes
+            self._ss_requested = False
+        self._ss_done.set()
 
     @staticmethod
     def _window_to_seconds(window_name):

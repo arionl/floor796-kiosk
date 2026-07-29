@@ -14,6 +14,7 @@ Endpoints:
   GET  /objects/recent?n=20    JSON N most recently highlighted objects
   POST /overlay                {"enabled": true} or {"enabled": false}
   PATCH/POST /overlay/window   {"window": "30min"} cycle overlay time window
+  GET  /screenshot             PNG capture of the live viewport
 
 Uses only stdlib — no external dependencies.
 """
@@ -241,6 +242,18 @@ class StatsHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "highlighter not available"}, 503)
             else:
                 self._send_json(summary)
+
+        elif path == "/screenshot":
+            # Capture the live viewport. The actual pygame surface copy
+            # happens on the main render thread; request_screenshot()
+            # blocks (up to SCREENSHOT_TIMEOUT) until it returns PNG bytes.
+            png_data = collector.request_screenshot()
+            if png_data is None:
+                self._send_json(
+                    {"error": "screenshot timed out (main loop unresponsive)"},
+                    503)
+            else:
+                self._send_png(png_data)
 
         elif path == "/windows":
             self._send_json({"windows": collector.get_heatmap_windows()})

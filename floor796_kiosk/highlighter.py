@@ -42,6 +42,23 @@ MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
 RECENT_BLACKLIST = 12.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
+# Panel exclusion zone: objects whose bbox overlaps this rectangle in
+# the bottom-right corner are skipped during selection, since they'd
+# be visually hidden behind the info panel that shows title, thumbnail,
+# and link type. Covers the maximum panel footprint (thumbnail + 2-line
+# title + wiki extract + margin).
+PANEL_EXCLUDE_W = 380    # panel width + margin
+PANEL_EXCLUDE_H = 360    # max panel height + margin (with thumbnail)
+
+# Edge viewing buffer: at the END of the highlight duration, the object
+# must still have at least this fraction of the viewport as clearance
+# from each edge. This is deliberately larger than the 1.5% hard clip
+# margin (which only prevents pixel-clipping) to ensure the object stays
+# *comfortably* visible — not barely on-screen — giving viewers enough
+# time to notice and study the highlight before it scrolls off from
+# wandering.
+EDGE_BUFFER = 0.05  # 5% (~96px horizontal, ~54px vertical at 1920x1080)
+
 CHANGELOG_URL = "https://floor796.com/data/changelog.json"
 CHANGELOG_CACHE = "changelog.json"  # local cache filename
 
@@ -70,7 +87,7 @@ ZOOM_DURATION = 0.5             # seconds for zoom to complete
 
 STEADY_SPEED = 0.6               # Hz — slow breathing (~1.7s/cycle)
 GLOW_RADIUS = 24                 # outward gradient extent in pixels
-GLOW_STEPS = 16                  # number of concentric rect layers
+GLOW_STEPS = 8                   # number of concentric rect layers (was 16)
 GLOW_PEAK_ALPHA = 90             # peak alpha at box edge when breathing peaks
 
 # ── Thumbnail panel layout ───────────────────────────────────────────────────
@@ -416,11 +433,34 @@ class ObjectHighlighter:
     """Manages the automatic object highlight cycle."""
 
     def __init__(self, segments, screen_w, screen_h,
-                 spacing_w=1016, spacing_h=812, overscan_margin=0):
+                 spacing_w=1016, spacing_h=812, overscan_margin=0,
+                 ui_scale=1.0):
         self._index = TileObjectIndex(segments, spacing_w, spacing_h)
         self._screen_w = screen_w
         self._screen_h = screen_h
         self._overscan_margin = overscan_margin
+
+        # UI scale factor for high-DPI displays (1.0 at 1080p, 1.5 at 4K).
+        # All panel dimensions, fonts, outlines, and glow are multiplied
+        # by this factor so the overlay occupies the same screen fraction
+        # regardless of resolution.
+        self._ui_scale = ui_scale
+        s = ui_scale  # shorthand
+        self._thumb_w = int(THUMB_W * s)
+        self._thumb_h = int(THUMB_H * s)
+        self._panel_margin = int(PANEL_MARGIN * s)
+        self._panel_padding = int(PANEL_PADDING * s)
+        self._panel_w = int(PANEL_W * s)
+        self._panel_w_no_thumb = int(PANEL_W_NO_THUMB * s)
+        self._panel_h_title_bar = int(PANEL_H_TITLE_BAR * s)
+        self._panel_h_thumb = int(PANEL_H_THUMB * s)
+        self._panel_h_footer = int(PANEL_H_FOOTER * s)
+        self._box_outline = max(1, int(BOX_OUTLINE * s))
+        self._zoom_outline = max(2, int(ZOOM_OUTLINE * s))
+        self._glow_radius = int(GLOW_RADIUS * s)
+        self._panel_exclude_w = int(PANEL_EXCLUDE_W * s)
+        self._panel_exclude_h = int(PANEL_EXCLUDE_H * s)
+        self._corner_len = max(6, int(8 * s))
 
         # State machine
         self.enabled = True
@@ -436,6 +476,23 @@ class ObjectHighlighter:
 
         # Thumbnail cache
         self._thumbs = ThumbnailCache()
+        # Scaled thumbnail cache: obj_id → scaled Surface.
+        # Avoids re-scaling the thumbnail every frame during a highlight.
+        # Bounded: evicts oldest entries beyond MAX_CACHE_ENTRIES to prevent
+        # unbounded memory growth (each 640×400 RGBA surface = ~1MB at 4K).
+        self._scaled_thumb_cache = {}
+        # Cached panel background (bg + border + accent bar) keyed by
+        # (obj_id, has_thumb) — rebuilt only when the highlighted object
+        # changes, not every frame.
+        # Bounded: each ~700×600 SRCALPHA surface = ~1.5MB at 4K scale.
+        self._panel_bg_cache = {}  # (obj_id, has_thumb) → (Surface, panel_w, panel_h)
+        # Maximum entries in each overlay cache. At ~2.5MB combined per
+        # entry at 4K, 24 entries = ~60MB ceiling.
+        self._max_overlay_cache_entries = 24
+        # Cached glow surfaces keyed by (radius, box_w, box_h).
+        # The glow breathes between ~10 radius values; each gets cached
+        # so we don't allocate GLOW_STEPS SRCALPHA surfaces per frame.
+        self._glow_cache = {}
 
         # Fonts (lazily initialized when first render is called)
         self._font_title = None
@@ -457,11 +514,26 @@ class ObjectHighlighter:
     def _init_fonts(self):
         if self._fonts_ready:
             return
-        self._font_title = pygame.font.Font(None, 22)
-        self._font_body = pygame.font.Font(None, 18)
-        self._font_small = pygame.font.Font(None, 16)
-        self._font_link = pygame.font.Font(None, 15)
+        s = self._ui_scale
+        self._font_title = pygame.font.Font(None, max(8, int(22 * s)))
+        self._font_body = pygame.font.Font(None, max(8, int(18 * s)))
+        self._font_small = pygame.font.Font(None, max(8, int(16 * s)))
+        self._font_link = pygame.font.Font(None, max(8, int(15 * s)))
         self._fonts_ready = True
+
+    def _panel_rect(self):
+        """Return (px1, py1, px2, py2) of the info panel in screen coords.
+
+        The panel sits in the bottom-right corner.  This is used to exclude
+        objects that would be hidden behind the panel.  We use the maximum
+        panel footprint (with thumbnail) so that even after the panel grows
+        during the highlight, no previously-occluded object was selected.
+        """
+        p2x = self._screen_w - self._panel_margin - self._overscan_margin
+        p1x = p2x - self._panel_exclude_w
+        p2y = self._screen_h - self._panel_margin - self._overscan_margin
+        p1y = p2y - self._panel_exclude_h
+        return p1x, p1y, p2x, p2y
 
     def _select_segment(self, vp_x1, vp_y1, vp_x2, vp_y2,
                         vel_x=0, vel_y=0):
@@ -469,14 +541,15 @@ class ObjectHighlighter:
 
         Selection is deterministic: pick the LEAST-RECENTLY-DISPLAYED
         object that is fully visible in the viewport and will remain
-        visible for the entire highlight duration (accounting for
-        wander velocity). Ties are broken by distance from viewport
+        comfortably visible for the entire highlight duration (accounting
+        for wander velocity). Ties are broken by distance from viewport
         center (closer wins).
 
         Filtering (hard skips):
           - Too-small segments (< MIN_BBOX_SIZE)
           - Bbox partially off-screen (must be fully inside viewport)
-          - Would scroll off-screen during HIGHLIGHT_DURATION
+          - Bbox overlaps the info panel in the bottom-right corner
+          - Would scroll too close to the screen edge during HIGHLIGHT_DURATION
           - Currently within RECENT_BLACKLIST cooldown
 
         From the remaining candidates, returns the one with the
@@ -498,9 +571,20 @@ class ObjectHighlighter:
         clip_margin_x = vp_w * 0.015
         clip_margin_y = vp_h * 0.015
 
+        # Panel exclusion rectangle in screen coordinates (for the panel
+        # occlusion check — objects behind the info panel are not visible).
+        panel_x1, panel_y1, panel_x2, panel_y2 = self._panel_rect()
+
         # Wander prediction
         wander_speed = math.hypot(vel_x, vel_y)
         predict_dist = wander_speed * HIGHLIGHT_DURATION
+
+        # Edge buffer: at the END of the highlight, the object must still
+        # have this much clearance from each viewport edge. This ensures
+        # viewers have enough time to see the highlight before it scrolls
+        # off-screen from wandering.
+        edge_buf_x = self._screen_w * EDGE_BUFFER
+        edge_buf_y = self._screen_h * EDGE_BUFFER
 
         eligible = []
 
@@ -521,21 +605,32 @@ class ObjectHighlighter:
                     seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
-            # Velocity prediction: skip objects that would scroll off
-            # during the highlight duration
+            # Panel occlusion: skip objects behind the bottom-right info
+            # panel. The panel is opaque and would hide the highlighted
+            # object (and its bounding box).
+            sx1 = seg.abs_x1 - vp_x1
+            sy1 = seg.abs_y1 - vp_y1
+            sx2 = seg.abs_x2 - vp_x1
+            sy2 = seg.abs_y2 - vp_y1
+            if (sx2 > panel_x1 and sx1 < panel_x2 and
+                    sy2 > panel_y1 and sy1 < panel_y2):
+                continue
+
+            # Velocity prediction with edge buffer: skip objects that
+            # would scroll too close to the screen edge during the
+            # highlight duration.  We predict the bbox position at the
+            # end of HIGHLIGHT_DURATION and require it to still have
+            # EDGE_BUFFER clearance from every edge — not just barely
+            # on-screen. This gives viewers enough viewing time.
             if predict_dist > 1:
-                sx1 = seg.abs_x1 - vp_x1
-                sy1 = seg.abs_y1 - vp_y1
-                sx2 = seg.abs_x2 - vp_x1
-                sy2 = seg.abs_y2 - vp_y1
                 future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
                 future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
                 future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
                 future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
-                visible = (future_x2 > clip_margin_x and
-                           future_x1 < self._screen_w - clip_margin_x and
-                           future_y2 > clip_margin_y and
-                           future_y1 < self._screen_h - clip_margin_y)
+                visible = (future_x2 > edge_buf_x and
+                           future_x1 < self._screen_w - edge_buf_x and
+                           future_y2 > edge_buf_y and
+                           future_y1 < self._screen_h - edge_buf_y)
                 if not visible:
                     continue
 
@@ -673,11 +768,11 @@ class ObjectHighlighter:
 
         Single-phase breathing glow that runs for the entire highlight.
         Returns (1.0, radius) where radius oscillates between 40% and
-        100% of GLOW_RADIUS at STEADY_SPEED Hz.
+        100% of the scaled GLOW_RADIUS at STEADY_SPEED Hz.
         """
         t = self._timer
         osc = (math.sin(t * STEADY_SPEED * 2 * math.pi) + 1) / 2
-        radius = int(GLOW_RADIUS * (0.4 + 0.6 * osc))
+        radius = int(self._glow_radius * (0.4 + 0.6 * osc))
         return 1.0, radius
 
     def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
@@ -688,6 +783,11 @@ class ObjectHighlighter:
         previous. The box interior is cut out of each layer so only the
         outward ring area receives glow. This painter's-algorithm approach
         produces a continuous gradient with no gaps or banding.
+
+        Glow surfaces are cached per (radius, box_width, box_height) to
+        avoid allocating SRCALPHA surfaces per frame. Only the surfaces
+        are cached — the blit position is computed each frame since the
+        viewport scrolls continuously.
         """
         bw = sx2 - sx1
         bh = sy2 - sy1
@@ -695,21 +795,35 @@ class ObjectHighlighter:
         if steps < 2:
             return
 
-        for i in range(steps, 0, -1):
-            frac = i / steps  # 1.0 at outer edge → 0 at box edge
-            alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
-            if alpha < 2:
-                continue
-            pad = max(1, int(glow_radius * frac))
-            gw = int(bw + pad * 2)
-            gh = int(bh + pad * 2)
-            if gw <= 0 or gh <= 0:
-                continue
-            glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
-            glow_surf.fill((*BOX_COLOR, alpha))
-            # Cut out the box interior so glow only covers the ring area
-            if int(bw) > 0 and int(bh) > 0:
-                glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
+        cache_key = (glow_radius, int(bw), int(bh))
+        cached = self._glow_cache.get(cache_key)
+        if cached is None:
+            layers = []
+            for i in range(steps, 0, -1):
+                frac = i / steps  # 1.0 at outer edge → 0 at box edge
+                alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
+                if alpha < 2:
+                    continue
+                pad = max(1, int(glow_radius * frac))
+                gw = int(bw + pad * 2)
+                gh = int(bh + pad * 2)
+                if gw <= 0 or gh <= 0:
+                    continue
+                glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+                glow_surf.fill((*BOX_COLOR, alpha))
+                # Cut out the box interior so glow only covers the ring area
+                if int(bw) > 0 and int(bh) > 0:
+                    glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
+                # Store (surface, pad) — position computed at blit time
+                layers.append((glow_surf, pad))
+            self._glow_cache[cache_key] = layers
+            # Evict old entries if cache is growing (keep last 8 sizes)
+            if len(self._glow_cache) > 8:
+                self._glow_cache.pop(next(iter(self._glow_cache)))
+        else:
+            layers = cached
+
+        for glow_surf, pad in layers:
             screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
@@ -728,7 +842,7 @@ class ObjectHighlighter:
         screen.blit(fill_surf, (int(sx1), int(sy1)))
 
         # Bright outline (thicker during zoom)
-        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        outline_w = self._zoom_outline if skip_glow else self._box_outline
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          outline_w)
@@ -738,7 +852,7 @@ class ObjectHighlighter:
         tw = title_surf.get_width()
         th = title_surf.get_height()
 
-        label_y = int(sy1) - th - 8
+        label_y = int(sy1) - th - int(8 * self._ui_scale)
         if label_y < 5:
             label_y = int(sy2) + 5  # below instead
 
@@ -746,7 +860,7 @@ class ObjectHighlighter:
         label_x = max(5, min(self._screen_w - tw - 5, label_x))
 
         # Label background
-        pad = 6
+        pad = int(6 * self._ui_scale)
         bg_rect = (label_x - pad, label_y - 3, tw + pad * 2, th + 6)
         bg_surf = pygame.Surface((bg_rect[2], bg_rect[3]), pygame.SRCALPHA)
         bg_surf.fill(LABEL_BG)
@@ -775,13 +889,13 @@ class ObjectHighlighter:
             self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
         # Bright outline (thicker during zoom)
-        outline_w = ZOOM_OUTLINE if skip_glow else BOX_OUTLINE
+        outline_w = self._zoom_outline if skip_glow else self._box_outline
         pygame.draw.rect(screen, BOX_COLOR,
                          (int(sx1), int(sy1), int(bw), int(bh)),
                          outline_w)
 
         # Corner brackets for extra emphasis
-        cl = 8  # corner length
+        cl = self._corner_len
         for cx, cy, dx, dy in [
             (sx1, sy1, 1, 1), (sx2, sy1, -1, 1),
             (sx1, sy2, 1, -1), (sx2, sy2, -1, -1)
@@ -877,7 +991,7 @@ class ObjectHighlighter:
             extract_text = self._thumbs.get_extract(seg.obj_id)
 
         # Word-wrap the title (up to 2 lines)
-        max_title_w = PANEL_W - PANEL_PADDING * 2
+        max_title_w = self._panel_w - self._panel_padding * 2
         title_surfaces = self._wrap_title(seg.title, self._font_title,
                                           max_title_w, max_lines=2)
         title_total_h = sum(s.get_height() for s in title_surfaces)
@@ -885,7 +999,7 @@ class ObjectHighlighter:
         # Determine panel dimensions
         # Title bar includes title lines + date line + padding.
         date_h = self._font_small.get_height()
-        title_bar_h = title_total_h + date_h + 16
+        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
 
         # Wrap extract text to compute its height
         extract_lines = []
@@ -894,36 +1008,44 @@ class ObjectHighlighter:
             extract_lines = self._wrap_text(
                 extract_text, self._font_small,
                 max_title_w, max_lines=3)
-            extract_h = sum(s.get_height() for s in extract_lines) + 10
+            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
 
         if has_thumb:
-            panel_w = PANEL_W
-            panel_h = (title_bar_h + PANEL_H_THUMB + PANEL_H_FOOTER +
-                       PANEL_PADDING + extract_h)
+            panel_w = self._panel_w
+            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
+                       self._panel_padding + extract_h)
         else:
-            panel_w = PANEL_W_NO_THUMB
-            panel_h = title_bar_h + PANEL_H_FOOTER + PANEL_PADDING
+            panel_w = self._panel_w_no_thumb
+            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
 
-        panel_x = self._screen_w - panel_w - PANEL_MARGIN - self._overscan_margin
-        panel_y = self._screen_h - panel_h - PANEL_MARGIN - self._overscan_margin
+        panel_x = self._screen_w - panel_w - self._panel_margin - self._overscan_margin
+        panel_y = self._screen_h - panel_h - self._panel_margin - self._overscan_margin
 
         date_surf = self._font_small.render(
             f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
 
-        # ── Draw panel background ──
-        panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        panel_surf.fill(CORNER_PANEL_BG)
-        pygame.draw.rect(panel_surf, CORNER_PANEL_BORDER,
-                         (0, 0, panel_w, panel_h), 1)
-
-        # Left accent bar
-        pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, 4, panel_h))
+        # ── Draw panel background (cached per object) ──
+        cache_key = (seg.obj_id, has_thumb)
+        cached_bg = self._panel_bg_cache.get(cache_key)
+        if cached_bg is None or cached_bg[1] != panel_w or cached_bg[2] != panel_h:
+            panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+            panel_surf.fill(CORNER_PANEL_BG)
+            pygame.draw.rect(panel_surf, CORNER_PANEL_BORDER,
+                             (0, 0, panel_w, panel_h), 1)
+            accent_w = max(2, int(4 * self._ui_scale))
+            pygame.draw.rect(panel_surf, LABEL_ACCENT, (0, 0, accent_w, panel_h))
+            self._panel_bg_cache[cache_key] = (panel_surf, panel_w, panel_h)
+            # Evict oldest if cache exceeds size limit
+            if len(self._panel_bg_cache) > self._max_overlay_cache_entries:
+                self._panel_bg_cache.pop(next(iter(self._panel_bg_cache)))
+        else:
+            panel_surf = cached_bg[0]
 
         screen.blit(panel_surf, (panel_x, panel_y))
 
         # ── Title (possibly 2 lines) + date ──
-        tx = panel_x + PANEL_PADDING
-        ty = panel_y + 8
+        tx = panel_x + self._panel_padding
+        ty = panel_y + int(8 * self._ui_scale)
         for ts in title_surfaces:
             screen.blit(ts, (tx, ty))
             ty += ts.get_height()
@@ -933,27 +1055,37 @@ class ObjectHighlighter:
         # ── Thumbnail ──
         if has_thumb:
             img_x = tx
-            img_y = panel_y + title_bar_h + 4
+            img_y = panel_y + title_bar_h + int(4 * self._ui_scale)
 
             if thumb_surf is not None:
-                # Draw the thumbnail
-                screen.blit(thumb_surf, (img_x, img_y))
+                # Scale thumbnail to match ui_scale (cached per obj_id)
+                scaled = self._scaled_thumb_cache.get(seg.obj_id)
+                if scaled is None:
+                    scaled = pygame.transform.smoothscale(
+                        thumb_surf, (self._thumb_w, self._thumb_h))
+                    self._scaled_thumb_cache[seg.obj_id] = scaled
+                    # Evict oldest if cache exceeds size limit
+                    if len(self._scaled_thumb_cache) > self._max_overlay_cache_entries:
+                        self._scaled_thumb_cache.pop(
+                            next(iter(self._scaled_thumb_cache)))
+                screen.blit(scaled, (img_x, img_y))
             else:
                 # Draw loading placeholder
-                self._render_placeholder(screen, img_x, img_y, THUMB_W, THUMB_H)
+                self._render_placeholder(screen, img_x, img_y,
+                                         self._thumb_w, self._thumb_h)
 
         # ── Wikipedia extract text (below thumbnail) ──
         if extract_lines:
-            ex_y = panel_y + title_bar_h + PANEL_H_THUMB + 4
+            ex_y = panel_y + title_bar_h + self._panel_h_thumb + int(4 * self._ui_scale)
             for line_surf in extract_lines:
                 screen.blit(line_surf, (tx, ex_y))
                 ex_y += line_surf.get_height()
 
         # ── Footer: link type + progress bar ──
-        footer_y = panel_y + panel_h - PANEL_H_FOOTER
+        footer_y = panel_y + panel_h - self._panel_h_footer
         self._render_footer(screen, seg, link_type,
-                            panel_x + PANEL_PADDING, footer_y,
-                            panel_w - PANEL_PADDING * 2)
+                            panel_x + self._panel_padding, footer_y,
+                            panel_w - self._panel_padding * 2)
 
     def _render_placeholder(self, screen, x, y, w, h):
         """Draw an animated loading placeholder for the thumbnail."""
@@ -989,8 +1121,8 @@ class ObjectHighlighter:
 
         # Progress bar (right side, takes remaining width)
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
-        bar_h = 3
-        bar_y = fy + 16
+        bar_h = max(2, int(3 * self._ui_scale))
+        bar_y = fy + int(16 * self._ui_scale)
         pygame.draw.rect(screen, (40, 40, 50), (fx, bar_y, fw, bar_h))
         pygame.draw.rect(screen, LABEL_ACCENT,
                          (fx, bar_y, int(fw * progress), bar_h))

@@ -15,7 +15,7 @@ Architecture:
     tile is toured.  A blank-ratio guard keeps the viewport on content.
 
 Controls (for maintenance/testing only):
-  Mouse drag / Arrow keys — Pan manually
+  Arrow keys — Pan manually
   Space                   — Toggle auto-wandering
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
@@ -27,6 +27,7 @@ The player auto-detects the board type and native display resolution at startup.
 
 import argparse
 import heapq
+import io
 import json
 import logging
 import math
@@ -401,6 +402,7 @@ class TileCache:
         # poll_results() to do intelligent eviction (never evict visible).
         self._visible_ids = set()
         self._needed_ids = set()
+        self._last_margin_ids = set()
 
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
@@ -458,10 +460,17 @@ class TileCache:
             self._worker.join(timeout=2)
 
     def set_needed(self, visible_ids, margin_ids):
+        # Fast path: if tile sets haven't changed since last call, skip
+        # all the queue/eviction work. At 15px/s the viewport crosses a
+        # tile boundary only ~once every 60s, so 99% of frames are no-ops.
+        if visible_ids == self._visible_ids and margin_ids == self._last_margin_ids:
+            return
+
         needed = visible_ids | margin_ids
         # Stash priority sets for poll_results() intelligent eviction.
         self._visible_ids = visible_ids
         self._needed_ids = needed
+        self._last_margin_ids = margin_ids
         with self._lock:
             already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
             new_pending = needed - already
@@ -1603,6 +1612,12 @@ def main():
             stats_collector = None
 
     # ── Object highlighter ──
+    # UI scale: at 1080p height the panel is sized as-designed (1.0x).
+    # At higher resolutions (1440p, 4K) the overlay scales proportionally
+    # so it occupies the same fraction of screen.
+    ui_scale = args.height / 1080.0
+    log.info("Highlighter UI scale: %.2fx (%dx%d)", ui_scale, args.width, args.height)
+
     object_highlighter = None
     if HIGHLIGHTER_AVAILABLE:
         changelog_path = CHANGELOG_PATH
@@ -1619,7 +1634,8 @@ def main():
                 object_highlighter = ObjectHighlighter(
                     hl_objects, args.width, args.height,
                     spacing_w=SPACING_W, spacing_h=SPACING_H,
-                    overscan_margin=args.overscan_margin)
+                    overscan_margin=args.overscan_margin,
+                    ui_scale=ui_scale)
                 log.info("Object highlighter: %d objects loaded",
                          len(hl_objects))
             else:
@@ -1641,7 +1657,17 @@ def main():
                  total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
 
     running = True
+
+    # ── Frame timing instrumentation ──
+    # Logs slow frames (>40ms) with per-section breakdown, every 5s max.
+    # Set FLOOR796_FRAME_DEBUG=1 for all frames.
+    from collections import deque
+    _frame_times = deque(maxlen=600)
+    _last_slow_log = 0.0
+    _frame_debug = os.environ.get("FLOOR796_FRAME_DEBUG", "")
+
     while running:
+        _ft0 = time.perf_counter()
         dt = clock.tick(30) / 1000.0
         dt = min(dt, 1 / 15)
 
@@ -1691,15 +1717,13 @@ def main():
         pos_x = max(0, min(map_w - args.width, pos_x))
         pos_y = max(0, min(map_h - args.height, pos_y))
 
+        # Compute heading once per frame (was called 3×)
+        heading = wanderer.heading() if wandering else (0.0, 0.0)
+
         # Object highlighter state machine
         if object_highlighter:
-            hl_vel_x = 0
-            hl_vel_y = 0
-            if wandering:
-                hv = wanderer.heading()
-                hl_vel_x, hl_vel_y = hv[0], hv[1]
             object_highlighter.update(dt, pos_x, pos_y,
-                                       hl_vel_x, hl_vel_y)
+                                       heading[0], heading[1])
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
@@ -1715,8 +1739,7 @@ def main():
             tiles_meta=tiles_meta,
             margin=effective_margin, tile_grid=tile_grid,
             grid_cols=grid_cols, grid_rows=grid_rows,
-            vel_x=wanderer.heading()[0] if wandering else 0,
-            vel_y=wanderer.heading()[1] if wandering else 0,
+            vel_x=heading[0], vel_y=heading[1],
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()
@@ -1725,18 +1748,21 @@ def main():
             wanderer.record_visits(visible_ids)
 
         now = time.time()
+        # Coverage stats computed once per frame — coverage_stats() runs
+        # _blank_ratio() which iterates visible tiles with numpy, so
+        # calling it twice (coverage log + stats_collector) is wasteful.
+        cov_visited, cov_total, cov_mn, cov_mx, cov_blank = \
+            wanderer.coverage_stats()
+
         if now - last_coverage_log > COVERAGE_LOG_INTERVAL:
-            visited, total_t, mn, mx, blank = wanderer.coverage_stats()
             log.info("[Coverage] %d/%d tiles visited | visits: min=%d max=%d | "
                      "blank: %d%% | waypoints: %d",
-                     visited, total_t, mn, mx, int(blank * 100),
-                     wanderer.waypoints_picked)
+                     cov_visited, cov_total, cov_mn, cov_mx,
+                     int(cov_blank * 100), wanderer.waypoints_picked)
             last_coverage_log = now
 
         # ── Stats collection (once per frame) ──
         if stats_collector:
-            heading = wanderer.heading() if wandering else (0, 0)
-            visited, total_t, mn, mx, blank = wanderer.coverage_stats()
             holo_scene = 0
             if hologram:
                 holo_scene = getattr(hologram, "_scene_idx", 0)
@@ -1748,11 +1774,11 @@ def main():
                 "cache_max": cache.max_tiles,
                 "cache_pending": cache.pending_count,
                 "cache_total_loads": cache.load_count,
-                "tiles_visited": visited,
-                "tiles_total": total_t,
+                "tiles_visited": cov_visited,
+                "tiles_total": cov_total,
                 "tiles_fully_viewed": len(wanderer.fully_viewed),
-                "visit_counts": dict(wanderer.visit_counts),
-                "blank_ratio": blank,
+                "visit_counts": wanderer.visit_counts,
+                "blank_ratio": cov_blank,
                 "current_target": wanderer.target_rc,
                 "waypoints_picked": wanderer.waypoints_picked,
                 "frame_idx": frame_idx,
@@ -1769,6 +1795,7 @@ def main():
             })
 
         # ── Render ──
+        _t_blit0 = time.perf_counter()
         screen.fill(BG_COLOR)
 
         tile_col_start = max(0, int(pos_x // SPACING_W))
@@ -1792,7 +1819,10 @@ def main():
                 dest_y = tr * SPACING_H - int(pos_y)
                 screen.blit(strip_surf, (dest_x, dest_y), area=src_rect)
 
+        _t_blit = (time.perf_counter() - _t_blit0) * 1000
+
         # ── Hologram overlay ──
+        _t_holo0 = time.perf_counter()
         if hologram:
             hologram.poll_scenes()
             hologram.update(frame_idx)
@@ -1801,6 +1831,7 @@ def main():
         # ── Object highlighter ──
         if object_highlighter:
             object_highlighter.render(screen, pos_x, pos_y)
+        _t_overlay = (time.perf_counter() - _t_holo0) * 1000
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
         if stats_collector and stats_collector.overlay_enabled:
@@ -1811,7 +1842,43 @@ def main():
         if mem_banner:
             mem_banner.render(screen)
 
+        # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
+        # The HTTP /screenshot endpoint signals a capture request; we copy
+        # the fully-composed screen surface here and hand back PNG bytes.
+        _t_ss0 = time.perf_counter()
+        if stats_collector and stats_collector.poll_screenshot_request():
+            try:
+                buf = io.BytesIO()
+                pygame.image.save(screen, buf, "PNG")
+                stats_collector.complete_screenshot(buf.getvalue())
+            except Exception as e:
+                log.warning("Screenshot capture failed: %s", e)
+                stats_collector.complete_screenshot(None)
+        _t_ss = (time.perf_counter() - _t_ss0) * 1000
+
+        _t_flip0 = time.perf_counter()
         pygame.display.flip()
+        _t_flip = (time.perf_counter() - _t_flip0) * 1000
+
+        # ── Frame timing log ──
+        _ft_total = (time.perf_counter() - _ft0) * 1000
+        _frame_times.append(_ft_total)
+        _should_log = (_ft_total > 40.0 and
+                       (time.perf_counter() - _last_slow_log) > 5.0)
+        if _frame_debug:
+            _should_log = True
+        if _should_log:
+            _sorted_ft = sorted(_frame_times)
+            _p50 = _sorted_ft[len(_sorted_ft) // 2]
+            _avg = sum(_frame_times) / len(_frame_times)
+            log.info(
+                "[FRAME] %.1fms (avg=%.1f p50=%.1f n=%d) "
+                "blit=%.1f overlay=%.1f ss=%.1f flip=%.1f pending=%d",
+                _ft_total, _avg, _p50, len(_frame_times),
+                _t_blit, _t_overlay, _t_ss, _t_flip,
+                cache.pending_count,
+            )
+            _last_slow_log = time.perf_counter()
 
     cache.stop()
     if hologram:
