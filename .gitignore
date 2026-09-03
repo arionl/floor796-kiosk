@@ -31,3 +31,8 @@ wander_heatmap*.png
 
 # Local backups (deployed code snapshots from kiosks)
 .backup-*/
+
+# Test sandboxes / scratch dirs — never commit these
+.test_*/
+tools/test_sandbox/
+test_sandbox/
