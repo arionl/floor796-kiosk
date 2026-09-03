@@ -127,6 +127,7 @@ floor796-kiosk/
 ├── assets/                       Downloaded from floor796.com (cached, gitignored)
 │   ├── tiles/                    Source tile MP4s
 │   ├── tiles_meta.json           Grid metadata
+│   ├── tile_state.json           Per-tile download fingerprints (update detection)
 │   ├── changelog.json            Object labels / polygon data
 │   └── holograms/                Hologram scene sources
 ├── cache/                        Generated at runtime (rebuildable, gitignored)
@@ -139,7 +140,8 @@ floor796-kiosk/
 │   ├── sim_heatmap.py            Wanderer heatmap simulation + visualization
 │   ├── sim_wander.py             Wanderer coverage simulation
 │   ├── sim_prefetch.py           Tile prefetch strategy simulation
-│   └── sim_prefetch_v3.py        Extended prefetch simulation
+│   ├── sim_prefetch_v3.py        Extended prefetch simulation
+│   └── test_tile_update.py       Tile update engine tests (local fake server)
 ├── deploy/                       Installation & systemd
 │   ├── install.sh                One-shot installer for fresh Pi/OrangePi
 │   ├── run.sh                    Boot wrapper (KMSDRM or X11 fallback)
