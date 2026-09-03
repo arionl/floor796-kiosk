@@ -5,7 +5,7 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
-## v2.4.2 — Hologram room fixes (2026-08-03)
+## v2.4.2 — Hologram room fixes (2026-09-03)
 
 ### Fixed
 - **Periodic empty hologram room** — three compounding causes:
@@ -56,7 +56,7 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
-## v2.4.1 — Changelog-driven tile updates (2026-08-03)
+## v2.4.1 — Changelog-driven tile updates (2026-09-03)
 
 ### Added
 - **Phased tile update detection** — the author of floor796.com often works
