@@ -5,6 +5,57 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.4.2 — Hologram room fixes (2026-08-03)
+
+### Fixed
+- **Periodic empty hologram room** — three compounding causes:
+  1. *Animation-clock drift*: the render loop reset its frame accumulator
+     instead of carrying the remainder, so at ~30fps the 12fps animation
+     clock ran at 10 ticks/s (20% slow). Every hologram cycle stretched
+     from 10s to ~12s (confirmed in journal timestamps) and all fade/gap
+     timing drifted with it. The accumulator now carries the remainder,
+     clamped after long hitches.
+  2. *Missed decode deadlines*: the next scene's decode was requested at
+     gap start, leaving only ~3.6s (stretched) of lead time. The largest
+     scene (1.6 MB, ~7s decode on a Pi 5) chronically missed it, so
+     `render()` silently returned an empty room until the scene popped
+     in mid-cycle. Requests are now issued at fade_out start (~5s lead),
+     and `_tick` refuses to enter fade_in until the scene is fully
+     promoted — extending the gap once (bounded) and otherwise skipping
+     to the next scene rather than ever showing an empty mid-cycle room.
+  3. *Corrupt-cache lockout*: a crash mid-download left a truncated
+     `.decoded` cache file that failed decode on every cycle, forever.
+     Cache writes are now atomic (`.tmp` + rename), downloads and cached
+     files pass a cheap structural validation, and a decode failure
+     purges the cache so the next cycle re-downloads.
+- **Highlighter showed non-playing holograms** — the changelog contains
+  "Hologram #1..#14" label objects, but the website only ever plays
+  slots 1–6 (7–14 are unplayable "404" console buttons) and the kiosk
+  plays one scene at a time. The highlighter now receives the hologram
+  playback state via a provider and only selects "Hologram #N" while
+  slot N is the scene currently materialized; an in-progress highlight
+  aborts when its hologram dematerializes (gap) but survives fade_out.
+- **Stats `holo_scene` always 0** — read a nonexistent `_scene_idx`
+  attribute; now reports `current_holo` (the actual scene index).
+
+### Changed
+- **Amortized scene promotion** — promoting a decoded scene converted
+  all 60 frames to surfaces in one render frame (100+ ms hitch, seen as
+  `overlay=119ms` frame spikes). `poll_scenes()` now promotes at most 8
+  frames per call; a scene is "ready" only when fully promoted.
+- **In-flight decode tracking** — `_request_scene` knows about scenes
+  currently being decoded, closing a re-queue race that could decode the
+  same scene twice.
+
+### Added
+- `HologramOverlay.playback_state()` — live state accessor for other
+  subsystems.
+- `tools/test_hologram_fixes.py` — 40-check headless suite covering
+  cache validation (against the 6 real scene files), gap-gating state
+  machine, highlighter gating/abort semantics, and accumulator math.
+
+---
+
 ## v2.4.1 — Changelog-driven tile updates (2026-08-03)
 
 ### Added

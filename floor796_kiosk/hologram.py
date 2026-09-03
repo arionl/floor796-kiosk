@@ -327,6 +327,20 @@ class HologramOverlay:
         self.surface_matrices = []
         self._glitch_cache = {}  # stable glitch colors per animation frame
 
+        # Gap extension: if the next scene is not decoded when fade_in
+        # would begin, the gap is extended (once per cycle, bounded) so
+        # the room never shows an empty hologram mid-cycle.  The request
+        # was already issued at the *previous* gap (see _enter_fade_out),
+        # so this only catches slow decodes.
+        self._gap_extended = False
+
+        # Amortized surface promotion: converting 60 decoded frames to
+        # pygame surfaces takes ~100ms+ on a Pi; doing all 60 in one
+        # render frame causes visible hitches.  We promote a few frames
+        # per poll_scenes() call instead.
+        self._partial_scenes = {}      # idx -> [frame_data, next_frame_i]
+        self._promote_budget_per_call = 8
+
         # Pre-compute clip polygon relative to hologram image top-left
         self.clip_poly_local = []
         for mx, my in CLIP_POINTS:
@@ -341,6 +355,7 @@ class HologramOverlay:
         # the render loop.
         self._decode_queue = []          # scene indices waiting to be decoded
         self._decode_results = {}        # {scene_idx: [Surface, ...]}
+        self._decode_inflight = set()    # indices currently being decoded
         self._decode_lock = threading.Lock()
         self._decode_worker = None
         self._decode_stop = False
@@ -400,20 +415,67 @@ class HologramOverlay:
         holo_file = HOLOGRAM_FILES[idx]
         cache_path = os.path.join(self.cache_dir, holo_file + '.decoded')
 
+        raw = None
         if os.path.exists(cache_path):
             with open(cache_path, 'rb') as f:
                 raw = f.read()
             log.info(f'Hologram scene {idx+1}: cached {holo_file}')
-        else:
+
+        if raw is None or not self._validate_raw(raw):
+            # Missing, empty, or corrupt cache — (re)download.
+            # A crash mid-download used to leave truncated files that
+            # failed decode on every cycle; the .tmp+rename and the
+            # size check make that impossible.
             url = CDN_BASE + holo_file
             log.info(f'Hologram scene {idx+1}: downloading {holo_file}...')
-            raw = urlopen(url, timeout=30).read()
-            with open(cache_path, 'wb') as f:
+            try:
+                raw = urlopen(url, timeout=30).read()
+            except Exception as e:
+                log.warning(f'Hologram scene {idx+1}: download failed: {e}')
+                return None
+            if not self._validate_raw(raw):
+                log.warning(f'Hologram scene {idx+1}: server sent invalid '
+                            f'data ({len(raw)} bytes)')
+                return None
+            tmp_path = cache_path + '.tmp'
+            with open(tmp_path, 'wb') as f:
                 f.write(raw)
+            os.replace(tmp_path, cache_path)
 
-        frames = decode_f796_br(raw)
+        try:
+            frames = decode_f796_br(raw)
+        except Exception as e:
+            # Cache is corrupt (e.g. pre-atomic-write leftover) — purge it
+            # so the next cycle re-downloads a clean copy.
+            log.warning(f'Hologram scene {idx+1}: decode failed ({e}) — '
+                        f'removing corrupt cache')
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+            return None
         log.info(f'  Decoded {len(frames)} frames (scene {idx+1})')
         return frames
+
+    @staticmethod
+    def _validate_raw(raw):
+        """Cheap structural check of a .f796.br file.
+
+        Layout (verified against all 6 cached scenes): a 244-byte header
+        of 61 big-endian u32 *decompressed* RLE lengths, followed by two
+        brotli blobs — brotli(frame 60 RLE) of lengths[60] bytes, then
+        brotli(remaining frames RLE).  The lengths sum to far more than
+        the file size (frames cross-reference), so only structural
+        sanity is checked: all lengths positive and both blobs present.
+        """
+        if len(raw) < 244 + 100:
+            return False
+        lengths = struct.unpack('>61I', raw[:244])
+        if any(v == 0 for v in lengths):
+            return False
+        # Both brotli blobs must be present (each at least ~100 bytes
+        # after compression).
+        return len(raw) - 244 - lengths[60] > 100
 
     def _build_surfaces(self, frame_data):
         """Convert raw RGBA frame bytes to pygame surfaces with alpha.
@@ -467,6 +529,8 @@ class HologramOverlay:
             with self._decode_lock:
                 if self._decode_queue:
                     idx = self._decode_queue.pop(0)
+                    if idx is not None:
+                        self._decode_inflight.add(idx)
 
             if idx is None:
                 time.sleep(0.05)  # idle — imported via time module in kiosk_player
@@ -479,6 +543,9 @@ class HologramOverlay:
                         self._decode_results[idx] = frames
             except Exception as e:
                 log.warning(f'Background decode failed for scene {idx+1}: {e}')
+            finally:
+                with self._decode_lock:
+                    self._decode_inflight.discard(idx)
 
     def _request_scene(self, idx):
         """Queue scene idx for background decoding (non-blocking)."""
@@ -487,6 +554,8 @@ class HologramOverlay:
         with self._decode_lock:
             if idx in self._decode_results:
                 return  # already decoded, waiting for surface creation
+            if idx in self._decode_inflight:
+                return  # worker is decoding it right now
             if idx in self._decode_queue:
                 return  # already queued
             self._decode_queue.append(idx)
@@ -495,30 +564,67 @@ class HologramOverlay:
         """Move decoded scenes from background results into self.scenes.
 
         Called from the main render loop. Converts raw bytes → pygame
-        surfaces and applies clip mask. Returns True if any scene was
-        promoted.
+        surfaces and applies clip mask. Promotion is amortized: at most
+        ``_promote_budget_per_call`` frames are converted per call, so a
+        60-frame scene is promoted over ~8 render frames instead of
+        stalling one frame for 100+ ms.
+
+        Returns True if any frame was promoted (partial counts).
         """
-        if not self._decode_results:
-            # Check under lock without copying if empty (fast path)
+        if not self._decode_results and not self._partial_scenes:
+            # Fast path: nothing pending
             return False
 
         promoted = False
+        budget = self._promote_budget_per_call
+
+        # 1. Continue partially-promoted scenes first
+        if self._partial_scenes:
+            promoted |= self._promote_partials(budget)
+
+        # 2. Pick up freshly decoded scenes from the worker
         with self._decode_lock:
-            pending = dict(self._decode_results)
+            fresh = dict(self._decode_results)
             self._decode_results.clear()
 
-        for idx, frame_data in pending.items():
+        for idx, frame_data in fresh.items():
             if idx in self.scenes:
                 continue
-            surfaces = self._build_surfaces(frame_data)
-            if self.clip_mask is not None:
-                for surf in surfaces:
-                    surf.blit(self.clip_mask, (0, 0),
-                              special_flags=pygame.BLEND_RGBA_MULT)
-            self.scenes[idx] = surfaces
-            promoted = True
+            # Start promotion (uses leftover budget if any)
+            self._partial_scenes[idx] = [frame_data, 0]
+            promoted |= self._promote_partials(budget)
 
         return promoted
+
+    def _promote_partials(self, budget):
+        """Convert up to ``budget`` frames from _partial_scenes into
+        self.scenes. Returns True if any frame was converted."""
+        converted = 0
+        done_ids = []
+        for idx, (frame_data, next_i) in self._partial_scenes.items():
+            if converted >= budget:
+                break
+            surfaces = self.scenes.setdefault(idx, [])
+            i = next_i
+            while i < len(frame_data) and converted < budget:
+                surf = pygame.image.frombuffer(
+                    frame_data[i], (SCENE_WIDTH, SCENE_HEIGHT), 'RGBA'
+                ).convert_alpha()
+                if self.clip_mask is not None:
+                    surf.blit(self.clip_mask, (0, 0),
+                              special_flags=pygame.BLEND_RGBA_MULT)
+                surfaces.append(surf)
+                i += 1
+                converted += 1
+            if i >= len(frame_data):
+                done_ids.append(idx)
+            else:
+                self._partial_scenes[idx] = [frame_data, i]
+
+        for idx in done_ids:
+            del self._partial_scenes[idx]
+
+        return converted > 0
 
     def _build_clip_mask(self):
         """Create a mask surface for the clip polygon."""
@@ -555,6 +661,21 @@ class HologramOverlay:
         """
         pass
 
+    def playback_state(self):
+        """Return the current playback state for other subsystems.
+
+        Returns a dict:
+            state (str)      — 'gap' | 'fade_in' | 'normal' | 'fade_out'
+            scene_idx (int)  — index into HOLOGRAM_FILES (0-based)
+            ready (bool)     — True when state is 'normal' (a scene is
+                               fully materialized and playing)
+        """
+        return {
+            'state': self.state,
+            'scene_idx': self.current_holo,
+            'ready': self.state == 'normal',
+        }
+
     def _tick(self):
         """Advance the state machine by one animation frame (12fps)."""
         # Update transition matrices at 12fps, not 60fps
@@ -563,7 +684,30 @@ class HologramOverlay:
 
         if self.state == 'gap':
             if self.state_frame >= GAP_FRAMES:
-                self._enter_fade_in()
+                next_idx = self.current_holo
+                if self._scene_ready(next_idx):
+                    self._enter_fade_in()
+                elif not self._gap_extended:
+                    # Scene not decoded yet — extend the gap rather than
+                    # starting fade_in with nothing to show.  Bounded to
+                    # one extension per cycle so a permanently failing
+                    # decode can't freeze the room forever; after the
+                    # extension expires, we advance anyway (rare fallback:
+                    # skip to the following scene rather than stall).
+                    self._gap_extended = True
+                    self.state_frame = 0
+                    log.info(f'Hologram: scene {next_idx+1} not ready — '
+                             f'extending gap')
+                else:
+                    # Extension exhausted — skip this scene this rotation.
+                    log.warning(f'Hologram: scene {next_idx+1} still not '
+                                f'ready after extended gap — skipping to '
+                                f'next scene')
+                    self.current_holo = (self.current_holo + 1) \
+                        % len(HOLOGRAM_FILES)
+                    self._gap_extended = False
+                    self.state_frame = 0
+                    self._request_scene(self.current_holo)
 
         elif self.state == 'fade_in':
             if self.state_frame >= FADE_IN_FRAMES:
@@ -582,11 +726,14 @@ class HologramOverlay:
     def _enter_gap(self):
         """Transition to empty room gap; advance to next hologram.
 
-        Evict the scene we just finished (2 cycles ago) to keep only
-        2 scenes in memory, and lazy-load the upcoming scene.
+        Evicts the scene we finished, and lazy-loads the upcoming scene.
+        The request itself was already issued at fade_out start (a full
+        cycle earlier lead time); this re-request only covers the case
+        where that decode failed and needs retrying.
         """
         self.state = 'gap'
         self.state_frame = 0
+        self._gap_extended = False
         self.current_holo = (self.current_holo + 1) % len(HOLOGRAM_FILES)
 
         # Evict the scene that is now 2 positions behind (no longer needed).
@@ -595,16 +742,31 @@ class HologramOverlay:
         prev_prev = (self.current_holo - 2) % len(HOLOGRAM_FILES)
         if prev_prev in self.scenes and prev_prev != self.current_holo:
             del self.scenes[prev_prev]
+        # Also drop any partial promotion state for the evicted scene.
+        self._partial_scenes.pop(prev_prev, None)
 
-        # Pre-load the next scene (current_holo + 1) during the 1s gap.
-        # This is now non-blocking — the background decoder handles it.
-        # If it's not ready in time, the scene will pop in when poll_scenes()
-        # promotes it (usually within a second or two).
+        # Ensure the upcoming scene is queued (no-op if already queued,
+        # decoded, or loaded). If the fade_out-time request failed, this
+        # retries it.
         next_idx = (self.current_holo + 1) % len(HOLOGRAM_FILES)
         self._request_scene(next_idx)
 
+    def _scene_ready(self, idx):
+        """True when scene idx is fully loaded and promotable/promoted.
+
+        A partially-promoted scene (surfaces still being converted) is
+        NOT ready — rendering would show a partially built frame list.
+        """
+        if idx in self._partial_scenes:
+            return False
+        return idx in self.scenes
+
     def _enter_fade_in(self):
-        """Begin materializing the next hologram."""
+        """Begin materializing the next hologram.
+
+        Only called when the scene is fully ready (see _tick).  If the
+        scene isn't ready, _tick extends the gap instead.
+        """
         self.state = 'fade_in'
         self.state_frame = 0
         self.surface_matrices = [create_surface_matrix(s) for s in SURFACES]
@@ -615,13 +777,23 @@ class HologramOverlay:
         self.state_frame = 0
 
     def _enter_fade_out(self):
-        """Begin dematerializing — start from full opacity."""
+        """Begin dematerializing — start from full opacity.
+
+        Also issues the decode request for the *next* scene here, at
+        fade_out start.  This gives the background decoder the entire
+        fade_out (2s) + gap (1s) + fade_in (2s) = ~5s to finish instead
+        of the previous ~3.6s measured from gap start — critical for
+        the largest scene (1.6 MB, ~7s decode on a Pi 5) which
+        chronically missed its deadline and produced an empty room.
+        """
         self.state = 'fade_out'
         self.state_frame = 0
         self.surface_matrices = [
             [[SURFACE_FADE_LEVELS for _ in range(s['cols'])]
              for _ in range(s['rows'])] for s in SURFACES
         ]
+        next_idx = (self.current_holo + 1) % len(HOLOGRAM_FILES)
+        self._request_scene(next_idx)
 
     def render(self, screen, viewport_x, viewport_y):
         """Render current hologram frame with transition effects."""
@@ -634,6 +806,10 @@ class HologramOverlay:
 
         # Ensure current scene is loaded
         if self.current_holo not in self.scenes:
+            # Should be unreachable: _tick gates fade_in on readiness and
+            # skips unready scenes after a bounded gap extension.  Render
+            # nothing rather than crash (e.g. first frames after startup
+            # before prepare() finishes promoting scenes).
             return
 
         # Position on screen
