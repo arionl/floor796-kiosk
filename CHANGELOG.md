@@ -5,6 +5,66 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.4.1 — Changelog-driven tile updates (2026-08-03)
+
+### Added
+- **Phased tile update detection** — the author of floor796.com often works
+  on a tile in phases, adding content over multiple sessions.  Each phase
+  adds an entry to his changelog referencing the tile.  The tile manager now
+  fetches the changelog alongside the matrix, derives a per-tile signature
+  (sorted set of changelog entry ids whose polygons reference the tile), and
+  re-downloads any tile whose signature changes.  Previously tiles were only
+  refreshed by mp4 file size, which missed phased updates.
+- **`assets/tile_state.json`** — per-tile fingerprint file (mp4 URL,
+  expected size, changelog entry set, pending flag).  Replaces size-only
+  comparison.  The mp4 URL embeds the upstream render timestamp, so
+  re-renders are detected even when file size is identical.
+- **Failed-download retry** — tiles whose download fails are marked
+  ``pending`` in the state file and retried on the next update check,
+  instead of being silently skipped until a size change.
+- **`content_mask.update_tiles()`** — incremental content-density-mask
+  patching.  When tiles are refreshed, only their rows in
+  ``content_mask.npz`` are recomputed instead of a full multi-minute
+  rebuild.
+- **Changelog cache refresh** — ``assets/changelog.json`` (used by the
+  object highlighter) is now rewritten after every successful update check,
+  so new objects become highlightable.  Previously it was downloaded once
+  and never refreshed.
+- **`.part` cleanup** — interrupted downloads no longer leave partial
+  files in the tiles directory; leftovers from crashed runs are removed at
+  the start of every check.
+- **`tools/test_tile_update.py`** — 24-check regression suite covering
+  first-run download, no-op, phased changelog updates, re-render with
+  identical size, entry removal, offline fallback, corrupt-file repair,
+  failed-download retry, and atomic state writes.  Runs against a local
+  fake HTTP server, no network needed.
+
+### Changed
+- **Tile downloads are now atomic** (``.part`` + rename) — a crash or power
+  loss mid-download can no longer leave a truncated tile on disk.
+- **Status screen wording** — "Tiles updated" now distinguishes "N new"
+  from "N refreshed" so you can see when the author extended existing
+  tiles.
+- **Version reported in User-Agent** — HTTP fetches now send
+  ``Floor796-Kiosk/<version>``.
+- **First run after upgrade re-fetches once** — with no state file present,
+  all tiles are re-downloaded one time to establish fingerprints (and to
+  repair any tile left stale by the old size-only scheme).  Subsequent
+  checks are no-ops.
+
+### Fixed
+- **Stale highlighter labels** — the object highlighter loaded
+  ``assets/changelog.json`` from cache and never re-downloaded it, so
+  objects added by the author after first boot were never highlighted.
+  The cache is now refreshed by the tile manager on every successful
+  update check.
+- **Stale strips after tile refresh** — re-downloading a tile left the old
+  decoded strip in ``cache/strips/`` and ``prepare_strips()`` would skip
+  re-decoding it, so the kiosk kept playing the old animation forever.
+  Refreshed tiles now have their strips deleted and are re-decoded.
+
+---
+
 ## v2.4 — 4K optimization, screenshot endpoint, OOM fix (2026-07-29)
 
 ### Added

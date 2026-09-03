@@ -159,3 +159,72 @@ if __name__ == "__main__":
     print(f"\nSaved to {CONTENT_MASK_PATH}")
     print(f"Map mask shape: {map_mask.shape}")
     print(f"Overall content density: {np.mean(map_mask):.1%}")
+
+
+def update_tiles(tiles_meta, mask_path, tile_ids, strip_dir=None):
+    """Incrementally update the content mask for specific tiles.
+
+    Called by the player after tile_manager has re-fetched tiles whose
+    upstream content changed (new changelog entries, re-render).  Only the
+    given tiles are recomputed (from their strips) and patched into the
+    saved mask, avoiding a full rebuild that takes minutes on a Pi.
+
+    Silently no-ops when numpy is unavailable or the mask file is missing
+    or corrupt (the caller falls back to a full rebuild in that case).
+    """
+    if not tile_ids:
+        return False
+    global STRIP_DIR
+    STRIP_DIR = strip_dir or _DEFAULT_STRIP_DIR
+
+    try:
+        import numpy as np
+    except ImportError:
+        return False
+
+    try:
+        data = np.load(mask_path)
+        map_mask = data["map_mask"]
+    except Exception:
+        return False
+
+    grid_rows = tiles_meta.get("grid_rows", 11)
+    grid_cols = tiles_meta.get("grid_cols", 10)
+    mask_rows, mask_cols = map_mask.shape
+    if mask_rows != grid_rows * MASK_ROWS or mask_cols != grid_cols * MASK_COLS:
+        # Grid dimensions changed — patch would corrupt the mask.
+        return False
+
+    changed = False
+    for tid in tile_ids:
+        info = tiles_meta["tiles"].get(tid)
+        if info is None:
+            continue
+        strip_path = os.path.join(STRIP_DIR, strips_best_ext(tid))
+        if not os.path.exists(strip_path):
+            # Strip not yet decoded (prepare_strips runs first, so this
+            # only happens on partial decodes) — leave old mask for now.
+            continue
+        try:
+            mask = compute_content_mask(strip_path)
+        except Exception as e:
+            print(f"  Warning: {tid}: {e}")
+            continue
+        r, c = info["row"], info["col"]
+        map_mask[r*MASK_ROWS:(r+1)*MASK_ROWS,
+                 c*MASK_COLS:(c+1)*MASK_COLS] = mask
+        changed = True
+
+    if not changed:
+        return False
+
+    np.savez_compressed(mask_path, map_mask=map_mask)
+    return True
+
+
+def strips_best_ext(tile_id):
+    """Return the first existing strip path extension for a tile."""
+    for ext in (".bmp", ".png"):
+        if os.path.exists(os.path.join(STRIP_DIR, f"{tile_id}{ext}")):
+            return ext
+    return ".bmp"

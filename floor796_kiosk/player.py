@@ -1462,17 +1462,25 @@ def main():
     ensure_dirs()
 
     # ── Check for tile updates (graceful offline fallback) ──
+    update_result = None
     try:
         from floor796_kiosk import tile_manager
         if tile_manager.has_cached_tiles():
             status.show("Checking for updates...")
-            result = tile_manager.check_and_update()
-            if result.get("offline"):
+            update_result = tile_manager.check_and_update()
+            if update_result.get("offline"):
                 status.show("Offline mode", "Using cached tiles")
                 time.sleep(1.5)
-            elif result.get("updated"):
-                new = len(result.get("new_tiles", []))
-                status.show("Tiles updated", f"{new} new tiles downloaded", progress=1.0)
+            elif update_result.get("updated"):
+                new = len(update_result.get("new_tiles", []))
+                changed = len(update_result.get("changed", []))
+                if changed:
+                    status.show("Tiles updated",
+                                f"{new - changed} new, {changed} refreshed",
+                                progress=1.0)
+                else:
+                    status.show("Tiles updated",
+                                f"{new} new tiles downloaded", progress=1.0)
                 time.sleep(1.5)
             else:
                 status.show("Tiles current")
@@ -1480,11 +1488,11 @@ def main():
         else:
             status.show("First run — downloading tiles...",
                         "This will take a few minutes")
-            result = tile_manager.check_and_update(
+            update_result = tile_manager.check_and_update(
                 status_callback=lambda done, total, tid, ok: status.show(
                     "Downloading tiles", f"{done} / {total}", progress=done / total)
             )
-            if result.get("offline"):
+            if update_result.get("offline"):
                 status.show("No internet connection",
                             "Connect to the network and restart.")
                 time.sleep(5)
@@ -1517,6 +1525,27 @@ def main():
     # ── Decode strips ──
     status.show("Checking tile strips...")
     prepare_strips(tiles_meta, status=status, display_depth=16)
+
+    # ── Patch content mask for tiles refreshed this boot ──
+    # tile_manager deletes strips of re-fetched tiles, and prepare_strips
+    # re-decodes them above.  Their density rows in content_mask.npz are
+    # stale until patched here (full rebuild takes minutes on a Pi).
+    if update_result and update_result.get("changed"):
+        changed_tiles = update_result["changed"]
+        log.info("Patching content mask for %d refreshed tile(s): %s",
+                 len(changed_tiles), changed_tiles)
+        try:
+            from floor796_kiosk.content_mask import update_tiles
+            patched = update_tiles(tiles_meta, CONTENT_MASK_PATH,
+                                   changed_tiles, strip_dir=STRIP_DIR)
+            if patched:
+                log.info("Content mask patched.")
+            else:
+                log.info("Content mask patch skipped (missing or grid "
+                         "changed) — rows for changed tiles are stale.")
+        except Exception as e:
+            log.warning("Content mask patch failed (%s) — continuing with "
+                        "existing mask.", e)
 
     # ── Build content density mask (if missing) ──
     if not os.path.exists(CONTENT_MASK_PATH):
