@@ -117,7 +117,7 @@ floor796-kiosk/
 │   ├── content_mask.py           Content density mask generator
 │   ├── hologram.py               Hologram scene overlay
 │   ├── highlighter.py            Object highlighter (804 objects, LRU selection)
-│   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki)
+│   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki, tenor, fandom, web)
 │   ├── cpu_affinity.py           big.LITTLE CPU core pinning
 │   └── stats/
 │       ├── __init__.py
@@ -271,11 +271,18 @@ random sampling, no scoring weights.
 | YouTube | `mqdefault.jpg` from `img.youtube.com` |
 | Image | Direct download (imgur, etc.) |
 | Video | Frame extraction via `ffmpeg` at ~1s timestamp |
+| Compound | All `\|\|`-separated parts scanned (any order); best image source picked |
 | Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
+| Fandom wikis | MediaWiki `api.php` `pageimages` lead image (page HTML 403s bots) |
+| Tenor | Item's `tinygif` (~220px) from embedded page JSON — the full GIF is 7MB+ |
 | Interactive | `og:image` from `floor796.com/interactive/` pages |
-| Web | HTML `og:image` → `twitter:image` → first `<img>` |
+| Web | HTML `og:image` → `twitter:image` → first non-SVG `<img>` (tracker domains skipped) |
 | SVG | Rendered to PNG via `cairosvg` |
 | AVIF / HEIC | Decoded via `pillow-heif` or native Pillow 12+ |
+
+Failed web fetches (bot-blocked sites like IMDb) degrade gracefully: the
+panel renders at no-thumbnail size rather than showing an eternal
+loading placeholder.
 
 Thumbnails are cached in `cache/thumbnails/` and fetched in background threads.
 
