@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""
-Simulation V3: Accurate model of the real tile cache eviction behavior.
+"""Simulation V3: Accurate model of the real tile cache eviction behavior.
+
+Current prefetch simulation (v2.3+).  Supersedes `sim_prefetch.py`, whose
+cache-eviction model was wrong about set_needed() timing; the V3 model
+reproduces the real code's behavior and is the one used for cache tuning.
 
 Key difference from V2: properly models that set_needed() IMMEDIATELY
 evicts any cached tile not in the needed set (visible + margin). This is

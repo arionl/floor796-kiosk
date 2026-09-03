@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""
-Wanderer simulation — runs the Wanderer algorithm for N hours of simulated
+"""Wanderer simulation — runs the Wanderer algorithm for N hours of simulated
 time and produces a coverage heatmap to detect directional bias.
 
 Does NOT require pygame or a display.  Imports the Wanderer class directly
-and runs it with a fixed timestep, simulating visit recording exactly as
-the render loop does.
+and runs it with a fixed timestep, simulating visit recording exactly as the
+render loop does.
+
+Status: maintained simulation.  Superseded `simulate_wander.py` (the original
+pre-refactor wanderer sim, kept for historical reference only).
 """
 
 import json
@@ -15,8 +17,9 @@ import os
 import time
 from collections import defaultdict
 
-# Add the kiosk directory to the path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Make the repo root importable regardless of cwd (package lives at repo root)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
 
 # We need to stub pygame before importing kiosk_player, since Wanderer
 # doesn't use pygame directly but kiosk_player imports it at module level.

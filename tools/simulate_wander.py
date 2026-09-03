@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""
+"""[LEGACY — superseded by sim_wander.py + sim_heatmap.py]
+
 Simulate the floor796 kiosk wandering algorithm and produce a heat map.
+
+This is the original, pre-refactor wanderer simulation (v1.3 era).  It is
+superseded by `sim_wander.py` (headless coverage analysis) and
+`sim_heatmap.py` (visual heatmap), which import the real Wanderer from the
+floor796_kiosk package and are kept up to date with it.  Kept for
+historical reference; the v1.3 CHANGELOG entry references its results.
 
 Renders:
   1. The overall map grid — animated tiles in one color, blank in another.

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""
-Wanderer heat-map visualisation.
+"""Wanderer heat-map visualisation.
 
-Runs the Wanderer for a simulated duration, then renders a PNG overview:
+Maintained simulation: imports the real Wanderer and tile layout, runs a
+simulated session, renders a PNG overview:
   - Animated tiles in warm colour (orange/red)
   - Blank tiles in dark blue/gray
   - Viewport visit trail overlaid as a heat gradient (hot = many visits)
@@ -22,8 +22,9 @@ import time
 import zlib
 from collections import defaultdict
 
-# Add kiosk dir to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Make the repo root importable regardless of cwd (package lives at repo root)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
 
 # Stub pygame before importing kiosk_player
 import types

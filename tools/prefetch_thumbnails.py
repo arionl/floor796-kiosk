@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""
-prefetch_thumbnails.py — pre-populate the player's thumbnail cache.
+"""prefetch_thumbnails.py — pre-populate the player's thumbnail cache.
+
+Operator utility: run this offline before deployment to avoid the lazy
+background fetch delay on first display of each object's thumbnail.
 
 Iterates through all objects in changelog.json, classifies each link,
 and fetches/resizes the thumbnail for every object that has one.
-This avoids the lazy background fetch delay on first display.
 
 Supports ALL entry types:
   - youtube:     YouTube video → mqdefault thumbnail from img.youtube.com

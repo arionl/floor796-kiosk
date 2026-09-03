@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""
+"""[LEGACY — superseded by sim_prefetch_v3.py]
+
 Simulation: tile prefetch behavior during direction changes.
+
+This was the first prefetch simulation (v2.3 era).  Its model of the tile
+cache turned out to be wrong about eviction timing, which is why V3 exists.
+Kept for historical reference; use `sim_prefetch_v3.py` for current work.
 
 Simulates the wanderer + tile cache with the REAL tile layout from
 tiles_meta.json. Measures how many tiles are missing (not yet in
