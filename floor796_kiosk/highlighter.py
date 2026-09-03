@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import urllib.request
 
@@ -130,6 +131,23 @@ PLACEHOLDER_PULSE_SPEED = 2.0  # Hz
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
+
+# Changelog entries for hologram-room slots are titled like
+# 'Hologram #6 (Hackers)' or 'Hologram #14'.  Groups: slot number.
+_HOLOGRAM_TITLE_RE = re.compile(r'^\s*Hologram\s*#(\d+)', re.IGNORECASE)
+
+
+def parse_hologram_slot(title):
+    """Return the 1-based hologram slot number referenced by a changelog
+    title, or None if the title is not a hologram-slot label."""
+    m = _HOLOGRAM_TITLE_RE.match(title or '')
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 
 class ObjectSegment:
     """A per-tile bounding box for one object.
@@ -469,6 +487,15 @@ class ObjectHighlighter:
         self._timer = 0.0
         self._current_seg = None
 
+        # Hologram gating: callable returning the HologramOverlay's
+        # playback_state() dict (or None when the hologram subsystem is
+        # unavailable).  Changelog entries titled 'Hologram #N ...' label
+        # the Nth hologram slot; slots 7-14 are the website's unplayable
+        # "404 no hologram" console buttons, and even playable slots are
+        # only worth highlighting while that scene is actually on.  The
+        # provider lets us gate selection on live playback state.
+        self._hologram_state_provider = None
+
         # Timestamped view history: obj_id -> [timestamps]
         # Used for recency-weighted selection and stats reporting.
         self._view_history = {}  # obj_id -> list of float timestamps
@@ -520,6 +547,16 @@ class ObjectHighlighter:
         self._font_small = pygame.font.Font(None, max(8, int(16 * s)))
         self._font_link = pygame.font.Font(None, max(8, int(15 * s)))
         self._fonts_ready = True
+
+    def set_hologram_state_provider(self, provider):
+        """Register a callable returning hologram playback state.
+
+        The provider returns the HologramOverlay.playback_state() dict
+        (keys: state, scene_idx, ready) or None.  When set, changelog
+        objects titled 'Hologram #N' are only selectable while hologram
+        slot N is the scene currently materialized/playing.
+        """
+        self._hologram_state_provider = provider
 
     def _panel_rect(self):
         """Return (px1, py1, px2, py2) of the info panel in screen coords.
@@ -592,6 +629,21 @@ class ObjectHighlighter:
             # Skip too-small segments
             if seg.width < MIN_BBOX_SIZE and seg.height < MIN_BBOX_SIZE:
                 continue
+
+            # Hologram gating: 'Hologram #N' labels are only meaningful
+            # while slot N is the scene currently playing (slots 7-14 on
+            # the website are unplayable "404" buttons and never qualify).
+            slot = parse_hologram_slot(seg.title)
+            if slot is not None:
+                holo = (self._hologram_state_provider()
+                        if self._hologram_state_provider else None)
+                if not holo or not holo.get('ready'):
+                    continue  # nothing playing — never highlight slots
+                if holo.get('state') != 'normal':
+                    continue
+                # scene_idx is 0-based; slot numbers are 1-based
+                if holo.get('scene_idx') != slot - 1:
+                    continue  # a different hologram is playing
 
             # Hard cooldown: skip if shown within RECENT_BLACKLIST seconds
             last = self._last_shown.get(seg.obj_id)
@@ -711,6 +763,24 @@ class ObjectHighlighter:
                     self._state = STATE_IDLE
                     self._timer = 0.0
                     return
+
+                # Hologram segments: abort when the labeled hologram is
+                # no longer visible (gap = fully dematerialized).  The
+                # highlight survives fade_out (image still dissolving)
+                # but not the empty room that follows.
+                slot = parse_hologram_slot(seg.title)
+                if slot is not None:
+                    holo = (self._hologram_state_provider()
+                            if self._hologram_state_provider else None)
+                    if (not holo or holo.get('state') == 'gap' or
+                            holo.get('scene_idx') != slot - 1):
+                        log.info("Hologram ended: obj %d '%s' dematerialized "
+                                 "at %.1fs", seg.obj_id, seg.title[:30],
+                                 self._timer)
+                        self._current_seg = None
+                        self._state = STATE_PAUSE
+                        self._timer = 0.0
+                        return
 
             if self._timer >= HIGHLIGHT_DURATION:
                 self._current_seg = None

@@ -1,3 +1,3 @@
 """Floor796 Kiosk — animated pixel-art map player for embedded displays."""
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"

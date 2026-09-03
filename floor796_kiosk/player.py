@@ -1677,6 +1677,13 @@ def main():
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
 
+    # Wire hologram playback state into the highlighter so 'Hologram #N'
+    # labels are only shown while slot N is actually playing.
+    if object_highlighter and hologram:
+        object_highlighter.set_hologram_state_provider(
+            hologram.playback_state)
+        log.info("Highlighter hologram gating enabled")
+
     # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
     mem_banner = None
     if low_memory:
@@ -1758,7 +1765,15 @@ def main():
         if frame_accumulator >= frame_interval:
             prev_frame_idx = frame_idx
             frame_idx = (frame_idx + 1) % TILE_FRAMES
-            frame_accumulator = 0.0
+            # Carry the remainder instead of resetting to zero.  At 30fps
+            # render / 12fps anim, resetting loses up to one full render
+            # frame (33ms) per tick — the animation clock then runs at
+            # 10 ticks/s instead of 12 (20% slow), stretching the 10s
+            # hologram cycle to ~12s (observed in journal logs).  Clamp
+            # after long hitches so we don't burst-catch-up.
+            frame_accumulator -= frame_interval
+            if frame_accumulator > frame_interval * 4:
+                frame_accumulator = frame_interval * 4
             # Cycle hologram when animation loop restarts
             if hologram and prev_frame_idx > frame_idx:
                 hologram.cycle_next()
@@ -1794,7 +1809,7 @@ def main():
         if stats_collector:
             holo_scene = 0
             if hologram:
-                holo_scene = getattr(hologram, "_scene_idx", 0)
+                holo_scene = hologram.current_holo
             stats_collector.update({
                 "x": pos_x, "y": pos_y,
                 "vx": heading[0], "vy": heading[1],
