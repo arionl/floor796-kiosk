@@ -275,6 +275,7 @@ random sampling, no scoring weights.
 | Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
 | Fandom wikis | MediaWiki `api.php` `pageimages` lead image (page HTML 403s bots) |
 | Tenor | Item's `tinygif` (~220px) from embedded page JSON — the full GIF is 7MB+ |
+| Overwatch | Hero-specific splash art (`960_{Hero}.jpg` from Blizzard CMS) — og:image is a generic share image identical for all heroes |
 | Interactive | `og:image` from `floor796.com/interactive/` pages |
 | Web | HTML `og:image` → `twitter:image` → first non-SVG `<img>` (tracker domains skipped) |
 | SVG | Rendered to PNG via `cairosvg` |

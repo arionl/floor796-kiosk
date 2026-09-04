@@ -277,6 +277,35 @@ def _tenor_image_url(text):
     return m.group(0) if m else None
 
 
+_OW_HERO_PAGE_RE = re.compile(
+    r'playoverwatch\.com/[a-z]{2}-[a-z]{2}/heroes/([a-z0-9-]+)/?', re.IGNORECASE)
+_OW_SPLASH_RE = re.compile(
+    r'(https?://blz-contentstack-images\.akamaized\.net/[^"\'\s<>)]+?/'
+    r'(\d{3,4})_([A-Za-z0-9_-]+)\.jpg)')
+
+
+def _overwatch_image_url(page_url, text):
+    """Extract the hero splash art from a playoverwatch.com hero page.
+
+    Every hero page serves the SAME generic Hero_Opengraph.jpg as
+    og:image, so generic extraction would show an identical image for
+    all heroes.  The page instead embeds hero-specific splash art on
+    Blizzard's CMS as {960,1600,2600}_{HeroName}.jpg; the 960px variant
+    is plenty for a 320px thumbnail.  Returns the URL or None.
+    """
+    m = _OW_HERO_PAGE_RE.search(page_url)
+    if not m:
+        return None
+    slug = m.group(1).replace('-', '_').lower()
+    best = None
+    for full, w, name in _OW_SPLASH_RE.findall(text):
+        if name.lower().replace('-', '_') != slug:
+            continue
+        if best is None or int(w) < int(best[1]):
+            best = (full, w)
+    return best[0] if best else None
+
+
 def _resolve_relative(url, base):
     """Resolve a possibly-relative image URL against a page URL."""
     if url.startswith("//"):
@@ -294,17 +323,24 @@ _TRACKER_URL_RE = re.compile(
     re.IGNORECASE)
 
 
-def _extract_page_image(html, page_url, is_tenor=False):
+def _extract_page_image(html, page_url, is_tenor=False, is_overwatch=False):
     """Extract the main image URL from a web page's HTML.
 
-    Order: og:image → twitter:image → (tenor: first media.tenor.com GIF) →
-    first non-SVG <img>.  Tracker/analytics pixels are skipped.
-    Returns an absolute URL or None.
+    Order: (overwatch: hero splash) → og:image → twitter:image →
+    (tenor: tinygif) → first non-SVG <img>.  Tracker/analytics pixels
+    are skipped.  Returns an absolute URL or None.
     """
     try:
         text = html.decode("utf-8", errors="replace")
     except Exception:
         text = html.decode("latin-1", errors="replace")
+
+    # Overwatch hero pages: hero-specific splash BEFORE og:image — every
+    # hero page serves the same generic Hero_Opengraph.jpg as og:image
+    if is_overwatch:
+        url = _overwatch_image_url(page_url, text)
+        if url:
+            return url
 
     for pat in (_OG_IMAGE_RE, _OG_IMAGE_RE_REV,
                 _TWITTER_IMAGE_RE, _TWITTER_IMAGE_RE_REV):
@@ -340,8 +376,10 @@ def _fetch_page_image(page_url, timeout=REQUEST_TIMEOUT):
     except Exception as e:
         log.debug("ThumbnailCache: page fetch failed for %s: %s", page_url, e)
         return None
-    img_url = _extract_page_image(html, page_url,
-                                  is_tenor="tenor.com" in page_url)
+    img_url = _extract_page_image(
+        html, page_url,
+        is_tenor="tenor.com" in page_url,
+        is_overwatch="playoverwatch.com" in page_url)
     if not img_url:
         return None
     try:

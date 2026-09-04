@@ -5,6 +5,20 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.4.4 — Overwatch hero thumbnails (2026-09-03)
+
+### Added
+- **playoverwatch.com hero pages** — custom page parser.  Every hero
+  page serves the identical generic `Hero_Opengraph.jpg` as og:image,
+  so generic extraction would show the same image for all five
+  Overwatch objects.  The parser extracts the hero-specific splash
+  art embedded on Blizzard's CMS (`{960,1600,2600}_{HeroName}.jpg`,
+  smallest variant chosen; slug dashes normalized to underscores for
+  names like `soldier-76` → `Soldier_76`).  Verified: all five heroes
+  produce distinct images.
+
+---
+
 ## v2.4.3 — Thumbnail fixes: compound links, tenor, fandom (2026-09-03)
 
 ### Fixed
