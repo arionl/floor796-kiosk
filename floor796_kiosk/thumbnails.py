@@ -6,13 +6,25 @@ object highlighter.
 Link types handled:
   - Direct images (floor796.com/data/misc/*.jpg, imgur, etc.)
   - YouTube videos (watch?v= or youtu.be) → mqdefault thumbnail
-  - Compound links (image_url||play-loop://audio.mp3) → image part
+  - Compound links (any part order: image||audio, audio||image,
+    event://||no-click||image, ...) → best thumbnail-capable part
   - img:// relative paths → prepend floor796.com base URL
+  - tenor.com pages → first media.tenor.com GIF on the page
+  - fandom.com wikis → lead image via MediaWiki api.php pageimages
+    (page HTML 403s non-browser user agents)
+  - Other web pages → og:image / twitter:image / first <img>
+  - Wikipedia → REST API summary (thumbnail + extract text)
   - Everything else → no thumbnail (returns None)
 
-Thumbnails are cached to disk as 320px-wide JPEGs (~10-20KB each).
-On cache hit, loading is instant from disk; on miss, a background
-thread fetches and processes the image.
+classify_link() is the single source of truth for link classification
+and thumbnail URL resolution — it never does network I/O; page/API
+URLs are prefixed ('page:', 'fandomapi:', 'wiki://api:') and resolved
+by the fetch worker.  The prefetch tool uses the same URLs as cache
+keys, so prefetched files are found at runtime.
+
+Thumbnails are cached to disk as 320px-wide PNGs.  On cache hit,
+loading is instant from disk; on miss, a background thread fetches
+and processes the image.
 """
 
 import hashlib
@@ -53,17 +65,37 @@ def classify_link(link):
     Returns (link_type, thumb_url) where link_type is one of:
       'youtube', 'image', 'video', 'wiki', 'web', 'interactive', 'none'
     and thumb_url is the URL to fetch for the thumbnail (or None).
+
+    For 'web' pages a thumb_url is now returned as a hint: the page URL
+    itself (with 'page:' prefix), to be resolved by the fetch worker via
+    og:image/first-image extraction.  classify_link itself never does
+    network I/O.
     """
     if not link:
         return "none", None
 
-    # Compound links: "image_url||play-loop://audio.mp3"
-    # Take the first part as the thumbnail source
+    # Compound links: "a||b[||c...]" — parts in ANY order (audio first,
+    # event first, 'no-click' filler, then the image, etc.).  Pick the
+    # first part that can produce a thumbnail; remember the type if a
+    # later part is richer (image > youtube > video > web).
     if "||" in link:
-        parts = link.split("||")
-        img_part = parts[0].strip()
-        # Recurse on just the image part
-        return classify_link(img_part)
+        parts = [p.strip() for p in link.split("||")]
+        best = None
+        for part in parts:
+            if not part or part == "no-click":
+                continue
+            lt, tu = classify_link(part)
+            if lt == "none":
+                continue
+            if tu is None and lt != "web":
+                # non-image part (audio/event) — nothing fetchable here
+                continue
+            rank = {"image": 0, "youtube": 1, "video": 2, "web": 3}.get(lt, 9)
+            if best is None or rank < best[2]:
+                best = (lt, tu, rank)
+        if best:
+            return best[0], best[1]
+        return "none", None
 
     # Special protocols — interactive://, event://, play-loop://
     if "://" in link and not link.startswith("http"):
@@ -102,16 +134,26 @@ def classify_link(link):
             return "wiki", thumb_url
         return "wiki", None
 
-    # wikireading.ru — not Wikipedia, no API
+    # wikireading.ru — no API; og:image extraction at fetch time
     if "wikireading.ru" in link:
-        return "wiki", None
+        return "web", "page:" + link
 
-    # Other web links
+    # tenor.com — the main GIF is the first media.tenor.com <img> on the
+    # page (no og:image).  Fetched via page-image extraction at fetch time.
+    if "tenor.com" in link:
+        return "web", "page:" + link
+
+    # Fandom wikis (bleach.fandom.com, etc.) — MediaWiki PageImages gives
+    # the curated lead image; page HTML 403s non-browser UAs.  Resolved
+    # at fetch time via the api.php pageimages prop.
+    if "fandom.com" in link:
+        return "wiki", "fandomapi:" + link
+
+    # Other web links — resolve via og:image / first image at fetch time
     if link.startswith("http"):
-        return "web", None
+        return "web", "page:" + link
 
     return "none", None
-
 
 # Wikipedia REST API summary endpoint.
 # Returns JSON with 'thumbnail' and 'extract' fields.
@@ -147,6 +189,41 @@ def _cache_key(url):
     return hashlib.md5(url.encode()).hexdigest() + ".png"
 
 
+def _load_image_bytes(raw):
+    """Decode raw image bytes into a pygame Surface.
+
+    Fast path: pygame's SDL_image (JPEG/PNG/GIF/BMP).  Fallback: Pillow
+    (WEBP/AVIF and other formats SDL_image can't handle), converted to
+    raw RGB(A) bytes.  Returns None if both fail.
+    """
+    try:
+        surf = pygame.image.load(io.BytesIO(raw))
+        # Paletted (8-bit) GIFs/PNGs can't be smoothly scaled — promote
+        # to 32-bit.  convert(32) with an explicit depth does not
+        # reference the display surface.
+        if surf.get_bitsize() < 24:
+            surf = surf.convert(32)
+        return surf
+    except pygame.error:
+        pass
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if img.mode in ("P", "L", "LA"):
+            img = img.convert("RGBA")
+        if img.mode == "RGBA":
+            surf = pygame.image.frombytes(img.tobytes(), img.size, "RGBA")
+        else:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            surf = pygame.image.frombytes(img.tobytes(), img.size, "RGB")
+        return surf
+    except Exception as e:
+        log.debug("ThumbnailCache: image decode failed: %s", e)
+        return None
+
+
 def _fetch_url(url, timeout=REQUEST_TIMEOUT):
     """Fetch raw bytes from a URL."""
     req = urllib.request.Request(url, headers={
@@ -154,6 +231,160 @@ def _fetch_url(url, timeout=REQUEST_TIMEOUT):
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+# ── Web page image extraction (og:image / twitter:image / first <img>) ──────
+
+_OG_IMAGE_RE = re.compile(
+    r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+    re.IGNORECASE)
+_OG_IMAGE_RE_REV = re.compile(
+    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
+    re.IGNORECASE)
+_TWITTER_IMAGE_RE = re.compile(
+    r'<meta\s+(?:property|name)=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+    re.IGNORECASE)
+_TWITTER_IMAGE_RE_REV = re.compile(
+    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']twitter:image["\']',
+    re.IGNORECASE)
+_IMG_TAG_RE = re.compile(
+    r'<img\s[^>]*src=["\']([^"\']+)["\']', re.IGNORECASE)
+
+# media.tenor.com main-content GIFs; inline JSON also embeds itemurl/imageurl
+_TENOR_GIF_RE = re.compile(
+    r'https?://media[0-9]?\.tenor\.com/[^"\'\s<>]+?\.gif')
+
+
+def _tenor_image_url(text):
+    """Extract the main GIF URL from a tenor.com view page.
+
+    The page embeds per-item JSON with variant URLs; slashes are
+    escaped as \\u002F.  The FIRST 'tinygif' in the document belongs to
+    the main item (subsequent ones are recommendations) and is ~220px
+    / ~100-500KB — ideal thumbnail source (the full GIF can be 7MB+).
+    Falls back to the first media.tenor.com GIF in document order.
+    """
+    for m in re.finditer(r'tinygif', text):
+        seg = text[m.end():m.end() + 250]
+        u = re.search(
+            r'https?:(?:\\u002F|/)(?:\\u002F|/)'
+            r'media[0-9]?\.tenor\.com'
+            r'(?:\\u002F|[^"\'\s<>\\])+',
+            seg)
+        if u:
+            return u.group(0).replace("\\u002F", "/")
+    m = _TENOR_GIF_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _resolve_relative(url, base):
+    """Resolve a possibly-relative image URL against a page URL."""
+    if url.startswith("//"):
+        return "https:" + url
+    if not url.startswith(("http://", "https://")):
+        return urllib.parse.urljoin(base.split("?")[0].split("#")[0], url)
+    return url
+
+
+# Analytics/tracking pixel domains — never legitimate thumbnails
+_TRACKER_URL_RE = re.compile(
+    r'(?:mc\.yandex\.(?:ru|com)|an\.yandex\.(?:ru|com)|'
+    r'google-analytics\.com|googletagmanager\.com|'
+    r'c\.bing\.net|facebook\.com/tr|px\.ads\.linkedin\.com)',
+    re.IGNORECASE)
+
+
+def _extract_page_image(html, page_url, is_tenor=False):
+    """Extract the main image URL from a web page's HTML.
+
+    Order: og:image → twitter:image → (tenor: first media.tenor.com GIF) →
+    first non-SVG <img>.  Tracker/analytics pixels are skipped.
+    Returns an absolute URL or None.
+    """
+    try:
+        text = html.decode("utf-8", errors="replace")
+    except Exception:
+        text = html.decode("latin-1", errors="replace")
+
+    for pat in (_OG_IMAGE_RE, _OG_IMAGE_RE_REV,
+                _TWITTER_IMAGE_RE, _TWITTER_IMAGE_RE_REV):
+        m = pat.search(text)
+        if m and m.group(1):
+            return _resolve_relative(m.group(1), page_url)
+
+    if is_tenor:
+        url = _tenor_image_url(text)
+        if url:
+            return url
+
+    # Fallback: first non-SVG <img> (site logos/icons are SVGs,
+    # analytics pixels live on tracker domains)
+    for m in _IMG_TAG_RE.finditer(text):
+        src = m.group(1)
+        if src.lower().split("?")[0].endswith(".svg"):
+            continue
+        # data: URIs are not fetchable thumbnails
+        if src.startswith("data:"):
+            continue
+        if _TRACKER_URL_RE.search(src):
+            continue
+        return _resolve_relative(src, page_url)
+
+    return None
+
+
+def _fetch_page_image(page_url, timeout=REQUEST_TIMEOUT):
+    """Fetch a web page and return the main image's raw bytes, or None."""
+    try:
+        html = _fetch_url(page_url, timeout=timeout)
+    except Exception as e:
+        log.debug("ThumbnailCache: page fetch failed for %s: %s", page_url, e)
+        return None
+    img_url = _extract_page_image(html, page_url,
+                                  is_tenor="tenor.com" in page_url)
+    if not img_url:
+        return None
+    try:
+        return _fetch_url(img_url, timeout=timeout)
+    except Exception as e:
+        log.debug("ThumbnailCache: page image fetch failed for %s: %s",
+                  img_url, e)
+        return None
+
+
+# ── Fandom wiki lead image via MediaWiki api.php (page HTML 403s bots) ──────
+
+def _fetch_fandom_image(fandom_url, timeout=REQUEST_TIMEOUT):
+    """Fetch a Fandom wiki page's lead image via the MediaWiki API.
+
+    Fandom serves MediaWiki, so api.php?action=query&prop=pageimages
+    returns the curated lead image ("most relevant") at a requested
+    size.  The wiki page itself returns 403 to non-browser user agents,
+    so the API is the reliable route.
+    """
+    try:
+        parsed = urllib.parse.urlparse(fandom_url)
+        wiki = f"{parsed.scheme}://{parsed.netloc}"
+        title = urllib.parse.unquote(parsed.path.split("/wiki/")[-1])
+        if not title or title == parsed.path:
+            return None
+        q = urllib.parse.urlencode({
+            "action": "query", "format": "json", "formatversion": "2",
+            "titles": title, "prop": "pageimages", "pithumbsize": "640",
+        })
+        data = json.loads(_fetch_url(f"{wiki}/api.php?{q}", timeout=timeout))
+        pages = data.get("query", {}).get("pages", [])
+        if not pages:
+            return None
+        thumb = pages[0].get("thumbnail") or {}
+        src = thumb.get("source")
+        if not src:
+            return None
+        return _fetch_url(src, timeout=timeout)
+    except Exception as e:
+        log.debug("ThumbnailCache: fandom api fetch failed for %s: %s",
+                  fandom_url, e)
+        return None
 
 
 def _extract_video_frame(url, timeout=REQUEST_TIMEOUT):
@@ -371,6 +602,21 @@ class ThumbnailCache:
                     raise ValueError("video frame extraction failed")
                 src_surf = pygame.image.load(io.BytesIO(frame_bytes))
 
+            elif url.startswith("page:"):
+                # Web page (tenor.com and general links) — og:image /
+                # first-image extraction
+                img_raw = _fetch_page_image(url[len("page:"):])
+                if img_raw is None:
+                    raise ValueError("no page image found")
+                src_surf = _load_image_bytes(img_raw)
+
+            elif url.startswith("fandomapi:"):
+                # Fandom wiki — lead image via MediaWiki api.php
+                img_raw = _fetch_fandom_image(url[len("fandomapi:"):])
+                if img_raw is None:
+                    raise ValueError("no fandom image found")
+                src_surf = _load_image_bytes(img_raw)
+
             elif url.startswith("wiki://api:"):
                 # Wikipedia: fetch REST API summary, get thumbnail + extract
                 api_url = url[len("wiki://api:"):]
@@ -432,6 +678,11 @@ class ThumbnailCache:
         """Return cached Wikipedia extract text for an object, or None."""
         with self._lock:
             return self._extracts.get(obj_id)
+
+    def has_failed(self, obj_id):
+        """True if a fetch was attempted for this object and failed."""
+        with self._lock:
+            return obj_id in self._failed
 
     def get_link_type(self, link):
         """Return the link type string for rendering indicators."""

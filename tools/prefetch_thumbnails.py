@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""
-prefetch_thumbnails.py — pre-populate the player's thumbnail cache.
+"""prefetch_thumbnails.py — pre-populate the player's thumbnail cache.
+
+Operator utility: run this offline before deployment to avoid the lazy
+background fetch delay on first display of each object's thumbnail.
 
 Iterates through all objects in changelog.json, classifies each link,
 and fetches/resizes the thumbnail for every object that has one.
-This avoids the lazy background fetch delay on first display.
 
 Supports ALL entry types:
   - youtube:     YouTube video → mqdefault thumbnail from img.youtube.com
@@ -166,6 +167,17 @@ def fetch_thumbnail_bytes(url, original_link=None):
     """
     link_type, _ = classify_link(url)
 
+    # ── Web pages via page-image extraction (tenor.com, general links) ──
+    if url.startswith("page:"):
+        from floor796_kiosk.thumbnails import _fetch_page_image
+        return _fetch_page_image(url[len("page:"):], timeout=REQUEST_TIMEOUT)
+
+    # ── Fandom wikis via MediaWiki api.php pageimages ──
+    if url.startswith("fandomapi:"):
+        from floor796_kiosk.thumbnails import _fetch_fandom_image
+        return _fetch_fandom_image(url[len("fandomapi:"):],
+                                   timeout=REQUEST_TIMEOUT)
+
     # ── YouTube: already resolved to img.youtube.com thumbnail URL ──
     if link_type == "youtube":
         return _fetch_url(url)
@@ -247,61 +259,36 @@ def fetch_thumbnail_bytes(url, original_link=None):
 def resolve_thumb_url(link):
     """Resolve a changelog 'l' field to a thumbnail URL for ALL types.
 
-    This extends classify_link by also handling:
-      - Compound links: checks ALL ||-separated parts for an image
-      - web/interactive/wiki: generates a cache key from the original link
+    classify_link is the single source of truth: it already handles
+    compound links (any part order), tenor/fandom pages, and returns
+    fetchable thumb URLs ('page:'/'fandomapi:'/'wiki://api:' prefixed)
+    for everything that can produce a thumbnail.  This function only
+    adds the legacy fallbacks for types classify_link can't resolve.
 
     Returns (link_type, thumb_url, cache_key_source) where cache_key_source
-    is the string used for the cache filename hash (thumb_url or original link).
+    is the string used for the cache filename hash.  It equals thumb_url
+    whenever one exists, so runtime and prefetch share one key space.
     """
     if not link:
         return "none", None, None
 
-    # Compound links: "image_url||play-loop://audio.mp3" or
-    # "play-loop://audio.mp3||image_url"
-    # Try ALL parts, return the first one that produces a thumbnail.
-    if "||" in link:
-        parts = [p.strip() for p in link.split("||")]
-        for part in parts:
-            lt, tu = classify_link(part)
-            if tu:
-                return lt, tu, tu
-        # No part produced a direct thumbnail URL; try og:image on each
-        # http part as a fallback.
-        for part in parts:
-            lt, _ = classify_link(part)
-            if lt in ("web", "interactive", "wiki") and part.startswith("http"):
-                return lt, part, part
-            if part.startswith("interactive://"):
-                return "interactive", part, part
-        # All parts are non-image (e.g. event:// or play-loop://audio only)
-        # Use the first part's type
-        lt, _ = classify_link(parts[0])
-        return lt, None, None
-
-    # Single link
     lt, thumb_url = classify_link(link)
 
-    # Types where classify_link already gives us a fetchable URL
-    if lt in ("youtube", "image", "video"):
+    # classify_link resolved something fetchable — use it verbatim
+    if thumb_url is not None:
         return lt, thumb_url, thumb_url
 
-    # Wikipedia with REST API URL
-    if lt == "wiki" and thumb_url and thumb_url.startswith("wiki://api:"):
-        return lt, thumb_url, thumb_url
+    # Legacy fallbacks for types classify_link returns no URL for:
 
     # Wikipedia / wikireading.ru without REST API → try og:image on the URL
-    if lt == "wiki" and thumb_url is None:
+    if lt == "wiki":
         return lt, link, link
 
-    # web and interactive: thumbnail URL IS the page URL (for og:image fetch)
-    if lt in ("web", "interactive"):
-        if link.startswith("http"):
-            return lt, link, link
-        if link.startswith("interactive://"):
-            return lt, link, link
+    # interactive:// paths → floor796.com page, og:image extraction
+    if lt == "interactive" and link.startswith(("interactive://", "http")):
+        return lt, link, link
 
-    # event://, none, etc.
+    # event://, play-loop://, none, etc.
     return lt, None, None
 
 

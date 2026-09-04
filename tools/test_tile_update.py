@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Sandbox test for the changelog-aware tile_manager.
+"""Regression tests for the changelog-aware tile_manager (v2.4.1+).
+
+Runs against a fake floor796 site served from a local HTTP server, in a
+gitignored scratch directory — no network access needed.
 
 Serves a fake floor796 site from a local HTTP server and runs
 check_and_update() against it in a scratch install dir:

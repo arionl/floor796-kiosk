@@ -1047,13 +1047,18 @@ class ObjectHighlighter:
 
         link_type, _ = classify_link(seg.link)
         # All link types that can produce a visual thumbnail:
-        # images, YouTube, video frame captures, and Wikipedia images
-        has_thumb = link_type in ("image", "youtube", "video", "wiki")
+        # images, YouTube, video frame captures, Wikipedia/Fandom images,
+        # and web pages (tenor GIFs, og:image) resolved at fetch time
+        has_thumb = link_type in ("image", "youtube", "video", "wiki", "web")
 
         # Try to get the thumbnail surface
         thumb_surf = None
         if has_thumb:
             thumb_surf = self._thumbs.get(seg.obj_id, seg.link)
+            if thumb_surf is None and self._thumbs.has_failed(seg.obj_id):
+                # Fetch attempted and failed — don't reserve thumbnail
+                # space or pulse a placeholder forever
+                has_thumb = False
 
         # Wikipedia extract text (if available)
         extract_text = None

@@ -5,6 +5,54 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## v2.4.3 — Thumbnail fixes: compound links, tenor, fandom (2026-09-03)
+
+### Fixed
+- **Compound links with audio/event first** — `classify_link` took the
+  first `||`-separated part blindly; when the author lists the audio or
+  event part first (12 of 15 compound links in the changelog, including
+  all six `Hologram #N` entries), the object got no thumbnail even
+  though an image was present in a later part.  All parts are now
+  scanned and the best thumbnail source picked regardless of order
+  (image > YouTube > video frame > web page).
+- **tenor.com links never fetched a thumbnail** — tenor pages carry no
+  og:image; the main GIF is the first `media.tenor.com` image in the
+  page.  The extractor now finds it directly (in document order).
+- **fandom.com links never fetched a thumbnail** — Fandom wiki pages
+  return 403 to non-browser user agents, so og:image scraping cannot
+  work.  Fandom serves MediaWiki, so the thumbnail now comes from
+  `api.php?action=query&prop=pageimages` — the curated lead image
+  ("most relevant" picture) at 640px.
+- **General web links never fetched a thumbnail at runtime** — only the
+  offline prefetch tool did og:image extraction; the running kiosk
+  showed nothing for web-type links.  Runtime now resolves web pages
+  via og:image → twitter:image → first non-SVG `<img>`.
+- **Analytics pixels cached as thumbnails** — the first-`<img>` fallback
+  now skips known tracker domains (mc.yandex.ru, google-analytics.com,
+  etc.).  Previously the wikireading.ru entry would have cached a 1×1
+  Yandex tracking pixel.
+- **wikireading.ru** reclassified from wiki (no fetch) to web-page
+  extraction; its pages contain no real image, so it now cleanly gets
+  no thumbnail instead of a tracker pixel.
+
+### Changed
+- **Unified runtime/prefetch cache keys** — `classify_link` is now the
+  single source of truth for both classification and thumbnail URL
+  resolution.  Page/API URLs carry a scheme prefix (`page:`,
+  `fandomapi:`, `wiki://api:`) and the same string is hashed for the
+  disk-cache filename in both the runtime cache and the prefetch tool,
+  so prefetched files are always found at runtime (previously the two
+  used different key spaces for web/wiki types).
+- **Failed web fetches collapse the panel gracefully** — when a web
+  thumbnail fetch fails (bot-blocked sites), the info panel renders at
+  no-thumbnail size instead of reserving space and pulsing a loading
+  placeholder forever.
+- **Image decode fallback** — runtime thumbnail decoding now falls back
+  to Pillow (WEBP/AVIF) when SDL_image can't handle the format; the
+  prefetch tool's decoder remains available for HEIC/SVG.
+
+---
+
 ## v2.4.2 — Hologram room fixes (2026-09-03)
 
 ### Fixed

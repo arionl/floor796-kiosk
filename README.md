@@ -117,7 +117,7 @@ floor796-kiosk/
 │   ├── content_mask.py           Content density mask generator
 │   ├── hologram.py               Hologram scene overlay
 │   ├── highlighter.py            Object highlighter (804 objects, LRU selection)
-│   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki)
+│   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki, tenor, fandom, web)
 │   ├── cpu_affinity.py           big.LITTLE CPU core pinning
 │   └── stats/
 │       ├── __init__.py
@@ -134,16 +134,16 @@ floor796-kiosk/
 │   ├── strips/                   Decoded frame strips (BMP)
 │   ├── content_mask.npz          Pixel-level content density mask
 │   └── thumbnails/               Resized label thumbnails
-├── tools/                        Simulations & CLI tools
-│   ├── kiosk_status.py           Query the stats API from CLI
-│   ├── prefetch_thumbnails.py    Pre-fetch all thumbnails offline (all link types)
-│   ├── sim_heatmap.py            Wanderer heatmap simulation + visualization
-│   ├── sim_wander.py             Wanderer coverage simulation
-│   ├── sim_prefetch.py           Tile prefetch strategy simulation
-│   ├── sim_prefetch_v3.py        Extended prefetch simulation
-│   ├── simulate_wander.py         Early wanderer coverage simulation
-│   ├── test_hologram_fixes.py     Hologram/highlighter regression tests (headless)
-│   └── test_tile_update.py        Tile update engine tests (local fake server)
+├── tools/                        Utilities, tests & simulations
+│   ├── kiosk_status.py           [Operator] Query the stats API from CLI
+│   ├── prefetch_thumbnails.py    [Operator] Pre-fetch all thumbnails offline (all link types)
+│   ├── test_tile_update.py       [Test] Tile update engine regression suite (local fake server)
+│   ├── test_hologram_fixes.py    [Test] Hologram/highlighter regression suite (headless)
+│   ├── sim_wander.py             [Maintained] Wanderer coverage simulation
+│   ├── sim_heatmap.py            [Maintained] Wanderer heatmap simulation + visualization
+│   ├── sim_prefetch_v3.py        [Maintained] Tile prefetch/cache eviction simulation
+│   ├── sim_prefetch.py           [Legacy] First prefetch sim; wrong eviction model — see v3
+│   └── simulate_wander.py        [Legacy] Pre-refactor wanderer sim; superseded by sim_wander/sim_heatmap
 ├── deploy/                       Installation & systemd
 │   ├── install.sh                One-shot installer for fresh Pi/OrangePi
 │   ├── run.sh                    Boot wrapper (KMSDRM or X11 fallback)
@@ -271,11 +271,18 @@ random sampling, no scoring weights.
 | YouTube | `mqdefault.jpg` from `img.youtube.com` |
 | Image | Direct download (imgur, etc.) |
 | Video | Frame extraction via `ffmpeg` at ~1s timestamp |
+| Compound | All `\|\|`-separated parts scanned (any order); best image source picked |
 | Wikipedia | REST API (`/api/rest_v1/page/summary/`) returns thumbnail + text extract |
+| Fandom wikis | MediaWiki `api.php` `pageimages` lead image (page HTML 403s bots) |
+| Tenor | Item's `tinygif` (~220px) from embedded page JSON — the full GIF is 7MB+ |
 | Interactive | `og:image` from `floor796.com/interactive/` pages |
-| Web | HTML `og:image` → `twitter:image` → first `<img>` |
+| Web | HTML `og:image` → `twitter:image` → first non-SVG `<img>` (tracker domains skipped) |
 | SVG | Rendered to PNG via `cairosvg` |
 | AVIF / HEIC | Decoded via `pillow-heif` or native Pillow 12+ |
+
+Failed web fetches (bot-blocked sites like IMDb) degrade gracefully: the
+panel renders at no-thumbnail size rather than showing an eternal
+loading placeholder.
 
 Thumbnails are cached in `cache/thumbnails/` and fetched in background threads.
 
@@ -475,19 +482,47 @@ cd floor796-kiosk
 python3 -m floor796_kiosk --fullscreen
 ```
 
-### Simulation tools
+### Tools & simulations
+
+The `tools/` directory holds three kinds of scripts. Each script's module
+docstring carries the same status tag as below.
+
+**Operator utilities** — useful to anyone running a kiosk, no display or
+simulated time required:
 
 ```bash
-# Simulate 1 hour of wandering and generate a heatmap
-cd floor796-kiosk
-python3 tools/sim_heatmap.py --hours 1 --output heatmap.png
-
-# Simulate wanderer coverage
-python3 tools/sim_wander.py --hours 2
-
-# Check kiosk status via API
+# Live status of a running kiosk (one-shot, watch mode, health, heatmap)
 python3 tools/kiosk_status.py --host 127.0.0.1
+python3 tools/kiosk_status.py --watch 2 --health
+
+# Pre-fetch every object thumbnail offline, before deployment
+python3 tools/prefetch_thumbnails.py
 ```
+
+**Test suites** — run before deploying changes; both are self-contained
+(fake HTTP server / headless pygame) and exit non-zero on failure:
+
+```bash
+python3 tools/test_tile_update.py     # tile update engine (24 checks)
+python3 tools/test_hologram_fixes.py  # hologram + highlighter (40 checks)
+```
+
+**Maintained simulations** — import the real classes from the
+`floor796_kiosk` package and are kept current with it. Use these for
+wanderer/cache work:
+
+```bash
+cd floor796-kiosk
+python3 tools/sim_wander.py --hours 2            # coverage / directional bias
+python3 tools/sim_heatmap.py --hours 1 --output heatmap.png
+python3 tools/sim_prefetch_v3.py                 # tile cache eviction model
+```
+
+**Legacy simulations** — kept for historical reference only:
+`sim_prefetch.py` (first prefetch sim; its eviction model was wrong, which
+is why v3 exists) and `simulate_wander.py` (pre-refactor wanderer sim,
+superseded by `sim_wander.py`/`sim_heatmap.py`). Don't start new work
+from these.
 
 ### Building the content mask manually
 
