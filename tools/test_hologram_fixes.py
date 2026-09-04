@@ -64,8 +64,10 @@ if REAL_SCENES:
         check(f"real scene validates: {name}", overlay._validate_raw(raw))
     raw = open(REAL_SCENES[0], "rb").read()
 else:
-    # Fallback: structurally valid synthetic blob (not decodable)
-    raw = struct.pack(">61I", *([5000] * 60 + [2000])) + b"\x00" * 7000
+    # Fallback: structurally valid synthetic blob (not decodable).
+    # blob1 (lengths[60]=4000) must span more than half the file so the
+    # half-file truncation test actually removes blob2's space.
+    raw = struct.pack(">61I", *([5000] * 60 + [4000])) + b"\x00" * 4500
     check("synthetic structural blob validates", overlay._validate_raw(raw))
 
 check("truncated header rejected",
