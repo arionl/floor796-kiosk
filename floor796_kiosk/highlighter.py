@@ -43,13 +43,8 @@ MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
 RECENT_BLACKLIST = 12.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
-# Panel exclusion zone: objects whose bbox overlaps this rectangle in
-# the bottom-right corner are skipped during selection, since they'd
-# be visually hidden behind the info panel that shows title, thumbnail,
-# and link type. Covers the maximum panel footprint (thumbnail + 2-line
-# title + wiki extract + margin).
-PANEL_EXCLUDE_W = 380    # panel width + margin
-PANEL_EXCLUDE_H = 360    # max panel height + margin (with thumbnail)
+# Panel exclusion zone: see the PANEL_EXCLUDE_* constants defined after
+# the panel layout block below (they derive from those constants).
 
 # Edge viewing buffer: at the END of the highlight duration, the object
 # must still have at least this fraction of the viewport as clearance
@@ -115,6 +110,39 @@ PANEL_H_WITH_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_THUMB +
 PANEL_H_NO_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_FOOTER +
                     PANEL_PADDING * 2)                   # ~78
 
+# Panel exclusion zone: objects whose bbox overlaps this rectangle in
+# the bottom-right corner are skipped during selection (and abort the
+# highlight mid-show), since they'd be visually hidden behind the opaque
+# info panel.  Derived from the worst-case panel footprint above so it
+# can never under-count:
+#   panel_w = max(PANEL_W, PANEL_W_NO_THUMB)            = 360
+#   panel_h = 2-line title + date + 16 + thumb + 10
+#             + 3-line extract + 10 + footer + padding  ≈ 362
+# Exclusion box = panel + PANEL_MARGIN on all sides:
+#   360 + 2·20 = 400 wide, ~362 + 2·20 ≈ 402 tall.
+# The old hand-written 380×360 under-counted height by ~42px, letting
+# objects in that band be selected (and then hidden) behind the panel.
+PANEL_EXCLUDE_W = max(PANEL_W, PANEL_W_NO_THUMB) + 2 * PANEL_MARGIN
+
+# Worst-case panel height, built bottom-up from the same pieces
+# _render_corner_panel() stacks (measured line heights at 1080p scale,
+# s=1.0; both sides scale by ui_scale in __init__):
+#   2-line title bar  2·17 + 12 (date) + 16 (gap)  =  62
+#   thumbnail         THUMB_H + 10                 = 210
+#   wiki extract      3·12 + 10                    =  46
+#   footer            PANEL_H_FOOTER               =  28
+#   bottom padding    PANEL_PADDING                =  16
+#                                                   ─────
+#   max panel height                                362
+#   + PANEL_MARGIN top & bottom                     +40 → 402
+# A small safety pad covers font-metric drift across pygame versions.
+PANEL_EXCLUDE_H = (2 * 17 + 12 + 16          # 2-line title bar
+                   + THUMB_H + 10            # thumbnail
+                   + 3 * 12 + 10             # 3-line wiki extract
+                   + PANEL_H_FOOTER          # footer
+                   + PANEL_PADDING           # bottom padding
+                   + 2 * PANEL_MARGIN        # screen margin
+                   + 8)                      # safety pad
 # Link type display metadata: (label, color)
 LINK_TYPE_META = {
     "youtube":     ("\u25b6 YouTube",       (255, 70, 70)),    # red
@@ -657,16 +685,33 @@ class ObjectHighlighter:
                     seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
-            # Panel occlusion: skip objects behind the bottom-right info
-            # panel. The panel is opaque and would hide the highlighted
-            # object (and its bounding box).
+            # Screen-space bbox for the panel check (viewport-relative).
             sx1 = seg.abs_x1 - vp_x1
             sy1 = seg.abs_y1 - vp_y1
             sx2 = seg.abs_x2 - vp_x1
             sy2 = seg.abs_y2 - vp_y1
+
+            # Panel occlusion: skip objects behind the bottom-right info
+            # panel. The panel is opaque and would hide the highlighted
+            # object (and its bounding box).
             if (sx2 > panel_x1 and sx1 < panel_x2 and
                     sy2 > panel_y1 and sy1 < panel_y2):
                 continue
+
+            # Predicted panel occlusion: the panel lives in a fixed
+            # screen corner, so wandering slides objects INTO it during
+            # the 10s highlight.  Predict the bbox position at the END
+            # of the highlight (same model as the edge-buffer check
+            # below) and skip objects that would be panel-occluded by
+            # then — they'd get hidden mid-highlight.
+            if predict_dist > 1:
+                future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
+                future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
+                future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
+                future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
+                if (future_x2 > panel_x1 and future_x1 < panel_x2 and
+                        future_y2 > panel_y1 and future_y1 < panel_y2):
+                    continue
 
             # Velocity prediction with edge buffer: skip objects that
             # would scroll too close to the screen edge during the
@@ -761,6 +806,27 @@ class ObjectHighlighter:
                              seg.obj_id, seg.title[:30], self._timer)
                     self._current_seg = None
                     self._state = STATE_IDLE
+                    self._timer = 0.0
+                    return
+
+                # Panel occlusion abort: the viewport can drift so the
+                # highlighted object slides behind the opaque corner
+                # info panel mid-highlight.  Unlike selection time,
+                # there is no prediction here — the panel is anchored
+                # to the screen, so a direct overlap test tells us the
+                # object is hidden RIGHT NOW.
+                px1, py1, px2, py2 = self._panel_rect()
+                sx1 = seg.abs_x1 - vp_x1
+                sy1 = seg.abs_y1 - vp_y1
+                sx2 = seg.abs_x2 - vp_x1
+                sy2 = seg.abs_y2 - vp_y1
+                if (sx2 > px1 and sx1 < px2 and
+                        sy2 > py1 and sy1 < py2):
+                    log.info("Panel-occlusion abort: obj %d '%s' drifted "
+                             "behind info panel at %.1fs",
+                             seg.obj_id, seg.title[:30], self._timer)
+                    self._current_seg = None
+                    self._state = STATE_PAUSE
                     self._timer = 0.0
                     return
 
