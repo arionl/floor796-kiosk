@@ -177,6 +177,23 @@ def parse_hologram_slot(title):
         return None
 
 
+# Changelog entries for teleport-room pads carry an event link like
+# 'event://pick-teleport-7||no-click||https://…'.  Groups: 1-based pad.
+_TELEPORT_LINK_RE = re.compile(r'^event://pick-teleport-(\d+)')
+
+
+def parse_teleport_link(link):
+    """Return the 1-based teleport pad number referenced by a changelog
+    event link, or None if the link is not a teleport pad."""
+    m = _TELEPORT_LINK_RE.match(link or '')
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 class ObjectSegment:
     """A per-tile bounding box for one object.
 
@@ -523,6 +540,7 @@ class ObjectHighlighter:
         # only worth highlighting while that scene is actually on.  The
         # provider lets us gate selection on live playback state.
         self._hologram_state_provider = None
+        self._teleport_state_provider = None
 
         # Timestamped view history: obj_id -> [timestamps]
         # Used for recency-weighted selection and stats reporting.
@@ -585,6 +603,17 @@ class ObjectHighlighter:
         slot N is the scene currently materialized/playing.
         """
         self._hologram_state_provider = provider
+
+    def set_teleport_state_provider(self, provider):
+        """Register a callable returning the live teleport index.
+
+        The provider returns TeleportRoom.live_index() — the 0-based
+        index of the teleport currently in its PLAY phase, or None.
+        When set, changelog objects linked 'event://pick-teleport-N'
+        are only selectable while pad N is playing live; an in-flight
+        highlight aborts when the scene dematerializes.
+        """
+        self._teleport_state_provider = provider
 
     def _panel_rect(self):
         """Return (px1, py1, px2, py2) of the info panel in screen coords.
@@ -672,6 +701,15 @@ class ObjectHighlighter:
                 # scene_idx is 0-based; slot numbers are 1-based
                 if holo.get('scene_idx') != slot - 1:
                     continue  # a different hologram is playing
+
+            # Teleport gating: pad objects ('event://pick-teleport-N')
+            # are only meaningful while teleport N plays live.
+            pad = parse_teleport_link(seg.link)
+            if pad is not None:
+                live = (self._teleport_state_provider()
+                        if self._teleport_state_provider else None)
+                if live != pad - 1:
+                    continue  # not this pad's live scene
 
             # Hard cooldown: skip if shown within RECENT_BLACKLIST seconds
             last = self._last_shown.get(seg.obj_id)
@@ -841,6 +879,21 @@ class ObjectHighlighter:
                     if (not holo or holo.get('state') == 'gap' or
                             holo.get('scene_idx') != slot - 1):
                         log.info("Hologram ended: obj %d '%s' dematerialized "
+                                 "at %.1fs", seg.obj_id, seg.title[:30],
+                                 self._timer)
+                        self._current_seg = None
+                        self._state = STATE_PAUSE
+                        self._timer = 0.0
+                        return
+
+                # Teleport segments: abort when the pad's live scene
+                # dematerializes (live_index goes None / moves on).
+                pad = parse_teleport_link(seg.link)
+                if pad is not None:
+                    live = (self._teleport_state_provider()
+                            if self._teleport_state_provider else None)
+                    if live != pad - 1:
+                        log.info("Teleport ended: obj %d '%s' dematerialized "
                                  "at %.1fs", seg.obj_id, seg.title[:30],
                                  self._timer)
                         self._current_seg = None

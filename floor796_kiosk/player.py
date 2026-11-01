@@ -60,7 +60,7 @@ except ImportError:
 
 from floor796_kiosk.paths import (
     INSTALL_DIR, ASSETS_DIR, TILE_DIR, TILE_META_PATH,
-    CONTENT_MASK_PATH, STRIP_DIR, HOLOGRAM_DIR, CHANGELOG_PATH,
+    CONTENT_MASK_PATH, STRIP_DIR, HOLOGRAM_DIR, TELEPORT_DIR, CHANGELOG_PATH,
     THUMBNAIL_DIR, ensure_dirs,
 )
 
@@ -1608,6 +1608,17 @@ def main():
         log.warning("Hologram overlay failed: %s", e)
         hologram = None
 
+    # ── Teleport room overlay (site-exact port of the tvOS room) ──
+    teleport = None
+    try:
+        from floor796_kiosk.teleport import TeleportRoom
+        teleport = TeleportRoom(TELEPORT_DIR, tiles_meta=tiles_meta)
+        teleport.prepare()
+        teleport.start_decoder()
+    except Exception as e:
+        log.warning("Teleport room failed: %s", e)
+        teleport = None
+
     status.show("Ready!", f"{len(cache.cache)} tiles loaded", progress=1.0)
     time.sleep(0.5)
 
@@ -1683,6 +1694,10 @@ def main():
         object_highlighter.set_hologram_state_provider(
             hologram.playback_state)
         log.info("Highlighter hologram gating enabled")
+    if object_highlighter and teleport:
+        object_highlighter.set_teleport_state_provider(
+            teleport.live_index)
+        log.info("Highlighter teleport gating enabled")
 
     # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
     mem_banner = None
@@ -1777,6 +1792,9 @@ def main():
             # Cycle hologram when animation loop restarts
             if hologram and prev_frame_idx > frame_idx:
                 hologram.cycle_next()
+            # Teleport room steps once per animation tick (12 fps).
+            if teleport:
+                teleport.update()
 
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
@@ -1871,6 +1889,8 @@ def main():
             hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
+        if teleport:
+            teleport.render(screen, pos_x, pos_y)
 
         # ── Object highlighter ──
         if object_highlighter:
