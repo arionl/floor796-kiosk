@@ -5,6 +5,32 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
+## Unreleased — Teleport room (Stream A of the v2.5 plan)
+
+### Added
+- **Teleporter room** (`floor796_kiosk/teleport.py`) — site-exact port
+  of the tvOS `Rooms.swift` implementation, verified against the live
+  site semantics: 289×412 overlay anchored `t2r4,618,15`+(-4,1), clip
+  polygon, 4-tick gap → 22-beat materialize (f0 at alpha t/21 with
+  sparkle column t) → 60-tick play ([f0×3, f1…f57]) → 22-beat
+  dematerialize (f58 held, alpha 1−min(1,t/14)) → next scene. Sparkle
+  slots diff the held frame vs the empty-room bg on a 10 px quant
+  grid; the black hide-triangle masks only the diff baselines. All
+  content downloads and caches on-device (list JSON, bg PNG, sprite
+  sheet, `.f796.br` scenes; current+next resident only, ~29 MB/scene).
+  Sprite compositing is the W3C canvas overlay blend in straight
+  alpha, clipped to the room polygon, with per-cell opaque-bbox
+  cropping (10–20 ms per transition beat on the dev host).
+- **Highlighter teleport gating** — objects linked
+  `event://pick-teleport-N` are selectable only while pad N plays
+  live, with mid-highlight abort on dematerialize (mirrors the
+  hologram-slot gating).
+- 16 headless tests (`tools/test_teleport.py`): phase machine at every
+  boundary, gap extension/skip, slot diffing, composite math, clip,
+  geometry.
+
+---
+
 ## v2.4.4 — Overwatch hero thumbnails (2026-09-03)
 
 ### Added
