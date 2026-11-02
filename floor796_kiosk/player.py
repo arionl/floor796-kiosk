@@ -1828,12 +1828,28 @@ def main():
     _last_slow_log = 0.0
     _frame_debug = os.environ.get("FLOOR796_FRAME_DEBUG", "")
 
+    # GC pause tracking (slow-frame attribution): record every
+    # collection's duration; slow frames report recent pauses.
+    _gc_pauses = []
+
+    def _gc_cb(phase, info):
+        if phase == 'start':
+            _gc_pauses.append(time.perf_counter())
+        elif _gc_pauses:
+            dur = (time.perf_counter() - _gc_pauses[-1]) * 1000
+            _gc_pauses[-1] = dur
+            del _gc_pauses[:-8]          # keep the last few
+
+    import gc as _gc_mod
+    _gc_mod.callbacks.append(_gc_cb)
+
     while running:
         _ft0 = time.perf_counter()
         dt = clock.tick(30) / 1000.0
         _t_tick = (time.perf_counter() - _ft0) * 1000   # vsync wait
         dt = min(dt, 1 / 15)
 
+        _t_ev0 = time.perf_counter()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -1871,6 +1887,8 @@ def main():
                     if event.key == pygame.K_RIGHT: pos_x += speed * dt
                     if event.key == pygame.K_UP:    pos_y -= speed * dt
                     if event.key == pygame.K_DOWN:  pos_y += speed * dt
+
+        _t_ev = (time.perf_counter() - _t_ev0) * 1000
 
         if pending_viewport:
             # External viewport pin (POST /viewport on the stats
@@ -2036,6 +2054,7 @@ def main():
         _t_high = (time.perf_counter() - _t_high0) * 1000
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
+        _t_post0 = time.perf_counter()
         if stats_collector and stats_collector.overlay_enabled:
             snap = stats_collector.snapshot()
             stats_overlay.render(screen, snap)
@@ -2043,6 +2062,7 @@ def main():
         # ── Persistent low-memory warning banner ──
         if mem_banner:
             mem_banner.render(screen)
+        _t_post = (time.perf_counter() - _t_post0) * 1000
 
         # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
         # The HTTP /screenshot endpoint signals a capture request; we copy
@@ -2086,11 +2106,12 @@ def main():
                          "highlighter=%.1f (rest=%.1f)",
                          _t_holo, _t_tele, _t_high,
                          _t_overlay - _t_holo - _t_tele - _t_high)
-                _accounted = (_t_blit + _t_overlay + _t_ss + _t_flip)
-                log.info("[FRAME] logic=%.1f tick=%.1f "
-                         "(unaccounted=%.1f)",
+                _accounted = (_t_blit + _t_overlay + _t_ss + _t_flip
+                              + _t_post)
+                log.info("[FRAME] logic=%.1f tick=%.1f ev=%.1f "
+                         "post=%.1f (unaccounted=%.1f)",
                          _t_blit0 - _ft0 - _t_tick,
-                         _t_tick,
+                         _t_tick, _t_ev, _t_post,
                          _ft_total - _accounted
                          - (_t_blit0 - _ft0))
                 if object_highlighter and \
@@ -2098,6 +2119,10 @@ def main():
                     log.info("[FRAME] highlighter parts: %s",
                              {k: round(v, 1) for k, v in
                               object_highlighter._perf_parts.items()})
+                _big_gc = [round(p, 1) for p in _gc_pauses[-4:]
+                           if isinstance(p, float) and p > 5.0]
+                if _big_gc:
+                    log.info("[FRAME] recent GC pauses ms: %s", _big_gc)
             _last_slow_log = time.perf_counter()
 
     cache.stop()
