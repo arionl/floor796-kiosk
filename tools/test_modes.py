@@ -31,9 +31,12 @@ class TestModeMachine(unittest.TestCase):
         m = ModeMachine(Mode.EXPLORING)
         self.assertIs(m.cycle(), Mode.WANDERING)
 
-    def test_pan_in_wandering_enters_navigating(self):
+    def test_pan_in_wandering_does_not_move_the_map(self):
+        # Kiosk rule (arion): arrows are inert in Wandering — pan only
+        # in Navigating.  The mode must not change either.
         m = ModeMachine()
-        self.assertIs(m.pan_started(), Mode.NAVIGATING)
+        self.assertIs(m.pan_started(), Mode.WANDERING)
+        self.assertFalse(m.allows_free_pan)
 
     def test_pan_in_navigating_stays(self):
         m = ModeMachine(Mode.NAVIGATING)

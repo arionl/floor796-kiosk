@@ -4,9 +4,11 @@
 Mirrors floor796-tvos GameViewController's mode semantics
 (docs/architecture.md §3.1):
 
-  Wandering   self-driving camera (A* tours); the default.
-  Navigating  user-driven pan; entered by a click from Wandering OR by
-              any pan while Wandering; a click advances to Exploring.
+  Wandering   self-driving camera (A* tours); the default.  Arrow
+              keys are inert here (kiosk rule) — SPACE enters
+              Navigating for manual pan.
+  Navigating  user-driven pan; entered by a click from Wandering; a
+              click advances to Exploring.
   Exploring   object-to-object navigation (see explorer.py); a click
               returns to Wandering, which resumes the tour from the
               current camera position.
@@ -29,8 +31,10 @@ _CYCLE_ORDER = (Mode.WANDERING, Mode.NAVIGATING, Mode.EXPLORING)
 
 class ModeMachine:
     """Select-press (SPACE) cycles Wandering → Navigating → Exploring →
-    Wandering.  Any pan in Wandering enters Navigating.  Resuming
-    Wandering continues the tour from the current camera — no snap-back.
+    Wandering.  Arrows are inert in Wandering (kiosk rule: the map
+    cannot be moved by hand until Navigating).  Resuming
+    Wandering continues the tour from the current camera — no
+    snap-back.
 
     Exactly the tvOS cycleMode() semantics:
       exploring → click → exit exploring + wander;
@@ -60,14 +64,14 @@ class ModeMachine:
         return self._mode
 
     def pan_started(self):
-        """A pan gesture began (arrow key in Wandering or Navigating).
+        """A pan gesture began (arrow key).
 
-        In Wandering this ENTERS Navigating (tvOS: any pan while
-        wandering).  In Navigating it stays Navigating.  In Exploring a
+        Arrows only pan in NAVIGATING (kiosk rule, arion: arrows in
+        Wandering must not move the map — SPACE first).  In Exploring a
         pan is not a pan — it is a directional JUMP; the mode is
-        unchanged and the caller routes the input to the Explorer."""
-        if self._mode is Mode.WANDERING:
-            self._mode = Mode.NAVIGATING
+        unchanged and the caller routes the input to the Explorer.
+        This method is mode-preserving; it exists so callers have one
+        choke point for pan semantics."""
         return self._mode
 
     def force(self, mode):

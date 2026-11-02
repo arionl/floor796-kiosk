@@ -1792,6 +1792,7 @@ def main():
     frame_interval = 1.0 / args.fps
     last_coverage_log = time.time()
     pending_viewport = []          # queue of viewport commands (HTTP)
+    pending_mode = []              # queue of mode changes (HTTP)
 
     log.info("Player ready. Map: %dx%d (%dx%d tiles), %d animated.",
              map_w, map_h, grid_cols, grid_rows, anim_count)
@@ -1810,6 +1811,9 @@ def main():
             # Viewport control hook: POST /viewport {"x":..,"y":..} or
             # {"resume": true} (applied on the main loop, next frame).
             stats_server.viewport_queue = pending_viewport
+            # Mode control hook: POST /mode {"mode": ...} (applied on
+            # the main loop, next frame — same path as SPACE).
+            stats_server.mode_queue = pending_mode
             stats_overlay = StatsOverlay(
                 args.width, args.height, grid_rows, grid_cols)
             log.info("Stats server: http://127.0.0.1:8796/stats")
@@ -1898,6 +1902,39 @@ def main():
     _last_slow_log = 0.0
     _frame_debug = os.environ.get("FLOOR796_FRAME_DEBUG", "")
 
+    def _enter_mode(new_mode):
+        """Apply a mode transition's side effects (shared by SPACE
+        cycling and the /viewport hook): wanderer drive, highlighter
+        enable/suspend, explorer anchor.  In NAVIGATING highlighting is
+        OFF (kiosk rule); WANDERING/EXPLORING have it on."""
+        nonlocal wandering
+        if new_mode is Mode.WANDERING:
+            if explorer is not None:
+                explorer.cancel_flight()
+            if object_highlighter:
+                object_highlighter.enabled = True
+                object_highlighter.resume_auto()
+            wandering = True
+            wanderer.x = pos_x
+            wanderer.y = pos_y
+        elif new_mode is Mode.NAVIGATING:
+            wandering = False
+            if object_highlighter:
+                object_highlighter.enabled = False
+        else:   # EXPLORING
+            wandering = False
+            if object_highlighter:
+                object_highlighter.enabled = True
+                object_highlighter.suspend_auto()
+            if explorer is not None:
+                sel = explorer.enter(pos_x + args.width / 2,
+                                     pos_y + args.height / 2)
+                log.info("explorer: exploring — '%s'",
+                         sel.title[:40] if sel else '(none)')
+                if sel is not None and object_highlighter:
+                    object_highlighter.set_explore_target(sel)
+        mode_toast.show(new_mode)
+
     # GC pause tracking (slow-frame attribution): record every
     # collection's duration; slow frames report recent pauses.
     _gc_pauses = []
@@ -1934,27 +1971,7 @@ def main():
                     _old = mode_machine.current
                     _new = mode_machine.cycle()
                     log.info('mode: %s -> %s', _old.value, _new.value)
-                    if _new is Mode.WANDERING:
-                        explorer.cancel_flight()
-                        if object_highlighter:
-                            object_highlighter.resume_auto()
-                        wandering = True
-                        wanderer.x = pos_x
-                        wanderer.y = pos_y
-                    elif _new is Mode.NAVIGATING:
-                        wandering = False
-                    else:   # EXPLORING
-                        wandering = False
-                        if object_highlighter:
-                            object_highlighter.suspend_auto()
-                        if explorer is not None:
-                            sel = explorer.enter(pos_x + args.width / 2,
-                                                 pos_y + args.height / 2)
-                            log.info("explorer: exploring — '%s'",
-                                     sel.title[:40] if sel else '(none)')
-                            if sel is not None and object_highlighter:
-                                object_highlighter.set_explore_target(sel)
-                    mode_toast.show(_new)
+                    _enter_mode(_new)
                 elif event.key == pygame.K_v:
                     wanderer.print_coverage()
                 elif event.key == pygame.K_s:
@@ -1996,9 +2013,9 @@ def main():
                                 if object_highlighter:
                                     object_highlighter.set_explore_target(
                                         jumped)
-                    else:
-                        # Wandering → pan switches to Navigating (the
-                        # machine did it); Navigating pans directly.
+                    elif _pm is Mode.NAVIGATING:
+                        # Pan is allowed in Navigating only — arrows
+                        # are inert in Wandering (kiosk rule).
                         wandering = False
                         speed = 500
                         if event.key == pygame.K_LEFT:  pos_x -= speed * dt
@@ -2008,6 +2025,19 @@ def main():
 
         _t_ev = (time.perf_counter() - _t_ev0) * 1000
 
+        if pending_mode:
+            # Remote mode control (POST /mode): same transitions as
+            # SPACE, target mode named directly.
+            m, pending_mode[:] = pending_mode[0], []
+            _target = {'wandering': Mode.WANDERING,
+                       'navigating': Mode.NAVIGATING,
+                       'exploring': Mode.EXPLORING}[m]
+            if mode_machine.current is not _target:
+                log.info('mode: %s -> %s (remote)',
+                         mode_machine.current.value, _target.value)
+                mode_machine.force(_target)
+                _enter_mode(_target)
+
         if pending_viewport:
             # External viewport pin (POST /viewport on the stats
             # server): center the camera on a map position and pause
@@ -2015,14 +2045,13 @@ def main():
             # or the SPACE key.
             cmd, pending_viewport[:] = pending_viewport[0], []
             if cmd.get('resume'):
-                wandering = True
                 mode_machine.force(Mode.WANDERING)
-                wanderer.x, wanderer.y = pos_x, pos_y
+                _enter_mode(Mode.WANDERING)
                 log.info('viewport: wandering resumed at %.0f,%.0f',
                          pos_x, pos_y)
             else:
-                wandering = False
                 mode_machine.force(Mode.NAVIGATING)
+                _enter_mode(Mode.NAVIGATING)
                 pos_x = max(0, min(map_w - args.width,
                                    float(cmd['x']) - args.width / 2))
                 pos_y = max(0, min(map_h - args.height,
@@ -2173,6 +2202,31 @@ def main():
             teleport.render(screen, pos_x, pos_y)
         _t_tele = (time.perf_counter() - _t_tele0) * 1000
         _t_high0 = time.perf_counter()
+
+        # ── Exploring: gray ghost boxes for other jump targets ──
+        # tvOS parity (HighlighterOverlayView ghost boxes): while
+        # exploring, other selectable objects in the viewport get a
+        # subtle gray outline so the next jump target is visible.
+        # Withheld during flight (tvOS withholds until the destination
+        # is rendered); the selected object's own segments are excluded
+        # by obj_id.
+        _t_ghost0 = time.perf_counter()
+        if (explorer is not None
+                and mode_machine.explorer_drives_camera
+                and explorer.selection is not None
+                and not explorer.is_flying):
+            _sel = explorer.selection
+            for _seg in explorer.viewport_objects(
+                    pos_x, pos_y, args.width, args.height):
+                if _seg.obj_id == _sel.obj_id:
+                    continue
+                pygame.draw.rect(
+                    screen, (110, 110, 122),
+                    pygame.Rect(int(_seg.abs_x1 - pos_x),
+                                int(_seg.abs_y1 - pos_y),
+                                int(_seg.abs_x2 - _seg.abs_x1),
+                                int(_seg.abs_y2 - _seg.abs_y1)), 1)
+        _t_ghost = (time.perf_counter() - _t_ghost0) * 1000
 
         # ── Object highlighter ──
         if object_highlighter:

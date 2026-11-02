@@ -312,6 +312,29 @@ class StatsHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "need x,y or resume:true"},
                                  400)
 
+        elif path == "/mode":
+            # Mode control (keyboard-equivalent for remote/debug use):
+            # {"mode": "wandering"|"navigating"|"exploring"} applies the
+            # same transition as the SPACE cycle target.
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, 400)
+                return
+            q = getattr(self.server, 'mode_queue', None)
+            if q is None:
+                self._send_json({"error": "mode control not available"},
+                                 501)
+                return
+            m = data.get('mode')
+            if m in ('wandering', 'navigating', 'exploring'):
+                q.append(m)
+                self._send_json({"mode": m})
+            else:
+                self._send_json(
+                    {"error": "mode must be wandering|navigating|"
+                              "exploring"}, 400)
+
         elif path == "/overlay/window":
             try:
                 data = json.loads(body) if body else {}
