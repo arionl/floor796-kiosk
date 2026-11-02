@@ -363,5 +363,28 @@ class TestPrecomputedTransitions(unittest.TestCase):
             (4 * 1016 + 15 - 4 + 4, 2 * 812 + 618 + 1 + 4))
 
 
+    def test_giveup_and_skip_keep_decode_chain_alive(self):
+        # Regression (on-device wedge): the gap give-up and skip
+        # branches must request the next scene's decode, else scenes
+        # stays empty and the room never cycles again.
+        room = make_room(items=3)
+        inject_scene(room, 0, with_transitions=False)
+        room.phase_frame = T.GAP_FRAMES * 8
+        room.update()     # give-up: materialize via fallback
+        self.assertEqual(room.phase, T.TeleportRoom.MATERIALIZE)
+        self.assertIn(1, room._scene_requests)
+        # run scene 0 out (mat 22 + play 60 + demat 22)
+        for _ in range(22 + 60 + 22):
+            room.update()
+        self.assertEqual(room.phase, T.TeleportRoom.GAP)
+        self.assertEqual(room.current, 1)
+        # no scenes at all -> skip branch advances AND requests decode
+        room._scene_requests.clear()
+        room.phase_frame = T.GAP_FRAMES * 8
+        room.update()
+        self.assertEqual(room.current, 2)
+        self.assertIn(2, room._scene_requests)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

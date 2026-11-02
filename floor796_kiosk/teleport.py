@@ -469,9 +469,20 @@ class TeleportRoom:
                         self.phase_frame = 1
                         self.held_frame = 0
                         self._show_transition(None, 0, 0.0, 0)
+                        # Keep the request-ahead chain alive — without
+                        # this the NEXT gap finds scenes empty and the
+                        # skip loop below starves forever (wedge seen
+                        # on-device: room went static after one slow
+                        # precompute).
+                        self._request_scene(
+                            (self.current + 1) % len(self.items))
                 elif self.phase_frame >= GAP_FRAMES * 8:
                     self.current = (self.current + 1) % len(self.items)
                     self.phase_frame = 0
+                    # Skipping a stuck/missing scene — kick a decode for
+                    # the new current so the chain recovers instead of
+                    # starving (scene decode auto-queues transitions).
+                    self._request_scene(self.current)
         elif self.phase == self.MATERIALIZE:
             if self.phase_frame >= MATERIALIZE_FRAMES:
                 # Past last beat (t=21 displayed on the previous tick);
