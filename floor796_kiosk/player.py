@@ -1629,6 +1629,7 @@ def main():
     frame_accumulator = 0.0
     frame_interval = 1.0 / args.fps
     last_coverage_log = time.time()
+    pending_viewport = []          # queue of viewport commands (HTTP)
 
     log.info("Player ready. Map: %dx%d (%dx%d tiles), %d animated.",
              map_w, map_h, grid_cols, grid_rows, anim_count)
@@ -1644,6 +1645,9 @@ def main():
             stats_collector = StatsCollector(
                 sorted(wanderer.animated_tiles), map_w, map_h)
             stats_server = start_stats_server(stats_collector)
+            # Viewport control hook: POST /viewport {"x":..,"y":..} or
+            # {"resume": true} (applied on the main loop, next frame).
+            stats_server.viewport_queue = pending_viewport
             stats_overlay = StatsOverlay(
                 args.width, args.height, grid_rows, grid_cols)
             log.info("Stats server: http://127.0.0.1:8796/stats")
@@ -1759,6 +1763,27 @@ def main():
                     if event.key == pygame.K_RIGHT: pos_x += speed * dt
                     if event.key == pygame.K_UP:    pos_y -= speed * dt
                     if event.key == pygame.K_DOWN:  pos_y += speed * dt
+
+        if pending_viewport:
+            # External viewport pin (POST /viewport on the stats
+            # server): center the camera on a map position and pause
+            # wandering so the view holds.  Resume via {"resume": true}
+            # or the SPACE key.
+            cmd, pending_viewport[:] = pending_viewport[0], []
+            if cmd.get('resume'):
+                wandering = True
+                wanderer.x, wanderer.y = pos_x, pos_y
+                log.info('viewport: wandering resumed at %.0f,%.0f',
+                         pos_x, pos_y)
+            else:
+                wandering = False
+                pos_x = max(0, min(map_w - args.width,
+                                   float(cmd['x']) - args.width / 2))
+                pos_y = max(0, min(map_h - args.height,
+                                   float(cmd['y']) - args.height / 2))
+                wanderer.x, wanderer.y = pos_x, pos_y
+                log.info('viewport: pinned to %.0f,%.0f (camera %.0f,%.0f)',
+                         cmd['x'], cmd['y'], pos_x, pos_y)
 
         if wandering:
             wanderer.update(dt)
