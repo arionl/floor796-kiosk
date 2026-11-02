@@ -154,7 +154,8 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     At 1080p (1920×1080 = ~2M px) with 4 GB, max_tiles=15 is tuned.
     At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
     so we need a larger cache. Scale linearly with viewport area, then
-    cap by available memory (each strip ~96 MB).
+    cap by available memory (each strip ~96 MB at 24-bit source, ~128 MB
+    after display-format conversion — budget uses the larger figure).
 
     On low-memory boards (e.g. 2 GB Pi 5), the memory cap MUST be able
     to drop below MAX_TILES_BASE — otherwise the budget is ignored and
@@ -184,7 +185,8 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
         # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
         reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
         mem_budget_mb = max(0, total_mem_mb - reserve_mb)
-        mem_cap = max(2, int(mem_budget_mb / 96))  # 96 MB per strip
+        # ~128 MB per strip after display-format (32-bit) conversion
+        mem_cap = max(2, int(mem_budget_mb / 128))
         return min(max_t, mem_cap, MAX_TILES_CAP)
 
     # 4 GB+ board: scale with viewport, cap at MAX_TILES_CAP.
@@ -404,6 +406,29 @@ class TileCache:
         self._needed_ids = set()
         self._last_margin_ids = set()
 
+    def _ensure_display_depth(self, surf):
+        """Convert a strip to the display pixel format ONCE, in the
+        worker, in GIL-friendly vertical slices.
+
+        Strips are stored 24-bit (~100 MB); the display is 32-bit.
+        Without conversion SDL re-converts the blitted region on EVERY
+        frame (dense viewports measured blit=10-11 ms vs ~5 after).
+        A single whole-surface convert is a ~150 MB GIL-held SDL op
+        (300 ms main-thread stall — measured), so blit in one-tile-row
+        slices with a yield between them; each slice is ~1.5 ms."""
+        if surf.get_bitsize() == self.display_depth:
+            return surf
+        w, h = surf.get_size()
+        target = pygame.Surface((w, h), 0, self.display_depth)
+        step = TILE_H
+        y = 0
+        while y < h:
+            sh = min(step, h - y)
+            target.blit(surf, (0, y), pygame.Rect(0, y, w, sh))
+            y += sh
+            time.sleep(0.01)          # yield the GIL between slices
+        return target
+
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
         # No-op on homogeneous SoCs like the Raspberry Pi 5.
@@ -434,6 +459,9 @@ class TileCache:
                 # Load 16-bit pre-converted strip from disk. No runtime
                 # conversion needed — prepare_strips() saved them as 16-bit.
                 surf = pygame.image.load(strip_path)
+                # Re-encode to the display format once (sliced — see
+                # _ensure_display_depth) so per-frame blits are copies.
+                surf = self._ensure_display_depth(surf)
                 _, h = surf.get_size()
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
@@ -562,7 +590,7 @@ class TileCache:
                     try:
                         surf = pygame.image.load(strip_path)
                         if surf.get_bitsize() != self.display_depth:
-                            surf = self._convert_to_depth(surf)
+                            surf = self._ensure_display_depth(surf)
                         _, h = surf.get_size()
                         num_frames = max(1, h // TILE_H)
                         self.cache[tid] = (surf, num_frames)
