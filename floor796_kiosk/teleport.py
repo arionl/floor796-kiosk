@@ -224,7 +224,8 @@ class TeleportRoom:
 
         self.scenes = {}
         self._loading = set()
-        self._scene_requests = []
+        self._scene_requests = []      # priority (runtime)
+        self._bg_requests = []         # boot-time pre-render jobs
         self._scene_lock = threading.Lock()
         self._decode_thread = None
         self._stop_event = threading.Event()
@@ -273,13 +274,19 @@ class TeleportRoom:
             self.ready = True
             log.info('teleport-room: ready at %.0f,%.0f (%d teleports)',
                      self.origin_x, self.origin_y, len(self.items))
+            self._prune_stale_transition_cache()
             self._decode_scene(0)
             self._decode_scene(1 % max(1, len(self.items)))
             # Scene 0's transitions are needed ~330 ms after boot (the
-            # first gap) — precompute them synchronously so the very
-            # first materialize never hits the slow render-path
-            # fallback.
+            # first gap) — load/build them synchronously so the very
+            # first materialize never hits the render-path fallback.
             self._precompute_transitions(0)
+            # Pre-render EVERY scene's transitions up-front (background,
+            # behind runtime requests): the render loop is left with
+            # nothing but blits.  Cold boot renders + persists; warm
+            # boot finds the cache and no-ops.
+            for idx in range(len(self.items)):
+                self._queue_background(('render', idx))
         except Exception as e:
             self.prepare_failed = True
             log.warning('teleport-room: prepare failed: %s', e)
@@ -332,33 +339,50 @@ class TeleportRoom:
         while not self._stop_event.is_set():
             idx = None
             transitions = False
+            render = False
             with self._scene_lock:
+                job = None
                 if self._scene_requests:
-                    job = self._scene_requests.pop(0)
-                    if isinstance(job, tuple):
-                        # ('trans', idx): precompute transitions for a
-                        # decoded scene (off the render thread).
-                        idx, transitions = job[1], True
+                    job = self._scene_requests.pop(0)   # runtime first
+                elif self._bg_requests:
+                    job = self._bg_requests.pop(0)
+                if isinstance(job, tuple):
+                    kind = job[0]
+                    idx = job[1]
+                    if kind == 'trans':
+                        transitions = True
                         if idx not in self.scenes:
                             idx = None
-                    else:
-                        idx = job
-                        if idx in self.scenes or idx in self._loading:
-                            idx = None
+                    else:               # 'render': boot pre-render
+                        render = True
+                elif job is not None:
+                    idx = job
+                    if idx in self.scenes or idx in self._loading:
+                        idx = None
             if idx is None:
                 time.sleep(0.05)
                 continue
-            if transitions:
+            if render:
+                self._render_and_cache(idx)
+            elif transitions:
                 self._precompute_transitions(idx)
             else:
                 self._decode_scene(idx)
 
     def _request_scene(self, idx):
+        """Runtime decode request — PRIORITY (front of the worker
+        queue, ahead of boot-time background pre-rendering)."""
         with self._scene_lock:
             if idx not in self.scenes and idx not in self._loading \
                     and idx not in [j for j in self._scene_requests
                                     if not isinstance(j, tuple)]:
-                self._scene_requests.append(idx)
+                self._scene_requests.insert(0, idx)
+
+    def _queue_background(self, job):
+        """Boot-time background work (scene pre-rendering) — drained
+        only when no runtime request is pending."""
+        with self._scene_lock:
+            self._bg_requests.append(job)
 
     def _request_transitions(self, idx):
         with self._scene_lock:
@@ -366,16 +390,96 @@ class TeleportRoom:
                     and self.scenes[idx].trans_mat is None:
                 self._scene_requests.append(('trans', idx))
 
+    # ─── transition disk cache ─────────────────────────────────────────
+    # Pre-rendered transition composites persist across launches (like
+    # tile strips / hologram scene cache): cold boot renders + saves
+    # every scene's 44 beats in the background; warm boot just loads.
+
+    _TRANS_VERSION = 'v1'
+
+    def _transition_dir(self, idx):
+        stem = os.path.splitext(self.items[idx]['file'])[0]
+        return os.path.join(self.cache_dir,
+                            'trans_' + self._TRANS_VERSION, stem)
+
+    def _trans_cached(self, idx):
+        d = self._transition_dir(idx)
+        return all(os.path.exists(os.path.join(d, f'{kind}_{i:02d}.png'))
+                   for kind in ('mat', 'demat')
+                   for i in range(MATERIALIZE_FRAMES))
+
+    def _prune_stale_transition_cache(self):
+        """Drop cached transition dirs for scenes no longer in the
+        site's list (file ids change when content updates)."""
+        root = os.path.join(self.cache_dir,
+                            'trans_' + self._TRANS_VERSION)
+        if not os.path.isdir(root):
+            return
+        keep = {os.path.splitext(it['file'])[0] for it in self.items}
+        for name in os.listdir(root):
+            if name not in keep:
+                import shutil
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                log.info('teleport-room: pruned stale transition cache '
+                         '(%s)', name)
+
+    def _save_transitions(self, idx, mat, demat):
+        d = self._transition_dir(idx)
+        os.makedirs(d, exist_ok=True)
+        for kind, surfs in (('mat', mat), ('demat', demat)):
+            for i, surf in enumerate(surfs):
+                pygame.image.save(surf, os.path.join(d, f'{kind}_{i:02d}.png'))
+
+    def _load_transitions(self, idx):
+        """Load persisted transition surfaces; None when incomplete."""
+        d = self._transition_dir(idx)
+        out = {}
+        for kind in ('mat', 'demat'):
+            surfs = []
+            for i in range(MATERIALIZE_FRAMES):
+                p = os.path.join(d, f'{kind}_{i:02d}.png')
+                if not os.path.exists(p):
+                    return None
+                surfs.append(
+                    pygame.image.load(p).convert_alpha())
+            out[kind] = surfs
+        return out['mat'], out['demat']
+
+    def _render_and_cache(self, idx):
+        """Boot-time job: ensure scene idx's transitions are rendered
+        and persisted, then drop its frames (scenes 0/1 stay resident
+        for the first cycles)."""
+        if self._trans_cached(idx):
+            return
+        if idx not in self.scenes:
+            self._decode_scene(idx)
+        scene = self.scenes.get(idx)
+        if scene is None:
+            return
+        if scene.trans_mat is None:
+            self._precompute_transitions(idx)
+        if idx >= 2:
+            self.scenes.pop(idx, None)   # free ~30 MB; runtime re-decodes
+
     def _precompute_transitions(self, idx):
-        """Build all 22 materialize + 22 dematerialize composites for a
-        scene in the worker thread.  Sparkle slots are generated ONCE
-        per transition (site semantics — beats share the slot set and
-        differ only in sprite column); fresh randomness comes from the
-        per-cycle decode (scenes are dropped after playing)."""
+        """Attach transition surfaces to a scene: load from the
+        persisted pre-render cache when present (warm boot / repeat
+        cycles), otherwise build all 22 materialize + 22 dematerialize
+        composites and save them.  Sparkle slots are generated ONCE per
+        transition (site semantics — beats share the slot set and
+        differ only in sprite column); the persisted cache freezes the
+        sparkle placement per scene (arion: loops are fixed, pre-render
+        everything up-front)."""
         scene = self.scenes.get(idx)
         if scene is None or scene.trans_mat is not None:
             return
         if self.sprites is None or self.bg_px is None:
+            return
+        cached = self._load_transitions(idx) if self.items else None
+        if cached is not None:
+            scene.trans_mat, scene.trans_demat = cached
+            log.info('teleport-room: transitions for scene %d loaded '
+                     'from cache', idx + 1)
             return
         t0 = time.perf_counter()
 
@@ -396,6 +500,11 @@ class TeleportRoom:
                       lambda t: 1 - min(1, t / FADE_DIV))
         scene.trans_mat = mat
         scene.trans_demat = demat
+        try:
+            self._save_transitions(idx, mat, demat)
+        except Exception as e:
+            log.warning('teleport-room: saving transitions for scene '
+                        '%d failed: %s', idx + 1, e)
         log.info('teleport-room: transitions for scene %d ready '
                  '(%.1fs)', idx + 1, time.perf_counter() - t0)
 

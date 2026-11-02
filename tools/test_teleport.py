@@ -11,6 +11,10 @@ import unittest
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
+import pygame  # noqa: E402
+pygame.init()
+pygame.display.set_mode((8, 8))
+
 import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,7 +29,8 @@ FAKE_TILES = {
 
 
 def make_room(items=7):
-    room = T.TeleportRoom('/tmp/f796_teleport_test_cache',
+    import tempfile
+    room = T.TeleportRoom(tempfile.mkdtemp(prefix='f796tt_'),
                           tiles_meta={'tiles': FAKE_TILES})
     room.items = [{'file': f't{i}.f796.br', 'title_en': f'T{i}', 'src': None}
                   for i in range(items)]
@@ -365,6 +370,48 @@ class TestPrecomputedTransitions(unittest.TestCase):
             (room.origin_x, room.origin_y),
             (4 * 1016 + 15 - 4 + 4, 2 * 812 + 618 + 1 + 4))
 
+
+    def test_transition_disk_cache_roundtrip(self):
+        import tempfile
+        cache = tempfile.mkdtemp(prefix='f796tt_cache_')
+
+        def build():
+            room = T.TeleportRoom(cache, tiles_meta={'tiles': FAKE_TILES})
+            room.items = [{'file': 't0.f796.br', 'title_en': 'T0',
+                           'src': None}]
+            room.sprites = np.zeros((T.SPRITE_H * T.SPRITE_VARIANTS,
+                                      T.SPRITE_W * T.SPRITE_COLS, 4),
+                                     dtype=np.uint8)   # no sparkles
+            room.bg_px = np.zeros((T.HEIGHT, T.WIDTH, 4), dtype=np.uint8)
+            room.clip_mask = np.ones((T.HEIGHT, T.WIDTH), dtype=bool)
+            room.ready = True
+            inject_scene(room, 0, with_transitions=False)
+            return room
+
+        a = build()
+        a._precompute_transitions(0)
+        self.assertTrue(a._trans_cached(0))
+        # mat beat 5 alpha ≈ 255 * 5/21 at an opaque pixel
+        px = a.scenes[0].trans_mat[5].get_at((10, 10))
+        self.assertAlmostEqual(px.a, round(255 * 5 / 21), delta=2)
+
+        # Fresh instance loads from disk, not rebuild.
+        b = build()
+        import unittest.mock as mock
+        with mock.patch.object(b, '_diff_slots',
+                               side_effect=AssertionError(
+                                   'must not rebuild')):
+            b._precompute_transitions(0)
+        self.assertIsNotNone(b.scenes[0].trans_mat)
+        px = b.scenes[0].trans_mat[5].get_at((10, 10))
+        self.assertAlmostEqual(px.a, round(255 * 5 / 21), delta=2)
+
+        # Stale prune removes dirs for scenes no longer listed.
+        room = build()
+        room.items.append({'file': 'zz.f796.br', 'title_en': 'ZZ',
+                           'src': None})
+        room._prune_stale_transition_cache()
+        self.assertTrue(room._trans_cached(0))
 
     def test_giveup_and_skip_keep_decode_chain_alive(self):
         # Regression (on-device wedge): the gap give-up and skip
