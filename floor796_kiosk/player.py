@@ -16,7 +16,7 @@ Architecture:
 
 Controls (for maintenance/testing only):
   Arrow keys — Pan manually
-  Space                   — Toggle auto-wandering
+  Space                   — Cycle modes: Wandering → Navigating → Exploring
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
@@ -55,6 +55,11 @@ try:
     HIGHLIGHTER_AVAILABLE = True
 except ImportError:
     HIGHLIGHTER_AVAILABLE = False
+
+# First-party, dependency-free modules — required (no graceful
+# degradation for the mode system; a broken install should fail loud).
+from floor796_kiosk.modes import Mode, ModeMachine
+from floor796_kiosk.explorer import Explorer
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -676,6 +681,55 @@ class TileCache:
 
     def get(self, tile_id):
         return self.cache.get(tile_id)
+
+
+class ModeToast:
+    """Transient bottom-center capsule announcing mode changes (tvOS
+    showCapsule parity; kiosk wording mentions the keyboard)."""
+
+    TEXTS = None   # filled lazily per Mode (import cycle safety)
+
+    DURATION = 2.5   # seconds
+
+    def __init__(self, screen_w, screen_h):
+        self._screen_w = screen_w
+        self._screen_h = screen_h
+        self._font = None
+        self._surf = None
+        self._mode = None
+        self._until = 0.0
+
+    def show(self, mode):
+        from floor796_kiosk.modes import Mode
+        if ModeToast.TEXTS is None:
+            ModeToast.TEXTS = {
+                Mode.WANDERING: 'wandering — SPACE to navigate',
+                Mode.NAVIGATING: 'navigating — SPACE to explore',
+                Mode.EXPLORING: 'exploring — arrows jump, SPACE to wander',
+            }
+        self._mode = mode
+        self._surf = None          # re-render (mode changed)
+        self._until = time.monotonic() + self.DURATION
+
+    def render(self, screen):
+        if self._mode is None or time.monotonic() > self._until:
+            return
+        if self._font is None:
+            self._font = pygame.font.Font(None, 30)
+        if self._surf is None:
+            text = ModeToast.TEXTS.get(self._mode, self._mode.value)
+            self._surf = self._font.render(text, True, (235, 235, 240))
+        tw, th = self._surf.get_size()
+        pad_x, pad_y = 14, 8
+        cx = self._screen_w // 2
+        y = self._screen_h - 64
+        rect = pygame.Rect(cx - tw // 2 - pad_x, y - pad_y,
+                           tw + pad_x * 2, th + pad_y * 2)
+        bg = pygame.Surface(rect.size, pygame.SRCALPHA)
+        bg.fill((20, 22, 30, 210))
+        screen.blit(bg, rect.topleft)
+        pygame.draw.rect(screen, (90, 160, 255), rect, 1)
+        screen.blit(self._surf, (cx - tw // 2, y))
 
 
 # ─── Coverage-Weighted Wander Navigation ─────────────────────────────────────
@@ -1695,7 +1749,8 @@ def main():
     effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
     log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM, margin=%d)",
              max_tiles, args.width, args.height, total_mem_mb, effective_margin)
-    cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
+    cache = TileCache(STRIP_DIR, max_tiles=max_tiles,
+                      display_depth=screen.get_bitsize())
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
@@ -1770,6 +1825,7 @@ def main():
     log.info("Highlighter UI scale: %.2fx (%dx%d)", ui_scale, args.width, args.height)
 
     object_highlighter = None
+    hl_objects = []
     if HIGHLIGHTER_AVAILABLE:
         changelog_path = CHANGELOG_PATH
         if not os.path.exists(changelog_path):
@@ -1798,6 +1854,20 @@ def main():
     # Wire highlighter into stats collector for telemetry
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
+
+    # ── Modes + Explorer (tvOS parity: Wandering/Navigating/Exploring,
+    # SPACE cycles; arrows jump in Exploring) ──
+    mode_machine = ModeMachine(
+        Mode.NAVIGATING if args.no_wander else Mode.WANDERING)
+    mode_toast = ModeToast(args.width, args.height)
+    explorer = None
+    if object_highlighter is not None and hl_objects:
+        explorer = Explorer(hl_objects, SPACING_W, SPACING_H)
+        log.info('Explorer: %d jump targets (of %d segments)',
+                 len(explorer.segments), len(hl_objects))
+    else:
+        log.warning('Explorer unavailable (no objects) — Exploring '
+                    'mode will hold the camera still')
 
     # Wire hologram playback state into the highlighter so 'Hologram #N'
     # labels are only shown while slot N is actually playing.
@@ -1857,10 +1927,34 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:
-                    wandering = not wandering
-                    if wandering:
+                    # tvOS cycleMode(): Wandering → Navigating →
+                    # Exploring → Wandering (Exploring exits directly
+                    # to Wandering, which resumes the tour from the
+                    # current camera).
+                    _old = mode_machine.current
+                    _new = mode_machine.cycle()
+                    log.info('mode: %s -> %s', _old.value, _new.value)
+                    if _new is Mode.WANDERING:
+                        explorer.cancel_flight()
+                        if object_highlighter:
+                            object_highlighter.resume_auto()
+                        wandering = True
                         wanderer.x = pos_x
                         wanderer.y = pos_y
+                    elif _new is Mode.NAVIGATING:
+                        wandering = False
+                    else:   # EXPLORING
+                        wandering = False
+                        if object_highlighter:
+                            object_highlighter.suspend_auto()
+                        if explorer is not None:
+                            sel = explorer.enter(pos_x + args.width / 2,
+                                                 pos_y + args.height / 2)
+                            log.info("explorer: exploring — '%s'",
+                                     sel.title[:40] if sel else '(none)')
+                            if sel is not None and object_highlighter:
+                                object_highlighter.set_explore_target(sel)
+                    mode_toast.show(_new)
                 elif event.key == pygame.K_v:
                     wanderer.print_coverage()
                 elif event.key == pygame.K_s:
@@ -1881,12 +1975,36 @@ def main():
                         mode = object_highlighter.cycle_label_mode()
                         log.info("Object highlighter label: %s", mode)
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
-                    wandering = False
-                    speed = 500
-                    if event.key == pygame.K_LEFT:  pos_x -= speed * dt
-                    if event.key == pygame.K_RIGHT: pos_x += speed * dt
-                    if event.key == pygame.K_UP:    pos_y -= speed * dt
-                    if event.key == pygame.K_DOWN:  pos_y += speed * dt
+                    _pm = mode_machine.pan_started()
+                    if _pm is Mode.EXPLORING:
+                        # One KEYDOWN = one directional jump (tvOS
+                        # one-jump-per-flick rule; flight + cooldown
+                        # gate further input inside the Explorer).
+                        _dirs = {pygame.K_LEFT: (-1, 0),
+                                 pygame.K_RIGHT: (1, 0),
+                                 pygame.K_UP: (0, -1),
+                                 pygame.K_DOWN: (0, 1)}
+                        _dx, _dy = _dirs[event.key]
+                        if explorer is not None:
+                            jumped = explorer.jump(
+                                _dx, _dy,
+                                pos_x + args.width / 2,
+                                pos_y + args.height / 2)
+                            if jumped is not None:
+                                log.info("explorer: jump → '%s'",
+                                         jumped.title[:40])
+                                if object_highlighter:
+                                    object_highlighter.set_explore_target(
+                                        jumped)
+                    else:
+                        # Wandering → pan switches to Navigating (the
+                        # machine did it); Navigating pans directly.
+                        wandering = False
+                        speed = 500
+                        if event.key == pygame.K_LEFT:  pos_x -= speed * dt
+                        if event.key == pygame.K_RIGHT: pos_x += speed * dt
+                        if event.key == pygame.K_UP:    pos_y -= speed * dt
+                        if event.key == pygame.K_DOWN:  pos_y += speed * dt
 
         _t_ev = (time.perf_counter() - _t_ev0) * 1000
 
@@ -1898,11 +2016,13 @@ def main():
             cmd, pending_viewport[:] = pending_viewport[0], []
             if cmd.get('resume'):
                 wandering = True
+                mode_machine.force(Mode.WANDERING)
                 wanderer.x, wanderer.y = pos_x, pos_y
                 log.info('viewport: wandering resumed at %.0f,%.0f',
                          pos_x, pos_y)
             else:
                 wandering = False
+                mode_machine.force(Mode.NAVIGATING)
                 pos_x = max(0, min(map_w - args.width,
                                    float(cmd['x']) - args.width / 2))
                 pos_y = max(0, min(map_h - args.height,
@@ -1910,6 +2030,13 @@ def main():
                 wanderer.x, wanderer.y = pos_x, pos_y
                 log.info('viewport: pinned to %.0f,%.0f (camera %.0f,%.0f)',
                          cmd['x'], cmd['y'], pos_x, pos_y)
+
+        # ── Exploring: the camera flight owns the camera ──
+        if explorer is not None and mode_machine.explorer_drives_camera:
+            _c = explorer.update(dt)
+            if _c is not None:
+                pos_x = _c[0] - args.width / 2
+                pos_y = _c[1] - args.height / 2
 
         if wandering:
             wanderer.update(dt)
@@ -2052,6 +2179,9 @@ def main():
             object_highlighter.render(screen, pos_x, pos_y)
         _t_overlay = (time.perf_counter() - _t_holo0) * 1000
         _t_high = (time.perf_counter() - _t_high0) * 1000
+
+        # ── Mode-change capsule (transient) ──
+        mode_toast.render(screen)
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
         _t_post0 = time.perf_counter()

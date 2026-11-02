@@ -541,6 +541,8 @@ class ObjectHighlighter:
         # provider lets us gate selection on live playback state.
         self._hologram_state_provider = None
         self._teleport_state_provider = None
+        self._auto_select = True        # False while Exploring owns the box
+        self._forced_seg = None
 
         # Timestamped view history: obj_id -> [timestamps]
         # Used for recency-weighted selection and stats reporting.
@@ -797,6 +799,51 @@ class ObjectHighlighter:
         eligible.sort(key=lambda t: (t[0], t[1]))
         return eligible[0][2]
 
+    def _start_highlight(self, seg):
+        """Begin highlighting seg (shared by auto-picking and the
+        exploring-mode forced target)."""
+        self._current_seg = seg
+        self._state = STATE_HIGHLIGHT
+        self._timer = 0.0
+        self.highlights_shown += 1
+        # Record view timestamp
+        now = time.time()
+        last = self._last_shown.get(seg.obj_id)
+        ago = f"first time" if last is None else f"{now - last:.0f}s ago"
+        log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
+                 seg.obj_id, seg.title[:40], ago, len(self._last_shown))
+        self._last_shown[seg.obj_id] = now
+        history = self._view_history.setdefault(seg.obj_id, [])
+        history.append(now)
+        # Cap history length for memory
+        if len(history) > MAX_HISTORY_PER_OBJ:
+            del history[:-MAX_HISTORY_PER_OBJ]
+        # Prefetch thumbnail for the new object
+        self._thumbs.get(seg.obj_id, seg.link)
+
+    # ── Exploring-mode integration (tvOS: Explorer owns the box) ────
+
+    def suspend_auto(self):
+        """Stop auto-cycling selections (Exploring takes over)."""
+        self._auto_select = False
+
+    def resume_auto(self):
+        """Resume auto-cycling (leaving Exploring)."""
+        self._auto_select = True
+        self._forced_seg = None
+        # Drop any lingering explore highlight; the accumulator picks a
+        # fresh object from the PAUSE/IDLE cycle.
+        self._current_seg = None
+        self._state = STATE_IDLE
+        self._timer = 0.0
+
+    def set_explore_target(self, seg):
+        """Force the highlight onto the Explorer's selection.  Called
+        on every enter/jump; the box persists (no expiry) until the
+        next target or resume_auto()."""
+        self._forced_seg = seg
+        self._start_highlight(seg)
+
     def update(self, dt, pos_x, pos_y, vel_x=0, vel_y=0):
         """Advance the state machine.  Called once per frame.
 
@@ -815,29 +862,25 @@ class ObjectHighlighter:
         self._timer += dt
 
         if self._state == STATE_IDLE:
-            seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2,
-                                        vel_x, vel_y)
+            if self._auto_select:
+                seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2,
+                                            vel_x, vel_y)
+            else:
+                # Exploring mode: no auto-picking.  The forced explore
+                # target (if any) is re-anchored whenever the state
+                # machine comes back to IDLE (e.g. after an abort).
+                seg = self._forced_seg if self._forced_seg else None
             if seg:
-                self._current_seg = seg
-                self._state = STATE_HIGHLIGHT
-                self._timer = 0.0
-                self.highlights_shown += 1
-                # Record view timestamp
-                now = time.time()
-                last = self._last_shown.get(seg.obj_id)
-                ago = f"first time" if last is None else f"{now - last:.0f}s ago"
-                log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
-                         seg.obj_id, seg.title[:40], ago, len(self._last_shown))
-                self._last_shown[seg.obj_id] = now
-                history = self._view_history.setdefault(seg.obj_id, [])
-                history.append(now)
-                # Cap history length for memory
-                if len(history) > MAX_HISTORY_PER_OBJ:
-                    del history[:-MAX_HISTORY_PER_OBJ]
-                # Prefetch thumbnail for the new object
-                self._thumbs.get(seg.obj_id, seg.link)
+                self._start_highlight(seg)
 
         elif self._state == STATE_HIGHLIGHT:
+            if self._forced_seg is not None:
+                # Exploring target: a deliberate selection — the tvOS
+                # explorer keeps its red box until the next jump; skip
+                # the auto-cycling aborts and the duration expiry (the
+                # panel progress bar parks at 100%, matching tvOS
+                # progress:1).
+                return
             # Mid-highlight check: if the current object has scrolled
             # off-screen (e.g. wander direction changed), abort early
             # and immediately pick a new one.
