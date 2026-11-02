@@ -1970,7 +1970,7 @@ def main():
         _ft_total = (time.perf_counter() - _ft0) * 1000
         _frame_times.append(_ft_total)
         _should_log = (_ft_total > 40.0 and
-                       (time.perf_counter() - _last_slow_log) > 5.0)
+                       (time.perf_counter() - _last_slow_log) > 0.4)
         if _frame_debug:
             _should_log = True
         if _should_log:
@@ -1997,6 +1997,11 @@ def main():
                          _t_tick,
                          _ft_total - _accounted
                          - (_t_blit0 - _ft0))
+                if object_highlighter and \
+                        getattr(object_highlighter, '_perf_parts', None):
+                    log.info("[FRAME] highlighter parts: %s",
+                             {k: round(v, 1) for k, v in
+                              object_highlighter._perf_parts.items()})
             _last_slow_log = time.perf_counter()
 
     cache.stop()

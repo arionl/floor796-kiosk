@@ -567,6 +567,8 @@ class ObjectHighlighter:
         self._text_cache = {}
         self._static_text_cache = {}   # static strings ("Loading...", link labels)
         self._fill_surf_cache = {}     # cached box-fill / placeholder surfaces
+        self._glow_ms = 0.0            # per-frame glow render time (telemetry)
+        self._panel_ms = 0.0           # per-frame panel render time (telemetry)
         # Maximum entries in each overlay cache. At ~2.5MB combined per
         # entry at 4K, 24 entries = ~60MB ceiling.
         self._max_overlay_cache_entries = 24
@@ -925,6 +927,8 @@ class ObjectHighlighter:
             return
 
         self._init_fonts()
+        self._perf_parts = {}
+        _t0 = time.perf_counter()
         seg = self._current_seg
 
         # Convert absolute map coords to screen coords
@@ -959,6 +963,16 @@ class ObjectHighlighter:
         else:
             self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                                 skip_glow=zooming)
+        # Per-part attribution (only meaningful on slow frames).
+        self._perf_note('total', (time.perf_counter() - _t0) * 1000)
+        self._perf_parts['glow'] = self._glow_ms
+        self._perf_parts['panel'] = self._panel_ms
+        self._glow_ms = 0.0
+        self._panel_ms = 0.0
+
+    def _perf_note(self, label, ms):
+        """Collect per-part render timings for slow-frame attribution."""
+        self._perf_parts[label] = self._perf_parts.get(label, 0.0) + ms
 
     def _pulse_envelope(self):
         """Return (intensity, glow_radius) for the current timer position.
@@ -973,6 +987,7 @@ class ObjectHighlighter:
         return 1.0, radius
 
     def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
+        _g0 = time.perf_counter()
         """Draw a smooth alpha-gradient glow radiating outward from the box.
 
         Draws GLOW_STEPS filled rectangles from outermost (largest, lowest
@@ -1032,6 +1047,7 @@ class ObjectHighlighter:
 
         canvas, maxpad = cached
         screen.blit(canvas, (int(sx1) - maxpad, int(sy1) - maxpad))
+        self._glow_ms += (time.perf_counter() - _g0) * 1000
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                        skip_glow=False):
@@ -1248,6 +1264,7 @@ class ObjectHighlighter:
 
         All text and geometry are computed ONCE per highlight and
         cached in _text_cache — the per-frame path is blits only."""
+        _p0 = time.perf_counter()
 
         link_type, _ = classify_link(seg.link)
         # All link types that can produce a visual thumbnail:
@@ -1352,6 +1369,7 @@ class ObjectHighlighter:
         self._render_footer(screen, seg, link_type,
                             panel_x + self._panel_padding, footer_y,
                             panel_w - self._panel_padding * 2)
+        self._panel_ms += (time.perf_counter() - _p0) * 1000
 
     def _render_placeholder(self, screen, x, y, w, h):
         """Draw an animated loading placeholder for the thumbnail."""
