@@ -1925,13 +1925,18 @@ def main():
             hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
+        _t_holo = (time.perf_counter() - _t_holo0) * 1000
+        _t_tele0 = time.perf_counter()
         if teleport:
             teleport.render(screen, pos_x, pos_y)
+        _t_tele = (time.perf_counter() - _t_tele0) * 1000
+        _t_high0 = time.perf_counter()
 
         # ── Object highlighter ──
         if object_highlighter:
             object_highlighter.render(screen, pos_x, pos_y)
         _t_overlay = (time.perf_counter() - _t_holo0) * 1000
+        _t_high = (time.perf_counter() - _t_high0) * 1000
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
         if stats_collector and stats_collector.overlay_enabled:
@@ -1978,6 +1983,12 @@ def main():
                 _t_blit, _t_overlay, _t_ss, _t_flip,
                 cache.pending_count,
             )
+            if _ft_total > 45.0:
+                # Component attribution for slow frames.
+                log.info("[FRAME] slow breakdown: holo=%.1f tele=%.1f "
+                         "highlighter=%.1f (rest=%.1f)",
+                         _t_holo, _t_tele, _t_high,
+                         _t_overlay - _t_holo - _t_tele - _t_high)
             _last_slow_log = time.perf_counter()
 
     cache.stop()
