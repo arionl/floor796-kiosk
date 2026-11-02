@@ -1097,11 +1097,22 @@ class Wanderer:
             return
 
         # Classify tiles by content density for tour ordering
+        # (class computed ONCE per tile — np.mean per comparison made
+        # this O(n²) tour a 50-100ms+ main-thread hitch on the Pi)
+        density_class = {}
+        if self.content_density:
+            for rc, darr in self.content_density.items():
+                if rc in self.animated_tiles:
+                    d = float(np.mean(darr))
+                    density_class[rc] = 0 if d >= 0.60 else (
+                        1 if d >= 0.20 else 2)
+
         def tile_class(rc):
+            if rc in density_class:
+                return density_class[rc]
+            d = 1.0
             if self.content_density and rc in self.content_density:
                 d = float(np.mean(self.content_density[rc]))
-            else:
-                d = 1.0
             if d >= 0.60: return 0  # CORE
             if d >= 0.20: return 1  # EDGE
             return 2                   # TIP

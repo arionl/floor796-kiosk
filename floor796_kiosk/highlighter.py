@@ -559,6 +559,14 @@ class ObjectHighlighter:
         # changes, not every frame.
         # Bounded: each ~700×600 SRCALPHA surface = ~1.5MB at 4K scale.
         self._panel_bg_cache = {}  # (obj_id, has_thumb) → (Surface, panel_w, panel_h)
+        # Static rendered text per (obj_id, has_thumb): titles, date,
+        # extract lines, footer labels — font.render is ~0.3ms each and
+        # _wrap_text renders up to ~25 probes per frame; all static per
+        # highlight, so render ONCE and blit per frame (main-loop
+        # smoothness: the per-frame overlay cost drops to blits only).
+        self._text_cache = {}
+        self._static_text_cache = {}   # static strings ("Loading...", link labels)
+        self._fill_surf_cache = {}     # cached box-fill / placeholder surfaces
         # Maximum entries in each overlay cache. At ~2.5MB combined per
         # entry at 4K, 24 entries = ~60MB ceiling.
         self._max_overlay_cache_entries = 24
@@ -1023,9 +1031,15 @@ class ObjectHighlighter:
             _intensity, glow_radius = self._pulse_envelope()
             self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
-        # Semi-transparent fill
-        fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
-                                    pygame.SRCALPHA)
+        # Semi-transparent fill (cached surface — per-frame SRCALPHA
+        # allocation churn feeds the GC and causes periodic hitches)
+        fw = max(1, int(bw)); fh = max(1, int(bh))
+        fill_surf = self._fill_surf_cache.get((fw, fh))
+        if fill_surf is None:
+            fill_surf = pygame.Surface((fw, fh), pygame.SRCALPHA)
+            if len(self._fill_surf_cache) > 8:
+                self._fill_surf_cache.clear()
+            self._fill_surf_cache[(fw, fh)] = fill_surf
         fill_alpha = int(BOX_FILL[3])
         fill_surf.fill((*BOX_COLOR[:3], fill_alpha))
         screen.blit(fill_surf, (int(sx1), int(sy1)))
@@ -1037,7 +1051,18 @@ class ObjectHighlighter:
                          outline_w)
 
         # Label text — position above the box if space, else below
-        title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
+        # (text rendered once per highlight, cached)
+        tkey = ('inline', seg.obj_id)
+        cached_txt = self._text_cache.get(tkey)
+        if cached_txt is None or cached_txt[2] != seg.title \
+                or cached_txt[3] != seg.date:
+            title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
+            date_surf = (self._font_small.render(seg.date, True, LABEL_ACCENT)
+                         if seg.date else None)
+            self._text_cache[tkey] = (title_surf, date_surf, seg.title,
+                                      seg.date)
+        else:
+            title_surf, date_surf = cached_txt[0], cached_txt[1]
         tw = title_surf.get_width()
         th = title_surf.get_height()
 
@@ -1062,9 +1087,8 @@ class ObjectHighlighter:
 
         screen.blit(title_surf, (label_x, label_y))
 
-        # Date in small text
-        if seg.date:
-            date_surf = self._font_small.render(seg.date, True, LABEL_ACCENT)
+        # Date in small text (cached surface from the label cache above)
+        if seg.date and date_surf is not None:
             date_y = label_y + th + 2
             if date_y + date_surf.get_height() < self._screen_h:
                 screen.blit(date_surf, (label_x, date_y))
@@ -1161,8 +1185,59 @@ class ObjectHighlighter:
 
         return [font.render(line, True, color) for line in lines]
 
+    def _build_panel_text(self, seg, link_type, has_thumb, extract_text):
+        """Render all static panel text + geometry ONCE per highlight."""
+        # Word-wrap the title (up to 2 lines)
+        max_title_w = self._panel_w - self._panel_padding * 2
+        title_surfaces = self._wrap_title(seg.title, self._font_title,
+                                          max_title_w, max_lines=2)
+        title_total_h = sum(s.get_height() for s in title_surfaces)
+
+        # Determine panel dimensions
+        # Title bar includes title lines + date line + padding.
+        date_h = self._font_small.get_height()
+        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
+
+        extract_lines = []
+        extract_h = 0
+        if extract_text:
+            extract_lines = self._wrap_text(
+                extract_text, self._font_small,
+                max_title_w, max_lines=3)
+            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
+
+        if has_thumb:
+            panel_w = self._panel_w
+            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
+                       self._panel_padding + extract_h)
+        else:
+            panel_w = self._panel_w_no_thumb
+            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
+
+        date_surf = self._font_small.render(
+            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
+
+        label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
+        type_surf = (self._font_link.render(label, True, color)
+                     if label else None)
+
+        return {
+            'title': seg.title, 'date': seg.date,
+            'extract_text': extract_text,
+            'title_surfaces': title_surfaces,
+            'title_bar_h': title_bar_h,
+            'extract_lines': extract_lines,
+            'extract_h': extract_h,
+            'panel_w': panel_w, 'panel_h': panel_h,
+            'date_surf': date_surf,
+            'type_surf': type_surf,
+        }
+
     def _render_corner_panel(self, screen, seg):
-        """Draw the lower-right info panel with optional thumbnail."""
+        """Draw the lower-right info panel with optional thumbnail.
+
+        All text and geometry are computed ONCE per highlight and
+        cached in _text_cache — the per-frame path is blits only."""
 
         link_type, _ = classify_link(seg.link)
         # All link types that can produce a visual thumbnail:
@@ -1184,39 +1259,26 @@ class ObjectHighlighter:
         if link_type == "wiki":
             extract_text = self._thumbs.get_extract(seg.obj_id)
 
-        # Word-wrap the title (up to 2 lines)
-        max_title_w = self._panel_w - self._panel_padding * 2
-        title_surfaces = self._wrap_title(seg.title, self._font_title,
-                                          max_title_w, max_lines=2)
-        title_total_h = sum(s.get_height() for s in title_surfaces)
+        tkey = (seg.obj_id, has_thumb)
+        tc = self._text_cache.get(tkey)
+        if tc is None or tc.get('extract_text') != extract_text \
+                or tc.get('title') != seg.title or tc.get('date') != seg.date:
+            tc = self._build_panel_text(seg, link_type, has_thumb,
+                                        extract_text)
+            self._text_cache[tkey] = tc
+            if len(self._text_cache) > self._max_overlay_cache_entries * 2:
+                self._text_cache.pop(next(iter(self._text_cache)))
 
-        # Determine panel dimensions
-        # Title bar includes title lines + date line + padding.
-        date_h = self._font_small.get_height()
-        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
-
-        # Wrap extract text to compute its height
-        extract_lines = []
-        extract_h = 0
-        if extract_text:
-            extract_lines = self._wrap_text(
-                extract_text, self._font_small,
-                max_title_w, max_lines=3)
-            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
-
-        if has_thumb:
-            panel_w = self._panel_w
-            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
-                       self._panel_padding + extract_h)
-        else:
-            panel_w = self._panel_w_no_thumb
-            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
+        title_surfaces = tc['title_surfaces']
+        title_bar_h = tc['title_bar_h']
+        extract_lines = tc['extract_lines']
+        extract_h = tc['extract_h']
+        panel_w = tc['panel_w']
+        panel_h = tc['panel_h']
+        date_surf = tc['date_surf']
 
         panel_x = self._screen_w - panel_w - self._panel_margin - self._overscan_margin
         panel_y = self._screen_h - panel_h - self._panel_margin - self._overscan_margin
-
-        date_surf = self._font_small.render(
-            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
 
         # ── Draw panel background (cached per object) ──
         cache_key = (seg.obj_id, has_thumb)
@@ -1283,9 +1345,16 @@ class ObjectHighlighter:
 
     def _render_placeholder(self, screen, x, y, w, h):
         """Draw an animated loading placeholder for the thumbnail."""
-        # Dark background
-        ph_surf = pygame.Surface((w, h))
-        ph_surf.fill((25, 25, 35))
+        # Dark background (cached — avoid per-frame allocation)
+        ph_key = (w, h)
+        ph_surf = self._fill_surf_cache.get(ph_key)
+        if ph_surf is None:
+            ph_surf = pygame.Surface((w, h))
+            ph_surf.fill((25, 25, 35))
+            if len(self._fill_surf_cache) > 8:
+                self._fill_surf_cache.clear()
+            self._fill_surf_cache[ph_key] = ph_surf
+        ph_surf.fill((25, 25, 35))   # re-fill: cache may be shared w/ inline
         screen.blit(ph_surf, (x, y))
 
         # Pulsing border
@@ -1298,19 +1367,33 @@ class ObjectHighlighter:
         )
         pygame.draw.rect(screen, border_color, (x, y, w, h), 1)
 
-        # "Loading..." text
-        load_surf = self._font_small.render("Loading...", True, (80, 80, 100))
+        # "Loading..." text (static — render once)
+        load_surf = self._static_text_cache.get('loading')
+        if load_surf is None:
+            load_surf = self._font_small.render("Loading...", True,
+                                                (80, 80, 100))
+            self._static_text_cache['loading'] = load_surf
         lx = x + (w - load_surf.get_width()) // 2
         ly = y + (h - load_surf.get_height()) // 2
         screen.blit(load_surf, (lx, ly))
 
     def _render_footer(self, screen, seg, link_type, fx, fy, fw):
         """Draw link type indicator and progress bar in the footer area."""
-        label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
-
-        # Link type indicator (left side)
-        if label:
-            type_surf = self._font_link.render(label, True, color)
+        # Link type indicator (left side) — static label text cached
+        # per highlight (in _text_cache['type_surf']); pass it in via
+        # the current panel text cache entry.
+        tc = self._text_cache.get((seg.obj_id, True)) \
+            or self._text_cache.get((seg.obj_id, False))
+        type_surf = tc.get('type_surf') if tc else None
+        if type_surf is None:
+            label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
+            if label:
+                key = ('link', label, color)
+                type_surf = self._static_text_cache.get(key)
+                if type_surf is None:
+                    type_surf = self._font_link.render(label, True, color)
+                    self._static_text_cache[key] = type_surf
+        if type_surf is not None:
             screen.blit(type_surf, (fx, fy))
 
         # Progress bar (right side, takes remaining width)
