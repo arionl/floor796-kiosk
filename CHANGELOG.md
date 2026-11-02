@@ -5,7 +5,28 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
-## Unreleased — Teleport room (Stream A of the v2.5 plan)
+## Unreleased
+
+### Three canonical modes (Stream B of the v2.5 plan — tvOS parity)
+- `modes.py` — Wandering / Navigating / Exploring state machine with the
+  tvOS `cycleMode()` semantics: SPACE cycles W → N → E → W (Exploring
+  exits directly back to Wandering, which resumes the tour from the
+  current camera); any arrow pan in Wandering enters Navigating.
+- `explorer.py` — 1:1 port of tvOS `Explorer.swift`: 90°-cone →
+  180°-half-plane → stay-put jump rule, 0.4 s ease-out-cubic camera
+  flight, 0.3 s landing cooldown, min-size target filter, entry
+  re-anchors to the nearest object (never a prior stint's selection),
+  resume() keeps a selection.
+- Arrows in Exploring = one directional jump per keypress (one per
+  flick on tvOS); the highlighter suspends auto-cycling and follows the
+  explorer's target (box persists until the next jump); auto-selection
+  resumes on returning to Wandering. Transient mode capsule on change.
+- Tests: `tools/test_modes.py`, `tools/test_explorer.py` (all tvOS
+  ExplorerTests cases + kiosk multi-segment case).
+- `TileCache` now converts strips to the ACTUAL display depth (was
+  hardcoded 16 — the numpy 32-bit fast path never activated before).
+
+### Teleport room (Stream A of the v2.5 plan)
 
 ### Added
 - **Teleporter room** (`floor796_kiosk/teleport.py`) — site-exact port
