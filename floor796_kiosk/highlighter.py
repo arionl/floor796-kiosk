@@ -992,36 +992,46 @@ class ObjectHighlighter:
         if steps < 2:
             return
 
-        cache_key = (glow_radius, int(bw), int(bh))
+        # Quantize the breathing radius (2px steps): the raw sine
+        # radius changes almost every frame, which thrashed this cache
+        # (full layer-stack rebuild per frame = the 8-11ms/frame
+        # highlighter cost seen in slow-frame telemetry).
+        radius_q = max(2, int(round(glow_radius / 2.0)) * 2)
+        cache_key = (radius_q, int(bw), int(bh))
         cached = self._glow_cache.get(cache_key)
         if cached is None:
-            layers = []
+            maxpad = radius_q
+            canvas_w = max(1, int(bw) + maxpad * 2)
+            canvas_h = max(1, int(bh) + maxpad * 2)
+            canvas = pygame.Surface((canvas_w, canvas_h),
+                                    pygame.SRCALPHA)
             for i in range(steps, 0, -1):
                 frac = i / steps  # 1.0 at outer edge → 0 at box edge
                 alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
                 if alpha < 2:
                     continue
-                pad = max(1, int(glow_radius * frac))
-                gw = int(bw + pad * 2)
-                gh = int(bh + pad * 2)
+                pad = max(1, int(radius_q * frac))
+                gw = int(bw) + pad * 2
+                gh = int(bh) + pad * 2
                 if gw <= 0 or gh <= 0:
                     continue
                 glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
                 glow_surf.fill((*BOX_COLOR, alpha))
-                # Cut out the box interior so glow only covers the ring area
+                # Cut out the box interior so glow only covers the ring
                 if int(bw) > 0 and int(bh) > 0:
-                    glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
-                # Store (surface, pad) — position computed at blit time
-                layers.append((glow_surf, pad))
-            self._glow_cache[cache_key] = layers
-            # Evict old entries if cache is growing (keep last 8 sizes)
-            if len(self._glow_cache) > 8:
+                    glow_surf.fill((0, 0, 0, 0),
+                                    (pad, pad, int(bw), int(bh)))
+                # Compose into ONE surface — a single blit per frame
+                # instead of GLOW_STEPS (source-over is associative, so
+                # the result is identical to the layered blits).
+                canvas.blit(glow_surf, (maxpad - pad, maxpad - pad))
+            cached = (canvas, maxpad)
+            self._glow_cache[cache_key] = cached
+            if len(self._glow_cache) > 64:
                 self._glow_cache.pop(next(iter(self._glow_cache)))
-        else:
-            layers = cached
 
-        for glow_surf, pad in layers:
-            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
+        canvas, maxpad = cached
+        screen.blit(canvas, (int(sx1) - maxpad, int(sy1) - maxpad))
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                        skip_glow=False):
