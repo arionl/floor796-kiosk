@@ -1735,6 +1735,7 @@ def main():
     while running:
         _ft0 = time.perf_counter()
         dt = clock.tick(30) / 1000.0
+        _t_tick = (time.perf_counter() - _ft0) * 1000   # vsync wait
         dt = min(dt, 1 / 15)
 
         for event in pygame.event.get():
@@ -1989,6 +1990,13 @@ def main():
                          "highlighter=%.1f (rest=%.1f)",
                          _t_holo, _t_tele, _t_high,
                          _t_overlay - _t_holo - _t_tele - _t_high)
+                _accounted = (_t_blit + _t_overlay + _t_ss + _t_flip)
+                log.info("[FRAME] logic=%.1f tick=%.1f "
+                         "(unaccounted=%.1f)",
+                         _t_blit0 - _ft0 - _t_tick,
+                         _t_tick,
+                         _ft_total - _accounted
+                         - (_t_blit0 - _ft0))
             _last_slow_log = time.perf_counter()
 
     cache.stop()
