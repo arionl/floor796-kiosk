@@ -408,16 +408,35 @@ class TileCache:
 
     def _ensure_display_depth(self, surf):
         """Convert a strip to the display pixel format ONCE, in the
-        worker, in GIL-friendly vertical slices.
+        worker.
 
         Strips are stored 24-bit (~100 MB); the display is 32-bit.
         Without conversion SDL re-converts the blitted region on EVERY
         frame (dense viewports measured blit=10-11 ms vs ~5 after).
-        A single whole-surface convert is a ~150 MB GIL-held SDL op
-        (300 ms main-thread stall — measured), so blit in one-tile-row
-        slices with a yield between them; each slice is ~1.5 ms."""
+
+        Fast path (32-bit display): numpy over zero-copy ``get_view``
+        buffers — ufuncs and strided assignments RELEASE the GIL, so a
+        full 100 MB strip converts with at most an ~8 ms main-thread
+        gap (measured on the Pi; a single SDL convert/``tobytes`` holds
+        the GIL 100-950 ms instead).  The converted pixels are written
+        directly into a display-format surface's own buffer, so the
+        per-frame blit is a mask-matched copy under any KMS layout.
+
+        IMPORTANT: numpy views keep their surface LOCKED — every
+        reference (views included) must be dropped before the surface
+        is returned, or every subsequent blit raises
+        "Surfaces must not be locked during blit".
+
+        Fallback (other depths / numpy failure): sliced SDL blits with
+        a GIL yield between slices (~5 ms holds, ~0.7 s per strip)."""
         if surf.get_bitsize() == self.display_depth:
             return surf
+        if self.display_depth == 32:
+            try:
+                return self._convert_depth32_numpy(surf)
+            except Exception as e:
+                log.warning('tilecache: fast depth convert failed '
+                            '(%s) — falling back to sliced blit', e)
         w, h = surf.get_size()
         target = pygame.Surface((w, h), 0, self.display_depth)
         step = TILE_H
@@ -428,6 +447,55 @@ class TileCache:
             y += sh
             time.sleep(0.01)          # yield the GIL between slices
         return target
+
+    def _probe_bgr(self, surf_or_none):
+        """Detect a surface format's channel order (True = B,G,R in
+        memory).  surf_or_none=None probes the DISPLAY format."""
+        if surf_or_none is None:
+            display = pygame.display.get_surface()
+            if display is None:
+                raise RuntimeError('display not initialized')
+            p = pygame.Surface((1, 1), 0, display)
+        else:
+            p = pygame.Surface((1, 1), 0, surf_or_none)
+        p.fill((255, 0, 0))
+        return pygame.image.tobytes(p, 'RGB')[0] == 0
+
+    def _convert_depth32_numpy(self, surf):
+        import numpy as np
+        w, h = surf.get_size()
+
+        # Channel orders (probed once per process, cached on instance)
+        if getattr(self, '_strip_src_bgr', None) is None:
+            self._strip_src_bgr = self._probe_bgr(surf)
+            self._strip_dst_bgr = self._probe_bgr(None)
+
+        src_view = surf.get_view('0')
+        rows = np.frombuffer(src_view, np.uint8,
+                             count=surf.get_pitch() * h)
+        rows = rows.reshape(h, surf.get_pitch())[:, :w * 3] \
+            .reshape(h, w, 3)
+        if self._strip_src_bgr:
+            rows = rows[:, :, ::-1]
+
+        display = pygame.display.get_surface()
+        tgt = pygame.Surface((w, h), 0, display)
+        tgt_view = tgt.get_view('0')
+        tp = tgt.get_pitch()
+        buf = np.frombuffer(tgt_view, np.uint8, count=tp * h)
+        out = buf.reshape(h, tp)[:, :w * 4].reshape(h, w, 4)
+        if self._strip_dst_bgr:
+            out[:, :, 0] = rows[:, :, 2]
+            out[:, :, 1] = rows[:, :, 1]
+            out[:, :, 2] = rows[:, :, 0]
+        else:
+            out[:, :, :3] = rows
+        out[:, :, 3] = 0
+        # Drop EVERY view/reference — numpy views keep the BufferProxy
+        # (and thus the surface lock) alive; a locked surface cannot be
+        # blitted.
+        del out, buf, tgt_view, rows, src_view
+        return tgt
 
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
