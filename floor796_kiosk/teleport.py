@@ -228,7 +228,7 @@ class TeleportRoom:
         self._scene_lock = threading.Lock()
         self._decode_thread = None
         self._stop_event = threading.Event()
-        self._fallback_warned = False
+        self._fallback_scene = -1
 
         self.phase = self.GAP
         self.phase_frame = 0
@@ -456,8 +456,18 @@ class TeleportRoom:
                     self.phase_frame = 1   # beat 0 displayed below
                     self.held_frame = 0
                     self._show_transition(scene.trans_mat, 0, 0.0, 0)
-                    self._request_scene(
-                        (self.current + 1) % len(self.items))
+                    nxt = (self.current + 1) % len(self.items)
+                    self._request_scene(nxt)
+                    # Look-ahead: when the next scene is fully ready,
+                    # start decoding the one after it now — the dense
+                    # scenes' transition precompute (10-17 s) outruns a
+                    # single cycle (~11 s), so heavy scenes need a full
+                    # extra cycle of runway to keep their sparkles.
+                    nxt_scene = self.scenes.get(nxt)
+                    if nxt_scene is not None \
+                            and nxt_scene.trans_mat is not None:
+                        self._request_scene(
+                            (self.current + 2) % len(self.items))
                 elif scene is not None:
                     # Scene decoded but transitions still precomputing
                     # in the worker — wait (request again), so a slow
@@ -585,16 +595,24 @@ class TeleportRoom:
 
     def _show_transition(self, surf_list, beat, alpha, t):
         """Display a transition beat from precomputed surfaces (fast
-        path) or fall back to on-the-fly compositing."""
+        path) or fall back to a cheap fade (image pass only, no
+        sparkle blend) — a full on-the-fly composite blocks the render
+        thread ~400 ms per beat on the Pi and drops the whole display;
+        a sparkle-less fade is the graceful degradation."""
         if surf_list is not None:
             self._staging = surf_list[min(beat, MATERIALIZE_FRAMES - 1)]
             return
-        if not self._fallback_warned:
-            log.warning('teleport-room: transitions not ready — '
-                        'using slow render-path composite')
-            self._fallback_warned = True
-        self.generate_slots(self.held_frame)
-        self._composite(alpha, t)
+        if self._fallback_scene != self.current:
+            log.warning('teleport-room: scene %d transitions not '
+                        'ready — fading without sparkles',
+                        self.current + 1)
+            self._fallback_scene = self.current
+        scene = self.scenes.get(self.current)
+        if scene is None:
+            return
+        src = scene.frames[min(self.held_frame, 59)]
+        self._staging = _composite_pixels(
+            src, alpha, t, [], self.sprites, self.clip_mask)
 
     # ─── render / queries ──────────────────────────────────────────────
 
@@ -653,9 +671,10 @@ def _composite_pixels(src, alpha, t, slots, sprites, clip_mask):
         return out
 
     for x, y, variant, shift in slots:
-        bx0, by0, bx1, by1 = _sprite_cell_bbox(sprites, variant, t)
-        if bx0 >= bx1 or by0 >= by1:
+        block = _sprite_floats(sprites, variant, t)
+        if block is None:
             continue
+        sr_full, sg_full, sb_full, sa_full, bx0, by0, bx1, by1 = block
         dx = x - SPRITE_CX + shift + bx0
         dy = y - SPRITE_CY + by0
         # Destination window (clipped to the canvas).
@@ -663,20 +682,24 @@ def _composite_pixels(src, alpha, t, slots, sprites, clip_mask):
         y0, y1 = max(0, dy), min(HEIGHT, dy + (by1 - by0))
         if x0 >= x1 or y0 >= y1:
             continue
-        # Source window (sheet cell origin + bbox, matched to the
-        # destination clip).
-        sxx0 = t * SPRITE_W + bx0 + (x0 - dx)
-        syy0 = variant * SPRITE_H + by0 + (y0 - dy)
         w, h = x1 - x0, y1 - y0
-
-        sp = sprites[syy0:syy0 + h, sxx0:sxx0 + w].astype(np.float32) / 255.0
-        sa = sp[:, :, 3]
+        # Source window inside the cached bbox block (edge-clipped
+        # slots use a sub-rect of the cached float arrays).
+        sxx = x0 - dx
+        syy = y0 - dy
+        if w == bx1 - bx0 and h == by1 - by0:
+            sa = sa_full
+            sr, sg, sb = sr_full, sg_full, sb_full
+        else:
+            sa = sa_full[syy:syy + h, sxx:sxx + w]
+            sr = sr_full[syy:syy + h, sxx:sxx + w]
+            sg = sg_full[syy:syy + h, sxx:sxx + w]
+            sb = sb_full[syy:syy + h, sxx:sxx + w]
         keep = sa > 0
         if not keep.any():
             continue
         br = out[y0:y1, x0:x1, 3].astype(np.float32) / 255.0
         dr = out[y0:y1, x0:x1, :3].astype(np.float32) / 255.0
-        sr, sg, sb = sp[:, :, 0], sp[:, :, 1], sp[:, :, 2]
 
         ao = sa + br * (1 - sa)
 
@@ -731,6 +754,38 @@ def _sprite_cell_bbox(sprites, variant, col):
         _bbox_cache.clear()
     _bbox_cache[key] = (sprites, box)
     return box
+
+
+_sprite_float_cache = {}
+
+
+def _sprite_floats(sprites, variant, col):
+    """Cached float32 straight-color channels (r, g, b, a) of a sprite
+    cell's opaque bbox, or None when the cell is empty.
+
+    Dense rooms diff ~1100 slots per beat; without this cache every
+    slot re-converts its uint8 block to float32 per beat (the two
+    largest scenes took 17s+ to precompute, out-running the cycle and
+    forcing slow render-path fallbacks)."""
+    key = (id(sprites), variant, col)
+    hit = _sprite_float_cache.get(key)
+    if hit is not None and hit[0] is sprites:
+        return hit[1]
+    bx0, by0, bx1, by1 = _sprite_cell_bbox(sprites, variant, col)
+    if bx0 >= bx1 or by0 >= by1:
+        block = None
+    else:
+        y0 = variant * SPRITE_H + by0
+        x0 = col * SPRITE_W + bx0
+        h, w = by1 - by0, bx1 - bx0
+        sp = sprites[y0:y0 + h, x0:x0 + w].astype(np.float32) / 255.0
+        block = (sp[:, :, 0].copy(), sp[:, :, 1].copy(),
+                 sp[:, :, 2].copy(), sp[:, :, 3].copy(),
+                 bx0, by0, bx1, by1)
+    if len(_sprite_float_cache) > 256:
+        _sprite_float_cache.clear()
+    _sprite_float_cache[key] = (sprites, block)
+    return block
 
 
 _surf_cache = {}

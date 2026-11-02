@@ -334,20 +334,23 @@ class TestPrecomputedTransitions(unittest.TestCase):
 
     def test_fallback_composites_when_transitions_missing(self):
         import numpy as np
+        import time as _time
         room = make_room()
         inject_scene(room, 0, with_transitions=False)
         # force materialize past the gap-wait bound
         room.phase_frame = T.GAP_FRAMES * 8
         room.update()
         self.assertEqual(room.phase, T.TeleportRoom.MATERIALIZE)
-        for _ in range(3):
-            room.update()
-        # No precomputed list -> on-the-fly numpy composite (array,
-        # not a surface).
-        self.assertIsNotNone(room._staging)
+        t0 = _time.perf_counter()
+        room.update()   # beat 1
+        dt = (_time.perf_counter() - t0) * 1000
+        # Cheap fallback: image pass only (fade, no sparkle blend) —
+        # must stay well under a frame budget.
         self.assertIsInstance(room._staging, np.ndarray)
-        self.assertGreater(
-            getattr(room, '_last_composite_ms', 0), 0)
+        self.assertLess(dt, 30)
+        src = room.scenes[0].frames[0]
+        a_expected = int(min(255, src[10, 10, 3] * (1 / 21) + 0.5))
+        self.assertEqual(int(room._staging[10, 10, 3]), a_expected)
 
     def test_origin_correction_applied(self):
         # The measured (+4,+4) fix must be included in the origin.
