@@ -40,7 +40,7 @@ def make_room(items=7):
     return room
 
 
-def inject_scene(room, idx):
+def inject_scene(room, idx, with_transitions=True):
     frames = []
     for f in range(60):
         px = np.zeros((T.HEIGHT, T.WIDTH, 4), dtype=np.uint8)
@@ -54,7 +54,16 @@ def inject_scene(room, idx):
         d = frames[i].copy()
         T.erase_hidden(d)
         raws[i] = d
-    room.scenes[idx] = T._Scene(frames, raws)
+    scene = T._Scene(frames, raws)
+    if with_transitions:
+        import pygame
+        scene.trans_mat = [
+            pygame.Surface((T.WIDTH, T.HEIGHT), pygame.SRCALPHA)
+            for _ in range(T.MATERIALIZE_FRAMES)]
+        scene.trans_demat = [
+            pygame.Surface((T.WIDTH, T.HEIGHT), pygame.SRCALPHA)
+            for _ in range(T.MATERIALIZE_FRAMES)]
+    room.scenes[idx] = scene
 
 
 class TestGeometry(unittest.TestCase):
@@ -283,6 +292,75 @@ class TestSceneDecodeShape(unittest.TestCase):
         px[:, :, 3] = np.where(room.clip_mask, px[:, :, 3], 0)
         self.assertEqual(int(px[150, 100, 3]), 255)
         self.assertEqual(int(px[0, 0, 3]), 0)
+
+
+class TestPrecomputedTransitions(unittest.TestCase):
+    def test_fast_path_uses_precomputed_surfaces(self):
+        import pygame
+        room = make_room()
+        inject_scene(room, 0)
+        fake = [pygame.Surface((T.WIDTH, T.HEIGHT),
+                               pygame.SRCALPHA)
+                for _ in range(T.MATERIALIZE_FRAMES)]
+        room.scenes[0].trans_mat = fake
+        for _ in range(T.GAP_FRAMES):
+            room.update()
+        # beat 0 displayed from the precomputed list — identity match.
+        self.assertIs(room._staging, fake[0])
+        for _ in range(3):
+            room.update()
+        self.assertIs(room._staging, fake[room.phase_frame - 1])
+        # No on-the-fly composite ran on the render path.
+        self.assertFalse(hasattr(room, '_last_composite_ms')
+                         and room._last_composite_ms)
+
+    def test_gap_waits_for_transitions(self):
+        room = make_room()
+        inject_scene(room, 0, with_transitions=False)
+        for _ in range(T.GAP_FRAMES):
+            room.update()
+        # scene decoded, transitions missing -> gap extends
+        self.assertEqual(room.phase, T.TeleportRoom.GAP)
+        for _ in range(10):
+            room.update()
+        self.assertEqual(room.phase, T.TeleportRoom.GAP)
+        # transitions appear -> next tick materializes
+        import pygame
+        room.scenes[0].trans_mat = [
+            pygame.Surface((T.WIDTH, T.HEIGHT), pygame.SRCALPHA)
+            for _ in range(T.MATERIALIZE_FRAMES)]
+        room.update()
+        self.assertEqual(room.phase, T.TeleportRoom.MATERIALIZE)
+
+    def test_fallback_composites_when_transitions_missing(self):
+        import numpy as np
+        room = make_room()
+        inject_scene(room, 0, with_transitions=False)
+        # force materialize past the gap-wait bound
+        room.phase_frame = T.GAP_FRAMES * 8
+        room.update()
+        self.assertEqual(room.phase, T.TeleportRoom.MATERIALIZE)
+        for _ in range(3):
+            room.update()
+        # No precomputed list -> on-the-fly numpy composite (array,
+        # not a surface).
+        self.assertIsNotNone(room._staging)
+        self.assertIsInstance(room._staging, np.ndarray)
+        self.assertGreater(
+            getattr(room, '_last_composite_ms', 0), 0)
+
+    def test_origin_correction_applied(self):
+        # The measured (+4,+4) fix must be included in the origin.
+        room = T.TeleportRoom('/tmp/f796_teleport_test_cache',
+                              tiles_meta={'tiles': FAKE_TILES})
+        room.tiles = FAKE_TILES
+        anchor = T.resolve_point(FAKE_TILES, T.ANCHOR_TILE,
+                                 T.ANCHOR_X, T.ANCHOR_Y)
+        room.origin_x = anchor[0] + T.OFF_X + T.ORIGIN_FIX_X
+        room.origin_y = anchor[1] + T.OFF_Y + T.ORIGIN_FIX_Y
+        self.assertEqual(
+            (room.origin_x, room.origin_y),
+            (4 * 1016 + 15 - 4 + 4, 2 * 812 + 618 + 1 + 4))
 
 
 if __name__ == '__main__':

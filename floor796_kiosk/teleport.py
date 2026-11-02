@@ -62,6 +62,13 @@ ANCHOR_X = 15            # local X inside the anchor tile
 ANCHOR_Y = 618           # local Y inside the anchor tile
 OFF_X = -4
 OFF_Y = 1
+# Measured correction: cross-correlating teleport-bg.png against the
+# map tile strips (tools/tele_align.py, 2026-11-02) puts the room art
+# at (+4,+4) from the site-formula anchor on THIS map grid — the
+# tvOS-tuned OFF constants are 4px up-left of the kiosk tiles, which
+# read as a "background shift" during the alpha cross-fades.
+ORIGIN_FIX_X = 4
+ORIGIN_FIX_Y = 4
 
 # Room clip polygon (site render slot clipPathPoints), as
 # (tile_ref, x, y) absolute-resolved at prepare() time.
@@ -170,13 +177,26 @@ def load_image_rgba(path):
 
 class _Scene:
     """Decoded teleport scene: displayed frames (clipped, straight
-    alpha) + raw diff baselines (f0, f58 with the hide-triangle)."""
+    alpha), raw diff baselines (f0/f58 with the hide-triangle), and
+    precomputed transition composites.
 
-    __slots__ = ('frames', 'raws')
+    The materialize/dematerialize composites (held frame at ramping
+    alpha + sparkle overlay) are deterministic per transition, so they
+    are precomputed in the background decode thread (``trans_mat`` /
+    ``trans_demat``, lists of 22 pygame surfaces each, freshly
+    randomized sparkle slots per precompute — site regenerates slots
+    every transition).  Computing them on the render thread cost
+    40-100+ ms per beat on the Pi and dropped the whole display's
+    frame rate during the effects.  ``None`` until ready; update()
+    falls back to the slow on-the-fly composite when missing."""
+
+    __slots__ = ('frames', 'raws', 'trans_mat', 'trans_demat')
 
     def __init__(self, frames, raws):
         self.frames = frames   # list of 60 (H,W,4) uint8 arrays
         self.raws = raws       # {frame_idx: (H,W,4) uint8} diff baselines
+        self.trans_mat = None      # [22] surfaces, beat t = alpha t/21
+        self.trans_demat = None    # [22] surfaces, beat t = fade-out
 
 
 class TeleportRoom:
@@ -208,6 +228,7 @@ class TeleportRoom:
         self._scene_lock = threading.Lock()
         self._decode_thread = None
         self._stop_event = threading.Event()
+        self._fallback_warned = False
 
         self.phase = self.GAP
         self.phase_frame = 0
@@ -233,8 +254,8 @@ class TeleportRoom:
                 log.info('teleport-room: anchor/clip tiles missing — '
                          'disabled')
                 return
-            self.origin_x = anchor[0] + OFF_X
-            self.origin_y = anchor[1] + OFF_Y
+            self.origin_x = anchor[0] + OFF_X + ORIGIN_FIX_X
+            self.origin_y = anchor[1] + OFF_Y + ORIGIN_FIX_Y
             poly = []
             for ref, x, y in CLIP_POINTS:
                 px, py = resolve_point(self.tiles, ref, x, y)
@@ -254,6 +275,11 @@ class TeleportRoom:
                      self.origin_x, self.origin_y, len(self.items))
             self._decode_scene(0)
             self._decode_scene(1 % max(1, len(self.items)))
+            # Scene 0's transitions are needed ~330 ms after boot (the
+            # first gap) — precompute them synchronously so the very
+            # first materialize never hits the slow render-path
+            # fallback.
+            self._precompute_transitions(0)
         except Exception as e:
             self.prepare_failed = True
             log.warning('teleport-room: prepare failed: %s', e)
@@ -305,20 +331,73 @@ class TeleportRoom:
     def _decode_worker_loop(self):
         while not self._stop_event.is_set():
             idx = None
+            transitions = False
             with self._scene_lock:
                 if self._scene_requests:
-                    idx = self._scene_requests.pop(0)
-                    if idx in self.scenes or idx in self._loading:
-                        idx = None
+                    job = self._scene_requests.pop(0)
+                    if isinstance(job, tuple):
+                        # ('trans', idx): precompute transitions for a
+                        # decoded scene (off the render thread).
+                        idx, transitions = job[1], True
+                        if idx not in self.scenes:
+                            idx = None
+                    else:
+                        idx = job
+                        if idx in self.scenes or idx in self._loading:
+                            idx = None
             if idx is None:
                 time.sleep(0.05)
                 continue
-            self._decode_scene(idx)
+            if transitions:
+                self._precompute_transitions(idx)
+            else:
+                self._decode_scene(idx)
 
     def _request_scene(self, idx):
         with self._scene_lock:
-            if idx not in self.scenes and idx not in self._loading:
+            if idx not in self.scenes and idx not in self._loading \
+                    and idx not in [j for j in self._scene_requests
+                                    if not isinstance(j, tuple)]:
                 self._scene_requests.append(idx)
+
+    def _request_transitions(self, idx):
+        with self._scene_lock:
+            if idx in self.scenes \
+                    and self.scenes[idx].trans_mat is None:
+                self._scene_requests.append(('trans', idx))
+
+    def _precompute_transitions(self, idx):
+        """Build all 22 materialize + 22 dematerialize composites for a
+        scene in the worker thread.  Sparkle slots are generated ONCE
+        per transition (site semantics — beats share the slot set and
+        differ only in sprite column); fresh randomness comes from the
+        per-cycle decode (scenes are dropped after playing)."""
+        scene = self.scenes.get(idx)
+        if scene is None or scene.trans_mat is not None:
+            return
+        if self.sprites is None or self.bg_px is None:
+            return
+        t0 = time.perf_counter()
+
+        def build(held, alpha_fn):
+            slots = self._diff_slots(scene, held)
+            out = []
+            for beat in range(MATERIALIZE_FRAMES):
+                arr = _composite_pixels(
+                    scene.frames[min(held, 59)], alpha_fn(beat), beat,
+                    slots, self.sprites, self.clip_mask)
+                out.append(_make_surface(arr))
+            return out
+
+        # materialize: held f0, alpha t/21
+        mat = build(0, lambda t: t / (MATERIALIZE_FRAMES - 1))
+        # dematerialize: held f58, alpha 1-min(1,t/14)
+        demat = build(DEMAT_ENTRY_FRAME,
+                      lambda t: 1 - min(1, t / FADE_DIV))
+        scene.trans_mat = mat
+        scene.trans_demat = demat
+        log.info('teleport-room: transitions for scene %d ready '
+                 '(%.1fs)', idx + 1, time.perf_counter() - t0)
 
     def poll_scenes(self):
         """Drop finished scenes is unnecessary; request-ahead happens in
@@ -350,6 +429,10 @@ class TeleportRoom:
                 frames.append(px)
             self.scenes[idx] = _Scene(frames, raws)
             log.info('teleport-room: scene %d ready (%s)', idx + 1, name)
+            # Queue transition precompute right after decode (runs one
+            # scene ahead of playback).
+            with self._scene_lock:
+                self._scene_requests.append(('trans', idx))
         except Exception as e:
             log.warning('teleport-room: scene %d failed: %s', idx + 1, e)
         finally:
@@ -364,17 +447,28 @@ class TeleportRoom:
         if self.phase == self.GAP:
             self.phase_frame += 1
             if self.phase_frame >= GAP_FRAMES:
-                if self.current in self.scenes:
+                scene = self.scenes.get(self.current)
+                if scene is not None and scene.trans_mat is not None:
                     # Engine counter frozen at -1 through materialize —
                     # worker keeps decoding f0; beat 0 = sparkles only.
                     self.slot_frame = 0
                     self.phase = self.MATERIALIZE
                     self.phase_frame = 1   # beat 0 displayed below
                     self.held_frame = 0
-                    self.generate_slots(0)
-                    self._composite(0.0, 0)
+                    self._show_transition(scene.trans_mat, 0, 0.0, 0)
                     self._request_scene(
                         (self.current + 1) % len(self.items))
+                elif scene is not None:
+                    # Scene decoded but transitions still precomputing
+                    # in the worker — wait (request again), so a slow
+                    # precompute stretches the gap instead of forcing
+                    # the slow render-path composite.
+                    self._request_transitions(self.current)
+                    if self.phase_frame >= GAP_FRAMES * 8:
+                        self.phase = self.MATERIALIZE  # give up waiting
+                        self.phase_frame = 1
+                        self.held_frame = 0
+                        self._show_transition(None, 0, 0.0, 0)
                 elif self.phase_frame >= GAP_FRAMES * 8:
                     self.current = (self.current + 1) % len(self.items)
                     self.phase_frame = 0
@@ -387,7 +481,12 @@ class TeleportRoom:
                 self.slot_frame = 0
                 self.phase_frame = 0   # next else-tick n=1 -> f0 (#2)
             else:
-                self._composite(
+                # Display beat t = phaseFrame (1..21); held frame stays
+                # f0 while alpha ramps t/21 and sparkles sweep column t.
+                scene = self.scenes.get(self.current)
+                self._show_transition(
+                    scene.trans_mat if scene else None,
+                    self.phase_frame,
                     self.phase_frame / (MATERIALIZE_FRAMES - 1),
                     self.phase_frame)
                 self.phase_frame += 1
@@ -400,8 +499,9 @@ class TeleportRoom:
                 self.phase = self.DEMATERIALIZE
                 self.phase_frame = 1   # beat 0 displayed below
                 self.held_frame = DEMAT_ENTRY_FRAME
-                self.generate_slots(DEMAT_ENTRY_FRAME)
-                self._composite(1.0, 0)
+                scene = self.scenes.get(self.current)
+                self._show_transition(scene.trans_demat if scene else None,
+                                      0, 1.0, 0)
             else:
                 # Live play shows the FULL scene: [f0 x3, f1..f57].
                 self.slot_frame = 0 if self.phase_frame <= 1 \
@@ -420,18 +520,21 @@ class TeleportRoom:
                 self.phase_frame = 0
             else:
                 # ALL beats hold f58 under alpha 1-min(1,t/14).
+                scene = self.scenes.get(self.current)
                 a = 1 - min(1, self.phase_frame / FADE_DIV)
-                self._composite(a, self.phase_frame)
+                self._show_transition(
+                    scene.trans_demat if scene else None,
+                    self.phase_frame, a, self.phase_frame)
                 self.phase_frame += 1
 
     # ─── sparkle slots ─────────────────────────────────────────────────
 
-    def generate_slots(self, frame_idx):
-        """Diff held frame vs empty-room bg on the quant grid."""
-        scene = self.scenes.get(self.current)
+    def _diff_slots(self, scene, frame_idx):
+        """Diff held frame vs empty-room bg on the quant grid.
+
+        Pure (no self mutation) — safe to call from the worker thread."""
         if scene is None or self.bg_px is None:
-            self.slots = []
-            return
+            return []
         px = scene.raws.get(min(frame_idx, 59))
         if px is None:
             px = scene.frames[min(frame_idx, 59)]
@@ -441,15 +544,25 @@ class TeleportRoom:
         diff = np.abs(self.bg_px[ys][:, xs, :3].astype(np.int16)
                       - px[ys][:, xs, :3].astype(np.int16)) >= 16
         yy, xx = np.nonzero(diff.any(axis=2))
-        self.slots = [(int(xs[j]), int(ys[i]),
-                       random.randrange(SPRITE_VARIANTS),
-                       random.randint(-3, 3))
-                      for i, j in zip(yy, xx)]
+        return [(int(xs[j]), int(ys[i]),
+                 random.randrange(SPRITE_VARIANTS),
+                 random.randint(-3, 3))
+                for i, j in zip(yy, xx)]
+
+    def generate_slots(self, frame_idx):
+        """Render-path fallback: refresh self.slots for the current
+        scene (precomputed transitions don't need this)."""
+        self.slots = self._diff_slots(self.scenes.get(self.current),
+                                      frame_idx)
 
     # ─── compositing (canvas drawSlots semantics, straight alpha) ──────
 
     def _composite(self, alpha, t):
-        """Held frame at ramping alpha + overlay-blend sparkles."""
+        """Held frame at ramping alpha + overlay-blend sparkles.
+
+        Slow render-path FALLBACK only — the worker precomputes every
+        transition beat (see _precompute_transitions); this runs when a
+        transition surface isn't ready yet."""
         scene = self.scenes.get(self.current)
         if scene is None:
             return
@@ -458,6 +571,19 @@ class TeleportRoom:
         self._staging = _composite_pixels(
             src, alpha, t, self.slots, self.sprites, self.clip_mask)
         self._last_composite_ms = (time.perf_counter() - t0) * 1000.0
+
+    def _show_transition(self, surf_list, beat, alpha, t):
+        """Display a transition beat from precomputed surfaces (fast
+        path) or fall back to on-the-fly compositing."""
+        if surf_list is not None:
+            self._staging = surf_list[min(beat, MATERIALIZE_FRAMES - 1)]
+            return
+        if not self._fallback_warned:
+            log.warning('teleport-room: transitions not ready — '
+                        'using slow render-path composite')
+            self._fallback_warned = True
+        self.generate_slots(self.held_frame)
+        self._composite(alpha, t)
 
     # ─── render / queries ──────────────────────────────────────────────
 
@@ -468,7 +594,9 @@ class TeleportRoom:
         scene = self.scenes.get(self.current)
         if self.phase in (self.MATERIALIZE, self.DEMATERIALIZE) \
                 and self._staging is not None:
-            surf = _surface(self._staging)
+            surf = self._staging \
+                if isinstance(self._staging, pygame.Surface) \
+                else _surface(self._staging)
         elif self.phase == self.PLAY and scene is not None:
             surf = _surface(scene.frames[min(self.slot_frame, 59)])
         else:
@@ -597,18 +725,24 @@ def _sprite_cell_bbox(sprites, variant, col):
 _surf_cache = {}
 
 
+def _make_surface(arr):
+    """(H,W,4) uint8 array -> fresh pygame surface (no caching)."""
+    return pygame.image.frombuffer(arr.tobytes(), (WIDTH, HEIGHT),
+                                   'RGBA').convert_alpha()
+
+
 def _surface(arr):
     """(H,W,4) uint8 array -> pygame surface.
 
     Cached per array identity; entries keep a reference to the source
-    array so ids cannot be recycled while cached.
-    """
+    array so ids cannot be recycled while cached.  Used by the PLAY
+    path (60 rotating frames per scene); transitions use _make_surface
+    directly and hold their surfaces in the scene."""
     key = id(arr)
     hit = _surf_cache.get(key)
     if hit is not None and hit[0] is arr:
         return hit[1]
-    surf = pygame.image.frombuffer(arr.tobytes(), (WIDTH, HEIGHT),
-                                   'RGBA').convert_alpha()
+    surf = _make_surface(arr)
     if len(_surf_cache) > 8:
         _surf_cache.clear()
     _surf_cache[key] = (arr, surf)
