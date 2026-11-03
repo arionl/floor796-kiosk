@@ -385,7 +385,7 @@ no external dependencies).  All endpoints return JSON unless noted.
 | `GET /health` | 24-hour health trends (RSS, CPU, FPS with min/max/avg) |
 | `GET /heatmap[?window=1h]` | Viewport visit heatmap as a PNG image |
 | `GET /coverage[?window=30m]` | Tile coverage grid with per-tile visit counts |
-| `GET /objects` | Per-object highlight stats (id, title, views, last shown) for all 804 objects |
+| `GET /objects` | Per-object highlight stats (id, title, views, last shown) for all 855 objects |
 | `GET /objects/recent?n=20` | N most recently highlighted objects |
 | `GET /objects/summary?window=30m&limit=10` | Windowed summary: most-viewed, most-recent, coverage % |
 | `POST /overlay` | Toggle on-screen overlay: `{"enabled": true}` |
