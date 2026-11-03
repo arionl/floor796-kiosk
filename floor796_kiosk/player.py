@@ -278,41 +278,6 @@ class StatusDisplay:
         pygame.display.flip()
 
 
-class MemoryWarningBanner:
-    """Persistent on-screen banner for low-RAM devices.
-
-    Shown when total system RAM < 4 GB.  The tile cache is too small to
-    keep all in-view tiles loaded, so the user sees blank/missing tiles
-    while wandering.  The banner pre-renders once and is blitted every
-    frame — zero per-frame allocation cost.
-    """
-
-    BANNER_H = 44
-
-    def __init__(self, screen, total_mem_mb, overscan_margin=0):
-        w = screen.get_width()
-        self.overscan_margin = overscan_margin
-        self.surf = pygame.Surface((w, self.BANNER_H), pygame.SRCALPHA)
-
-        # Semi-transparent amber background
-        self.surf.fill((180, 100, 0, 210))
-        # Bottom border line for visual separation
-        pygame.draw.line(self.surf, (255, 180, 0, 255),
-                         (0, self.BANNER_H - 1), (w, self.BANNER_H - 1), 2)
-
-        font = pygame.font.Font(None, 26)
-        ram_gb = total_mem_mb / 1024
-        msg = (f"WARNING: {ram_gb:.0f} GB RAM detected — "
-               f"4 GB recommended for smooth playback. "
-               f"Some tiles may appear blank.")
-        text = font.render(msg, True, (255, 240, 200))
-        text_rect = text.get_rect(center=(w // 2, self.BANNER_H // 2))
-        self.surf.blit(text, text_rect)
-
-    def render(self, screen):
-        screen.blit(self.surf, (0, self.overscan_margin))
-
-
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
 
 def prepare_strips(tiles_meta, status=None, display_depth=16):
@@ -1657,21 +1622,15 @@ def main():
 
     status = create_status_display(screen)
 
-    # ── Low-memory startup warning ──
-    # This is the very first thing the user sees. If the board has less
-    # than ~4 GB RAM the tile cache will be too small to keep all in-view
-    # tiles loaded — we tell the user up front.
+    # ── Low-memory handling ──
+    # 2 GB boards run the full feature set (16-bit strips, capped tile
+    # cache — measured working, arion 2026-11-02). No user-facing
+    # warning; keep only the journal note for diagnostics.
     low_memory = 0 < total_mem_mb < LOW_MEM_THRESHOLD_MB
     if low_memory:
-        ram_gb = total_mem_mb / 1024
-        log.warning("Low memory: %d MB (%.0f GB) — below 4 GB recommendation. "
-                    "Banner will be shown.", total_mem_mb, ram_gb)
-        status.show(
-            f"WARNING: {ram_gb:.0f} GB RAM",
-            "4 GB recommended for smooth playback. "
-            "Some tiles may appear blank.",
-        )
-        time.sleep(4)
+        log.info("Low memory board: %d MB — 16-bit strips, capped tile "
+                 "cache (no banner).", total_mem_mb)
+        time.sleep(0.5)
     else:
         status.show("Floor796 Kiosk", "Starting up...")
         time.sleep(0.5)
@@ -1951,13 +1910,9 @@ def main():
             teleport.live_index)
         log.info("Highlighter teleport gating enabled")
 
-    # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
-    mem_banner = None
-    if low_memory:
-        mem_banner = MemoryWarningBanner(screen, total_mem_mb,
-                                         overscan_margin=args.overscan_margin)
-        log.info("Memory warning banner enabled (%d MB < %d MB, overscan margin %dpx)",
-                 total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
+    # ── Persistent low-memory banner: REMOVED (arion 2026-11-02) — the
+    # 2 GB Pi 5 runs the full feature set; the budget/depth logic
+    # handles constrained boards without nagging the viewer. ──
 
     running = True
 
@@ -2316,9 +2271,7 @@ def main():
             snap = stats_collector.snapshot()
             stats_overlay.render(screen, snap)
 
-        # ── Persistent low-memory warning banner ──
-        if mem_banner:
-            mem_banner.render(screen)
+        # ── Persistent low-memory warning banner: removed ──
         _t_post = (time.perf_counter() - _t_post0) * 1000
 
         # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
