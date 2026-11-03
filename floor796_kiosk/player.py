@@ -683,6 +683,56 @@ class TileCache:
         return self.cache.get(tile_id)
 
 
+def _rect_subtract(a, b):
+    """Rectangle subtraction: rects covering `a` minus `b` (0-4 rects).
+    The pygame equivalent of tvOS's even-odd mask hole."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return [a]
+    out = []
+    if ax < ix1:
+        out.append((ax, ay, ix1 - ax, ah))
+    if ix2 < ax + aw:
+        out.append((ix2, ay, ax + aw - ix2, ah))
+    if ay < iy1:
+        out.append((ix1, ay, ix2 - ix1, iy1 - ay))
+    if iy2 < ay + ah:
+        out.append((ix1, iy2, ix2 - ix1, ay + ah - iy2))
+    return out
+
+
+def _draw_ghost_box(screen, color, rect, excl, width=2):
+    """Draw an outlined box, CLIPPED against the exclusion rect (the
+    highlighted object's content area) — a box that overlaps the
+    highlight has its lines inside the hole suppressed instead of
+    drawn over the artwork.  Port of the tvOS ghost-layer even-odd
+    mask (HighlighterOverlayView.updateGhostBoxes, arion 2026-11-01).
+    Emphasized: light gray, same weight as the red box's steady
+    stroke, rounded corners on the unclipped path."""
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return
+    if excl is None or excl.width <= 0:
+        pygame.draw.rect(screen, color, rect, width,
+                         border_radius=max(2, width + 1))
+        return
+    # Outline as 4 filled edge rects, each minus the exclusion.
+    t = width
+    edges = [
+        (x, y, w, t),                    # top
+        (x, y + h - t, w, t),            # bottom
+        (x, y + t, t, h - 2 * t),        # left
+        (x + w - t, y + t, t, h - 2 * t)  # right
+    ]
+    for e in edges:
+        for r in _rect_subtract(e, tuple(excl)):
+            if r[2] > 0 and r[3] > 0:
+                pygame.draw.rect(screen, color, r)
+
+
 class ModeToast:
     """Transient bottom-center capsule announcing mode changes (tvOS
     showCapsule parity; kiosk wording mentions the keyboard)."""
@@ -2204,9 +2254,11 @@ def main():
         _t_high0 = time.perf_counter()
 
         # ── Exploring: gray ghost boxes for other jump targets ──
-        # tvOS parity (HighlighterOverlayView ghost boxes): while
-        # exploring, other selectable objects in the viewport get a
-        # subtle gray outline so the next jump target is visible.
+        # tvOS parity (HighlighterOverlayView ghost boxes): light-gray
+        # outlined boxes on every selectable object in the viewport,
+        # CLIPPED with a hole over the highlighted object's content
+        # area (even-odd mask on tvOS; rect-subtracted edges here) so
+        # neighboring boxes never draw over the highlighted artwork.
         # Withheld during flight (tvOS withholds until the destination
         # is rendered); the selected object's own segments are excluded
         # by obj_id.
@@ -2216,16 +2268,20 @@ def main():
                 and explorer.selection is not None
                 and not explorer.is_flying):
             _sel = explorer.selection
+            _excl = pygame.Rect(
+                int(_sel.abs_x1 - pos_x) - 2, int(_sel.abs_y1 - pos_y) - 2,
+                int(_sel.abs_x2 - _sel.abs_x1) + 4,
+                int(_sel.abs_y2 - _sel.abs_y1) + 4)
             for _seg in explorer.viewport_objects(
                     pos_x, pos_y, args.width, args.height):
                 if _seg.obj_id == _sel.obj_id:
                     continue
-                pygame.draw.rect(
-                    screen, (110, 110, 122),
-                    pygame.Rect(int(_seg.abs_x1 - pos_x),
-                                int(_seg.abs_y1 - pos_y),
-                                int(_seg.abs_x2 - _seg.abs_x1),
-                                int(_seg.abs_y2 - _seg.abs_y1)), 1)
+                _draw_ghost_box(
+                    screen, (205, 205, 215),
+                    (int(_seg.abs_x1 - pos_x), int(_seg.abs_y1 - pos_y),
+                     int(_seg.abs_x2 - _seg.abs_x1),
+                     int(_seg.abs_y2 - _seg.abs_y1)),
+                    _excl, width=2)
         _t_ghost = (time.perf_counter() - _t_ghost0) * 1000
 
         # ── Object highlighter ──

@@ -1506,7 +1506,12 @@ class ObjectHighlighter:
         if type_surf is not None:
             screen.blit(type_surf, (fx, fy))
 
-        # Progress bar (right side, takes remaining width)
+        # Progress bar (right side, takes remaining width) — NOT shown
+        # for a forced (Exploring) target: the selection only changes
+        # when the user acts, so a countdown bar is meaningless noise
+        # (arion; tvOS exploring panels carry no timer either).
+        if self._forced_seg is not None:
+            return
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
         bar_h = max(2, int(3 * self._ui_scale))
         bar_y = fy + int(16 * self._ui_scale)
