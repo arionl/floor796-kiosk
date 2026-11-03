@@ -60,6 +60,7 @@ except ImportError:
 # degradation for the mode system; a broken install should fail loud).
 from floor796_kiosk.modes import Mode, ModeMachine
 from floor796_kiosk.explorer import Explorer
+from floor796_kiosk.splash import create_status_display
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -1649,7 +1650,7 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    status = StatusDisplay(screen)
+    status = create_status_display(screen)
 
     # ── Low-memory startup warning ──
     # This is the very first thing the user sees. If the board has less
@@ -1846,6 +1847,7 @@ def main():
 
     log.info("Player ready. Map: %dx%d (%dx%d tiles), %d animated.",
              map_w, map_h, grid_cols, grid_rows, anim_count)
+    status.release()     # free the splash strip (~120 MB) before the loop
     log.info("Animation: %d fps, %d-frame loop (%.1fs).",
              args.fps, TILE_FRAMES, TILE_FRAMES / args.fps)
 
