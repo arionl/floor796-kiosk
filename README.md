@@ -4,14 +4,19 @@ A self-contained animated pixel-art kiosk that displays the
 [floor796.com](https://floor796.com) interactive isometric map on a dedicated
 display — designed for Raspberry Pi 5 and OrangePi 5 Max.
 
-The player boots from cold-start, automatically pans across the full animated
-scene ensuring every tile is visited, and keeps the display on 24/7 with no
-screensaver or sleep.  As objects scroll into view, the highlighter identifies
-them from floor796.com's changelog, drawing a bounding box with a zoom-in
-animation, breathing glow, and info panel with title, date, and thumbnail
-(YouTube, image, video, Wikipedia, or interactive).  When the floor796 author
-publishes new tiles, they are automatically downloaded and incorporated on the
-next boot.
+The player boots from cold-start into a splash screen (floor796's own
+station animation), automatically pans across the full animated scene
+ensuring every tile is visited, and keeps the display on 24/7 with no
+screensaver or sleep.  As objects scroll into view, the highlighter
+identifies them from floor796.com's changelog, drawing a bounding box
+with a zoom-in animation, breathing glow, and info panel with title,
+date, and thumbnail (YouTube, image, video, Wikipedia, or interactive).
+The site's teleporter room plays in the corner with site-exact
+materialize/play/dematerialize transitions.  A keyboard (or the HTTP
+control endpoints) switches between three camera modes: Wandering
+(auto tour), Navigating (manual pan), and Exploring (object-to-object
+jumps).  When the floor796 author publishes new tiles, they are
+automatically downloaded and incorporated on the next boot.
 
 ![Floor796 Kiosk — object highlighter](screenshot.png)
 
@@ -32,7 +37,22 @@ next boot.
   pixel-level density mask) keep the viewport hugging actual pixel-art content,
   not blank tile-grid borders.  A* pathfinding through a safe-region grid
   ensures transit stays on content.
-- **Object highlighter** — automatically identifies and labels 804 objects from
+- **Three camera modes** — `Wandering` (the default self-driving tour),
+  `Navigating` (free manual pan), and `Exploring` (object-to-object jumps:
+  one arrow keypress flies the camera to the nearest object in that
+  direction, with gray ghost boxes marking the other jump targets in view,
+  clipped so they never cover the highlighted artwork).  SPACE cycles the
+  modes; a transient capsule announces each change.
+- **Teleporter room** — a site-exact port of floor796.com's teleport room:
+  8 scenes cycle automatically with 22-beat materialize (sparkle columns),
+  60-tick play, and 22-beat dematerialize transitions.  All transition beats
+  are pre-rendered at boot and cached on disk, so the render loop only blits
+  (~1.5 ms/frame).  Objects linked to a teleport pad are highlightable only
+  while that pad is playing.
+- **Boot splash** — floor796's about-section station animation loops in a
+  framed square over the boot status/progress.  The clip is decoded once to
+  a cached frame strip; boots after the first only blit.
+- **Object highlighter** — automatically identifies and labels 855 objects from
   floor796.com's changelog as they scroll into view.  Each highlight features a
   zoom-in intro animation (viewport bounds contract to the object over 0.5s),
   followed by a breathing glow effect.  Deterministic LRU selection ensures
@@ -70,9 +90,10 @@ next boot.
 | Network            | Internet for initial download + updates          |
 | Storage            | 4 GB free (tiles + decoded strips)               |
 
-> **2 GB boards** (e.g. Raspberry Pi 5 2 GB) are supported with a reduced tile
-> cache (8 tiles vs 18) and a low-memory warning banner.  The player uses ~1.5 GB
-> RSS and relies on swap under heavy load.  4 GB+ is recommended for headroom.
+> **2 GB boards** (e.g. Raspberry Pi 5 2 GB) run the full feature set with a
+> reduced tile cache (8 tiles, 16-bit strips) — ~1.45 GB RSS.  The tile-cache
+> budget adapts automatically to board RAM and strip depth; no user-facing
+> warnings.  4 GB+ is recommended for headroom.
 
 ---
 
@@ -96,6 +117,9 @@ fetched automatically on the first boot of the player:
 
 - ~123 MB of tiles from floor796.com
 - Object labels (changelog.json)
+- Boot splash animation strip (decoded once from the bundled mp4)
+- Teleporter room scenes + pre-rendered transitions (~54 MB, rendered in the
+  background while the room cycles)
 - Decoded frame strips (~8 minutes)
 - Content density mask (~2 minutes)
 
@@ -112,11 +136,15 @@ floor796-kiosk/
 │   ├── __main__.py               Entry point: python -m floor796_kiosk
 │   ├── paths.py                  Centralized path management
 │   ├── board_detect.py           Board detection (Pi 5 / OrangePi / generic)
-│   ├── player.py                 Main player (rendering + wandering)
+│   ├── player.py                 Main player (rendering, modes, ghost boxes)
 │   ├── tile_manager.py           Tile download + auto-update logic
 │   ├── content_mask.py           Content density mask generator
 │   ├── hologram.py               Hologram scene overlay
-│   ├── highlighter.py            Object highlighter (804 objects, LRU selection)
+│   ├── teleport.py               Teleporter room overlay (pre-rendered transitions)
+│   ├── modes.py                  Camera mode state machine (W/N/E)
+│   ├── explorer.py               Exploring-mode object-to-object navigation
+│   ├── splash.py                 Boot splash (station animation strip)
+│   ├── highlighter.py            Object highlighter (855 objects, LRU selection)
 │   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki, tenor, fandom, web)
 │   ├── cpu_affinity.py           big.LITTLE CPU core pinning
 │   └── stats/
@@ -139,6 +167,14 @@ floor796-kiosk/
 │   ├── prefetch_thumbnails.py    [Operator] Pre-fetch all thumbnails offline (all link types)
 │   ├── test_tile_update.py       [Test] Tile update engine regression suite (local fake server)
 │   ├── test_hologram_fixes.py    [Test] Hologram/highlighter regression suite (headless)
+│   ├── test_teleport.py          [Test] Teleport room: phases, slots, compositing (22 cases)
+│   ├── test_modes.py             [Test] Camera mode state machine
+│   ├── test_explorer.py          [Test] Exploring-mode selection geometry + flight
+│   ├── test_ghost_boxes.py       [Test] Ghost-box clipping (exclusion hole)
+│   ├── test_splash.py            [Test] Boot splash strip decode/cache/fallback
+│   ├── test_mem_budget.py        [Test] Depth-aware tile-cache memory budget
+│   ├── test_depth_convert.py     [Test] Strip 24→32-bit numpy conversion
+│   ├── test_panel_occlusion.py   [Test] Highlighter panel occlusion rules
 │   ├── sim_wander.py             [Maintained] Wanderer coverage simulation
 │   ├── sim_heatmap.py            [Maintained] Wanderer heatmap simulation + visualization
 │   ├── sim_prefetch_v3.py        [Maintained] Tile prefetch/cache eviction simulation
@@ -224,6 +260,53 @@ diamond shape means ~66% of each tile is background).  This mask is used by:
 The mask is built on first boot (or whenever `cache/content_mask.npz` is
 missing) and cached.  A progress bar is shown on-screen during the build.
 
+### Camera Modes
+
+The player has three canonical camera modes, cycled with SPACE:
+
+1. **Wandering** (default) — the self-driving coverage tour.  Arrow keys
+   are inert here.
+2. **Navigating** — free manual pan with the arrow keys.  Object
+   highlighting is off while hand-driving the camera.
+3. **Exploring** — object-to-object navigation.  Each arrow keypress
+   flies the camera (0.4 s eased flight, 0.3 s landing cooldown) to the
+   nearest selectable object in that direction — nearest within a 90°
+   cone first, then the 180° half-plane, otherwise stay put.  The
+   selected object gets the red box + info panel (no countdown bar —
+   it stays until the next jump); every other selectable object in
+   view gets a gray ghost box, clipped so its lines never draw over
+   the highlighted artwork.  Entering the mode re-anchors to the
+   object nearest the view center.
+
+Returning to Wandering resumes the tour from the current camera —
+never a snap-back to a previous position.  A transient capsule at the
+bottom of the screen announces each mode change.
+
+### Teleporter Room
+
+The site's teleporter room (a 289×412 overlay near the top-left of the
+map) cycles through its scenes automatically: a 22-beat materialize
+with sparkle columns, a 60-tick play phase, and a 22-beat
+dematerialize, then the next scene.  The implementation is site-exact
+(verified against the live site's render semantics), including the
+clip polygon and the black hide-triangle.
+
+All transition beats are pre-rendered once (first boot, in a
+background worker) and persisted to `assets/teleport/`; the render
+loop only blits the cached frames (~1.5 ms/frame).  Scene content
+downloads and caches on-device like everything else, and the scene
+count adapts if the site adds more teleports.
+
+### Boot Splash
+
+During boot, floor796's about-section station animation loops in a
+centered, framed square at 66% of screen height, with the boot status
+text and progress bar underneath.  The mp4 is ffmpeg-decoded once into
+a 60-frame strip (the same pipeline as tile strips) and cached in
+`cache/splash/`; the strip is freed before the main render loop
+starts.  If the assets or ffmpeg are unavailable, the boot screen
+falls back to plain status text.
+
 ### Auto-Update
 
 At startup, `tile_manager.py` fetches `matrix.json` from floor796.com to check
@@ -233,7 +316,7 @@ back to the existing cache — the kiosk always boots, online or offline.
 ### Object Highlighter
 
 The `ObjectHighlighter` class in `highlighter.py` automatically identifies and
-labels objects from floor796.com's changelog (804 objects) as the wanderer
+labels objects from floor796.com's changelog (855 objects) as the wanderer
 brings them into view.
 
 **Selection algorithm** — deterministic LRU (least-recently-used):
@@ -307,6 +390,8 @@ no external dependencies).  All endpoints return JSON unless noted.
 | `GET /objects/summary?window=30m&limit=10` | Windowed summary: most-viewed, most-recent, coverage % |
 | `POST /overlay` | Toggle on-screen overlay: `{"enabled": true}` |
 | `POST /overlay/window` | Set overlay time window: `{"window": "1h"}` or `{"cycle": true}` |
+| `POST /viewport` | Pin camera to a map position `{"x": .., "y": ..}` (pauses wandering); `{"resume": true}` resumes |
+| `POST /mode` | Switch camera mode: `{"mode": "wandering" \| "navigating" \| "exploring"}` |
 | `GET /screenshot` | PNG capture of the live viewport (highlighter + scene) |
 
 **On-screen overlay** — press `S` to toggle a semi-transparent stats panel
@@ -394,8 +479,8 @@ When a keyboard/mouse is connected during maintenance:
 
 | Key             | Action                     |
 |-----------------|----------------------------|
-| Space           | Toggle auto-wandering      |
-| Arrow keys      | Pan manually               |
+| Space           | Cycle camera mode: Wandering → Navigating → Exploring → Wandering |
+| Arrow keys      | Navigating: pan manually.  Exploring: jump to the next object in that direction.  Inert in Wandering. |
 | V               | Print coverage stats       |
 | O               | Toggle object highlighter  |
 | L               | Switch label mode (corner/inline) |
@@ -460,9 +545,9 @@ and re-fetch thumbnails on next boot.
 | Render rate         | 30 fps (vsync)   | 30 fps (vsync)   | ~17 fps (4K)¹    |
 | Animation rate      | 12 fps           | 12 fps           | 12 fps           |
 | Resolution          | 1080p (capped)   | 1080p (capped)   | native (up to 4K)|
-| Memory (RSS)        | ~2.4 GB          | ~1.5 GB          | ~2.7 GB          |
-| Swap                | 0 MB             | ~450 MB          | 0 MB             |
-| Tile cache          | 18 tiles         | 8 tiles          | 18+ tiles        |
+| Memory (RSS)        | ~2.9 GB          | ~1.45 GB         | ~2.7 GB          |
+| Swap                | 0 MB             | some (tight headroom) | 0 MB        |
+| Tile cache          | 10 tiles @32-bit | 8 tiles @16-bit  | 18+ tiles        |
 | CPU                 | ~50% (1 core)    | ~50% (1 core)    | ~30% (1 big core)|
 | Cold-boot (warm)    | ~20s             | ~20s             | ~20s             |
 | Full coverage       | ~25 min          | ~25 min          | ~25 min          |
@@ -473,8 +558,11 @@ and re-fetch thumbnails on next boot.
 > also achieves 30 fps (vsync).
 >
 > Boards with ≤4 GB RAM are automatically capped at 1080p to prevent OOM.
-> The 2 GB Pi 5 uses a reduced tile cache (8 tiles) and shows a low-memory
-> warning banner.  All boards use identical KMSDRM rendering with hardware GLES.
+> The tile-cache budget prices each slot at the real per-depth strip cost
+> (201 MB at 32-bit, 100 MB at 16-bit) and adapts to board RAM: 4 GB boards
+> hold ~10 display-format strips with zero swap; boards under 3.9 GB keep
+> 16-bit strips (~8 tiles on 2 GB).  All boards use identical KMSDRM
+> rendering.
 
 ---
 
@@ -510,6 +598,14 @@ python3 tools/prefetch_thumbnails.py
 ```bash
 python3 tools/test_tile_update.py     # tile update engine (24 checks)
 python3 tools/test_hologram_fixes.py  # hologram + highlighter (40 checks)
+python3 tools/test_teleport.py        # teleport room (22 cases)
+python3 tools/test_modes.py           # camera mode state machine
+python3 tools/test_explorer.py        # exploring-mode navigation
+python3 tools/test_ghost_boxes.py     # ghost-box clipping
+python3 tools/test_splash.py          # boot splash strip
+python3 tools/test_mem_budget.py      # tile-cache memory budget
+python3 tools/test_depth_convert.py   # strip depth conversion
+python3 tools/test_panel_occlusion.py # panel occlusion rules
 ```
 
 **Maintained simulations** — import the real classes from the
