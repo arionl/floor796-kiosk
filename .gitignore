@@ -1,5 +1,7 @@
 # Downloaded assets — cached locally, not tracked in git
 assets/
+# …except shipped app chrome (splash assets)
+!assets/splash/
 # Generated cache — rebuilt automatically, not tracked in git
 cache/
 # Legacy directories (pre-refactor)

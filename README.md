@@ -247,7 +247,11 @@ brings them into view.
    (never-shown objects have timestamp 0 = highest priority).  Ties are broken
    by closeness to viewport center.
 3. **Scroll-off safety** — mid-highlight, if the object scrolls out of view
-   (due to wanderer movement), the highlight is aborted cleanly.
+   (due to wanderer movement), the highlight is aborted cleanly.  The same
+   abort fires if the object drifts behind the opaque corner info panel,
+   and selection additionally predicts both screen-edge and panel overlap
+   at the END of the 10-second highlight (velocity-aware), so an object
+   that would wander into the panel is never picked in the first place.
 
 This guarantees every reachable object is highlighted before any repeats — no
 random sampling, no scoring weights.

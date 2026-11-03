@@ -43,13 +43,8 @@ MIN_BBOX_SIZE = 15         # skip tiny objects (pixels), hard to see
 RECENT_BLACKLIST = 12.0    # hard cooldown (> HIGHLIGHT + PAUSE)
 MAX_HISTORY_PER_OBJ = 20   # timestamps retained per object for stats
 
-# Panel exclusion zone: objects whose bbox overlaps this rectangle in
-# the bottom-right corner are skipped during selection, since they'd
-# be visually hidden behind the info panel that shows title, thumbnail,
-# and link type. Covers the maximum panel footprint (thumbnail + 2-line
-# title + wiki extract + margin).
-PANEL_EXCLUDE_W = 380    # panel width + margin
-PANEL_EXCLUDE_H = 360    # max panel height + margin (with thumbnail)
+# Panel exclusion zone: see the PANEL_EXCLUDE_* constants defined after
+# the panel layout block below (they derive from those constants).
 
 # Edge viewing buffer: at the END of the highlight duration, the object
 # must still have at least this fraction of the viewport as clearance
@@ -115,6 +110,39 @@ PANEL_H_WITH_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_THUMB +
 PANEL_H_NO_THUMB = (PANEL_H_TITLE_BAR + PANEL_H_FOOTER +
                     PANEL_PADDING * 2)                   # ~78
 
+# Panel exclusion zone: objects whose bbox overlaps this rectangle in
+# the bottom-right corner are skipped during selection (and abort the
+# highlight mid-show), since they'd be visually hidden behind the opaque
+# info panel.  Derived from the worst-case panel footprint above so it
+# can never under-count:
+#   panel_w = max(PANEL_W, PANEL_W_NO_THUMB)            = 360
+#   panel_h = 2-line title + date + 16 + thumb + 10
+#             + 3-line extract + 10 + footer + padding  ≈ 362
+# Exclusion box = panel + PANEL_MARGIN on all sides:
+#   360 + 2·20 = 400 wide, ~362 + 2·20 ≈ 402 tall.
+# The old hand-written 380×360 under-counted height by ~42px, letting
+# objects in that band be selected (and then hidden) behind the panel.
+PANEL_EXCLUDE_W = max(PANEL_W, PANEL_W_NO_THUMB) + 2 * PANEL_MARGIN
+
+# Worst-case panel height, built bottom-up from the same pieces
+# _render_corner_panel() stacks (measured line heights at 1080p scale,
+# s=1.0; both sides scale by ui_scale in __init__):
+#   2-line title bar  2·17 + 12 (date) + 16 (gap)  =  62
+#   thumbnail         THUMB_H + 10                 = 210
+#   wiki extract      3·12 + 10                    =  46
+#   footer            PANEL_H_FOOTER               =  28
+#   bottom padding    PANEL_PADDING                =  16
+#                                                   ─────
+#   max panel height                                362
+#   + PANEL_MARGIN top & bottom                     +40 → 402
+# A small safety pad covers font-metric drift across pygame versions.
+PANEL_EXCLUDE_H = (2 * 17 + 12 + 16          # 2-line title bar
+                   + THUMB_H + 10            # thumbnail
+                   + 3 * 12 + 10             # 3-line wiki extract
+                   + PANEL_H_FOOTER          # footer
+                   + PANEL_PADDING           # bottom padding
+                   + 2 * PANEL_MARGIN        # screen margin
+                   + 8)                      # safety pad
 # Link type display metadata: (label, color)
 LINK_TYPE_META = {
     "youtube":     ("\u25b6 YouTube",       (255, 70, 70)),    # red
@@ -141,6 +169,23 @@ def parse_hologram_slot(title):
     """Return the 1-based hologram slot number referenced by a changelog
     title, or None if the title is not a hologram-slot label."""
     m = _HOLOGRAM_TITLE_RE.match(title or '')
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+# Changelog entries for teleport-room pads carry an event link like
+# 'event://pick-teleport-7||no-click||https://…'.  Groups: 1-based pad.
+_TELEPORT_LINK_RE = re.compile(r'^event://pick-teleport-(\d+)')
+
+
+def parse_teleport_link(link):
+    """Return the 1-based teleport pad number referenced by a changelog
+    event link, or None if the link is not a teleport pad."""
+    m = _TELEPORT_LINK_RE.match(link or '')
     if not m:
         return None
     try:
@@ -495,6 +540,9 @@ class ObjectHighlighter:
         # only worth highlighting while that scene is actually on.  The
         # provider lets us gate selection on live playback state.
         self._hologram_state_provider = None
+        self._teleport_state_provider = None
+        self._auto_select = True        # False while Exploring owns the box
+        self._forced_seg = None
 
         # Timestamped view history: obj_id -> [timestamps]
         # Used for recency-weighted selection and stats reporting.
@@ -513,6 +561,16 @@ class ObjectHighlighter:
         # changes, not every frame.
         # Bounded: each ~700×600 SRCALPHA surface = ~1.5MB at 4K scale.
         self._panel_bg_cache = {}  # (obj_id, has_thumb) → (Surface, panel_w, panel_h)
+        # Static rendered text per (obj_id, has_thumb): titles, date,
+        # extract lines, footer labels — font.render is ~0.3ms each and
+        # _wrap_text renders up to ~25 probes per frame; all static per
+        # highlight, so render ONCE and blit per frame (main-loop
+        # smoothness: the per-frame overlay cost drops to blits only).
+        self._text_cache = {}
+        self._static_text_cache = {}   # static strings ("Loading...", link labels)
+        self._fill_surf_cache = {}     # cached box-fill / placeholder surfaces
+        self._glow_ms = 0.0            # per-frame glow render time (telemetry)
+        self._panel_ms = 0.0           # per-frame panel render time (telemetry)
         # Maximum entries in each overlay cache. At ~2.5MB combined per
         # entry at 4K, 24 entries = ~60MB ceiling.
         self._max_overlay_cache_entries = 24
@@ -557,6 +615,17 @@ class ObjectHighlighter:
         slot N is the scene currently materialized/playing.
         """
         self._hologram_state_provider = provider
+
+    def set_teleport_state_provider(self, provider):
+        """Register a callable returning the live teleport index.
+
+        The provider returns TeleportRoom.live_index() — the 0-based
+        index of the teleport currently in its PLAY phase, or None.
+        When set, changelog objects linked 'event://pick-teleport-N'
+        are only selectable while pad N is playing live; an in-flight
+        highlight aborts when the scene dematerializes.
+        """
+        self._teleport_state_provider = provider
 
     def _panel_rect(self):
         """Return (px1, py1, px2, py2) of the info panel in screen coords.
@@ -645,6 +714,15 @@ class ObjectHighlighter:
                 if holo.get('scene_idx') != slot - 1:
                     continue  # a different hologram is playing
 
+            # Teleport gating: pad objects ('event://pick-teleport-N')
+            # are only meaningful while teleport N plays live.
+            pad = parse_teleport_link(seg.link)
+            if pad is not None:
+                live = (self._teleport_state_provider()
+                        if self._teleport_state_provider else None)
+                if live != pad - 1:
+                    continue  # not this pad's live scene
+
             # Hard cooldown: skip if shown within RECENT_BLACKLIST seconds
             last = self._last_shown.get(seg.obj_id)
             if last is not None and (now - last) < RECENT_BLACKLIST:
@@ -657,16 +735,33 @@ class ObjectHighlighter:
                     seg.abs_y2 > vp_y2 - clip_margin_y):
                 continue
 
-            # Panel occlusion: skip objects behind the bottom-right info
-            # panel. The panel is opaque and would hide the highlighted
-            # object (and its bounding box).
+            # Screen-space bbox for the panel check (viewport-relative).
             sx1 = seg.abs_x1 - vp_x1
             sy1 = seg.abs_y1 - vp_y1
             sx2 = seg.abs_x2 - vp_x1
             sy2 = seg.abs_y2 - vp_y1
+
+            # Panel occlusion: skip objects behind the bottom-right info
+            # panel. The panel is opaque and would hide the highlighted
+            # object (and its bounding box).
             if (sx2 > panel_x1 and sx1 < panel_x2 and
                     sy2 > panel_y1 and sy1 < panel_y2):
                 continue
+
+            # Predicted panel occlusion: the panel lives in a fixed
+            # screen corner, so wandering slides objects INTO it during
+            # the 10s highlight.  Predict the bbox position at the END
+            # of the highlight (same model as the edge-buffer check
+            # below) and skip objects that would be panel-occluded by
+            # then — they'd get hidden mid-highlight.
+            if predict_dist > 1:
+                future_x1 = sx1 - vel_x * HIGHLIGHT_DURATION
+                future_y1 = sy1 - vel_y * HIGHLIGHT_DURATION
+                future_x2 = sx2 - vel_x * HIGHLIGHT_DURATION
+                future_y2 = sy2 - vel_y * HIGHLIGHT_DURATION
+                if (future_x2 > panel_x1 and future_x1 < panel_x2 and
+                        future_y2 > panel_y1 and future_y1 < panel_y2):
+                    continue
 
             # Velocity prediction with edge buffer: skip objects that
             # would scroll too close to the screen edge during the
@@ -704,6 +799,51 @@ class ObjectHighlighter:
         eligible.sort(key=lambda t: (t[0], t[1]))
         return eligible[0][2]
 
+    def _start_highlight(self, seg):
+        """Begin highlighting seg (shared by auto-picking and the
+        exploring-mode forced target)."""
+        self._current_seg = seg
+        self._state = STATE_HIGHLIGHT
+        self._timer = 0.0
+        self.highlights_shown += 1
+        # Record view timestamp
+        now = time.time()
+        last = self._last_shown.get(seg.obj_id)
+        ago = f"first time" if last is None else f"{now - last:.0f}s ago"
+        log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
+                 seg.obj_id, seg.title[:40], ago, len(self._last_shown))
+        self._last_shown[seg.obj_id] = now
+        history = self._view_history.setdefault(seg.obj_id, [])
+        history.append(now)
+        # Cap history length for memory
+        if len(history) > MAX_HISTORY_PER_OBJ:
+            del history[:-MAX_HISTORY_PER_OBJ]
+        # Prefetch thumbnail for the new object
+        self._thumbs.get(seg.obj_id, seg.link)
+
+    # ── Exploring-mode integration (Explorer owns the box) ────
+
+    def suspend_auto(self):
+        """Stop auto-cycling selections (Exploring takes over)."""
+        self._auto_select = False
+
+    def resume_auto(self):
+        """Resume auto-cycling (leaving Exploring)."""
+        self._auto_select = True
+        self._forced_seg = None
+        # Drop any lingering explore highlight; the accumulator picks a
+        # fresh object from the PAUSE/IDLE cycle.
+        self._current_seg = None
+        self._state = STATE_IDLE
+        self._timer = 0.0
+
+    def set_explore_target(self, seg):
+        """Force the highlight onto the Explorer's selection.  Called
+        on every enter/jump; the box persists (no expiry) until the
+        next target or resume_auto()."""
+        self._forced_seg = seg
+        self._start_highlight(seg)
+
     def update(self, dt, pos_x, pos_y, vel_x=0, vel_y=0):
         """Advance the state machine.  Called once per frame.
 
@@ -722,29 +862,24 @@ class ObjectHighlighter:
         self._timer += dt
 
         if self._state == STATE_IDLE:
-            seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2,
-                                        vel_x, vel_y)
+            if self._auto_select:
+                seg = self._select_segment(vp_x1, vp_y1, vp_x2, vp_y2,
+                                            vel_x, vel_y)
+            else:
+                # Exploring mode: no auto-picking.  The forced explore
+                # target (if any) is re-anchored whenever the state
+                # machine comes back to IDLE (e.g. after an abort).
+                seg = self._forced_seg if self._forced_seg else None
             if seg:
-                self._current_seg = seg
-                self._state = STATE_HIGHLIGHT
-                self._timer = 0.0
-                self.highlights_shown += 1
-                # Record view timestamp
-                now = time.time()
-                last = self._last_shown.get(seg.obj_id)
-                ago = f"first time" if last is None else f"{now - last:.0f}s ago"
-                log.info("Highlighting obj %d '%s' (last shown: %s, %d total in history)",
-                         seg.obj_id, seg.title[:40], ago, len(self._last_shown))
-                self._last_shown[seg.obj_id] = now
-                history = self._view_history.setdefault(seg.obj_id, [])
-                history.append(now)
-                # Cap history length for memory
-                if len(history) > MAX_HISTORY_PER_OBJ:
-                    del history[:-MAX_HISTORY_PER_OBJ]
-                # Prefetch thumbnail for the new object
-                self._thumbs.get(seg.obj_id, seg.link)
+                self._start_highlight(seg)
 
         elif self._state == STATE_HIGHLIGHT:
+            if self._forced_seg is not None:
+                # Exploring target: a deliberate selection — keep
+                # the red box until the next jump; skip the
+                # auto-cycling aborts and the duration expiry (the
+                # panel progress bar parks at 100%).
+                return
             # Mid-highlight check: if the current object has scrolled
             # off-screen (e.g. wander direction changed), abort early
             # and immediately pick a new one.
@@ -764,6 +899,27 @@ class ObjectHighlighter:
                     self._timer = 0.0
                     return
 
+                # Panel occlusion abort: the viewport can drift so the
+                # highlighted object slides behind the opaque corner
+                # info panel mid-highlight.  Unlike selection time,
+                # there is no prediction here — the panel is anchored
+                # to the screen, so a direct overlap test tells us the
+                # object is hidden RIGHT NOW.
+                px1, py1, px2, py2 = self._panel_rect()
+                sx1 = seg.abs_x1 - vp_x1
+                sy1 = seg.abs_y1 - vp_y1
+                sx2 = seg.abs_x2 - vp_x1
+                sy2 = seg.abs_y2 - vp_y1
+                if (sx2 > px1 and sx1 < px2 and
+                        sy2 > py1 and sy1 < py2):
+                    log.info("Panel-occlusion abort: obj %d '%s' drifted "
+                             "behind info panel at %.1fs",
+                             seg.obj_id, seg.title[:30], self._timer)
+                    self._current_seg = None
+                    self._state = STATE_PAUSE
+                    self._timer = 0.0
+                    return
+
                 # Hologram segments: abort when the labeled hologram is
                 # no longer visible (gap = fully dematerialized).  The
                 # highlight survives fade_out (image still dissolving)
@@ -775,6 +931,21 @@ class ObjectHighlighter:
                     if (not holo or holo.get('state') == 'gap' or
                             holo.get('scene_idx') != slot - 1):
                         log.info("Hologram ended: obj %d '%s' dematerialized "
+                                 "at %.1fs", seg.obj_id, seg.title[:30],
+                                 self._timer)
+                        self._current_seg = None
+                        self._state = STATE_PAUSE
+                        self._timer = 0.0
+                        return
+
+                # Teleport segments: abort when the pad's live scene
+                # dematerializes (live_index goes None / moves on).
+                pad = parse_teleport_link(seg.link)
+                if pad is not None:
+                    live = (self._teleport_state_provider()
+                            if self._teleport_state_provider else None)
+                    if live != pad - 1:
+                        log.info("Teleport ended: obj %d '%s' dematerialized "
                                  "at %.1fs", seg.obj_id, seg.title[:30],
                                  self._timer)
                         self._current_seg = None
@@ -798,6 +969,8 @@ class ObjectHighlighter:
             return
 
         self._init_fonts()
+        self._perf_parts = {}
+        _t0 = time.perf_counter()
         seg = self._current_seg
 
         # Convert absolute map coords to screen coords
@@ -832,6 +1005,16 @@ class ObjectHighlighter:
         else:
             self._render_corner(screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                                 skip_glow=zooming)
+        # Per-part attribution (only meaningful on slow frames).
+        self._perf_note('total', (time.perf_counter() - _t0) * 1000)
+        self._perf_parts['glow'] = self._glow_ms
+        self._perf_parts['panel'] = self._panel_ms
+        self._glow_ms = 0.0
+        self._panel_ms = 0.0
+
+    def _perf_note(self, label, ms):
+        """Collect per-part render timings for slow-frame attribution."""
+        self._perf_parts[label] = self._perf_parts.get(label, 0.0) + ms
 
     def _pulse_envelope(self):
         """Return (intensity, glow_radius) for the current timer position.
@@ -846,6 +1029,7 @@ class ObjectHighlighter:
         return 1.0, radius
 
     def _draw_breathing_glow(self, screen, sx1, sy1, sx2, sy2, glow_radius):
+        _g0 = time.perf_counter()
         """Draw a smooth alpha-gradient glow radiating outward from the box.
 
         Draws GLOW_STEPS filled rectangles from outermost (largest, lowest
@@ -865,36 +1049,68 @@ class ObjectHighlighter:
         if steps < 2:
             return
 
-        cache_key = (glow_radius, int(bw), int(bh))
+        # Quantize the breathing radius (2px steps): the raw sine
+        # radius changes almost every frame, which thrashed this cache
+        # (full layer-stack rebuild per frame = the 8-11ms/frame
+        # highlighter cost seen in slow-frame telemetry).
+        radius_q = max(2, int(round(glow_radius / 2.0)) * 2)
+        cache_key = (radius_q, int(bw), int(bh))
         cached = self._glow_cache.get(cache_key)
         if cached is None:
-            layers = []
+            maxpad = radius_q
+            canvas_w = max(1, int(bw) + maxpad * 2)
+            canvas_h = max(1, int(bh) + maxpad * 2)
+            canvas = pygame.Surface((canvas_w, canvas_h),
+                                    pygame.SRCALPHA)
             for i in range(steps, 0, -1):
                 frac = i / steps  # 1.0 at outer edge → 0 at box edge
                 alpha = int(GLOW_PEAK_ALPHA * (1.0 - frac) ** 1.5)
                 if alpha < 2:
                     continue
-                pad = max(1, int(glow_radius * frac))
-                gw = int(bw + pad * 2)
-                gh = int(bh + pad * 2)
+                pad = max(1, int(radius_q * frac))
+                gw = int(bw) + pad * 2
+                gh = int(bh) + pad * 2
                 if gw <= 0 or gh <= 0:
                     continue
                 glow_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
                 glow_surf.fill((*BOX_COLOR, alpha))
-                # Cut out the box interior so glow only covers the ring area
+                # Cut out the box interior so glow only covers the ring
                 if int(bw) > 0 and int(bh) > 0:
-                    glow_surf.fill((0, 0, 0, 0), (pad, pad, int(bw), int(bh)))
-                # Store (surface, pad) — position computed at blit time
-                layers.append((glow_surf, pad))
-            self._glow_cache[cache_key] = layers
-            # Evict old entries if cache is growing (keep last 8 sizes)
-            if len(self._glow_cache) > 8:
+                    glow_surf.fill((0, 0, 0, 0),
+                                    (pad, pad, int(bw), int(bh)))
+                # Compose into ONE surface — a single blit per frame
+                # instead of GLOW_STEPS (source-over is associative, so
+                # the result is identical to the layered blits).
+                canvas.blit(glow_surf, (maxpad - pad, maxpad - pad))
+            cached = (canvas, maxpad)
+            self._glow_cache[cache_key] = cached
+            if len(self._glow_cache) > 64:
                 self._glow_cache.pop(next(iter(self._glow_cache)))
-        else:
-            layers = cached
 
-        for glow_surf, pad in layers:
-            screen.blit(glow_surf, (int(sx1 - pad), int(sy1 - pad)))
+        canvas, maxpad = cached
+        # Blit only the four RING strips — the canvas center is fully
+        # transparent (the box interior was cut out) but a whole-canvas
+        # alpha blit still pays per-pixel cost for it; at 1440p box
+        # sizes that was ~5ms/frame.  Strips cut the touched pixels
+        # ~4x.
+        x = int(sx1) - maxpad
+        y = int(sy1) - maxpad
+        cw, ch = canvas.get_size()
+        inner_w = cw - 2 * maxpad
+        inner_h = ch - 2 * maxpad
+        if inner_w > 0 and inner_h > 0:
+            screen.blit(canvas, (x, y),
+                        area=pygame.Rect(0, 0, cw, maxpad))
+            screen.blit(canvas, (x, y + ch - maxpad),
+                        area=pygame.Rect(0, ch - maxpad, cw, maxpad))
+            screen.blit(canvas, (x, y + maxpad),
+                        area=pygame.Rect(0, maxpad, maxpad, inner_h))
+            screen.blit(canvas, (x + cw - maxpad, y + maxpad),
+                        area=pygame.Rect(cw - maxpad, maxpad, maxpad,
+                                         inner_h))
+        else:
+            screen.blit(canvas, (x, y))
+        self._glow_ms += (time.perf_counter() - _g0) * 1000
 
     def _render_inline(self, screen, seg, sx1, sy1, sx2, sy2, bw, bh,
                        skip_glow=False):
@@ -904,9 +1120,15 @@ class ObjectHighlighter:
             _intensity, glow_radius = self._pulse_envelope()
             self._draw_breathing_glow(screen, sx1, sy1, sx2, sy2, glow_radius)
 
-        # Semi-transparent fill
-        fill_surf = pygame.Surface((max(1, int(bw)), max(1, int(bh))),
-                                    pygame.SRCALPHA)
+        # Semi-transparent fill (cached surface — per-frame SRCALPHA
+        # allocation churn feeds the GC and causes periodic hitches)
+        fw = max(1, int(bw)); fh = max(1, int(bh))
+        fill_surf = self._fill_surf_cache.get((fw, fh))
+        if fill_surf is None:
+            fill_surf = pygame.Surface((fw, fh), pygame.SRCALPHA)
+            if len(self._fill_surf_cache) > 8:
+                self._fill_surf_cache.clear()
+            self._fill_surf_cache[(fw, fh)] = fill_surf
         fill_alpha = int(BOX_FILL[3])
         fill_surf.fill((*BOX_COLOR[:3], fill_alpha))
         screen.blit(fill_surf, (int(sx1), int(sy1)))
@@ -918,7 +1140,18 @@ class ObjectHighlighter:
                          outline_w)
 
         # Label text — position above the box if space, else below
-        title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
+        # (text rendered once per highlight, cached)
+        tkey = ('inline', seg.obj_id)
+        cached_txt = self._text_cache.get(tkey)
+        if cached_txt is None or cached_txt[2] != seg.title \
+                or cached_txt[3] != seg.date:
+            title_surf = self._font_title.render(seg.title, True, LABEL_TEXT)
+            date_surf = (self._font_small.render(seg.date, True, LABEL_ACCENT)
+                         if seg.date else None)
+            self._text_cache[tkey] = (title_surf, date_surf, seg.title,
+                                      seg.date)
+        else:
+            title_surf, date_surf = cached_txt[0], cached_txt[1]
         tw = title_surf.get_width()
         th = title_surf.get_height()
 
@@ -943,9 +1176,8 @@ class ObjectHighlighter:
 
         screen.blit(title_surf, (label_x, label_y))
 
-        # Date in small text
-        if seg.date:
-            date_surf = self._font_small.render(seg.date, True, LABEL_ACCENT)
+        # Date in small text (cached surface from the label cache above)
+        if seg.date and date_surf is not None:
             date_y = label_y + th + 2
             if date_y + date_surf.get_height() < self._screen_h:
                 screen.blit(date_surf, (label_x, date_y))
@@ -986,18 +1218,19 @@ class ObjectHighlighter:
         Returns a list of rendered surfaces.  If the title fits on one
         line, returns a single-element list.
         """
-        # Quick check: does it fit on one line?
-        single = font.render(title, True, LABEL_TEXT)
-        if single.get_width() <= max_w or max_lines <= 1:
-            return [single]
-
-        # Word-wrap
+        # Quick check: does it fit on one line?  (font.size measures —
+        # rendering a full surface just to read its width is ~20x
+        # costlier.)
+        if font.size(title)[0] <= max_w or max_lines <= 1:
+            return [font.render(title, True, LABEL_TEXT)]
         return self._wrap_text(title, font, max_w, max_lines, LABEL_TEXT)
 
     def _wrap_text(self, text, font, max_w, max_lines=3, color=None):
         """Word-wrap arbitrary text into rendered surfaces.
 
         Returns list of pygame surfaces, at most max_lines long.
+        Measurement uses font.size() (no surface allocation) — only the
+        final lines are rendered.
         """
         if color is None:
             color = (180, 180, 190)
@@ -1008,18 +1241,15 @@ class ObjectHighlighter:
 
         for word in words:
             test = word if not current else current + " " + word
-            test_w = font.render(test, True, color).get_width()
-            if test_w <= max_w:
+            if font.size(test)[0] <= max_w:
                 current = test
             else:
                 if current:
                     lines.append(current)
                     current = ""
-                # Handle single word too long for the line
-                if font.render(word, True, color).get_width() > max_w:
+                if font.size(word)[0] > max_w:
                     truncated = word
-                    while truncated and font.render(
-                            truncated, True, color).get_width() > max_w:
+                    while truncated and font.size(truncated)[0] > max_w:
                         truncated = truncated[:-1]
                     lines.append(truncated.rstrip() + "...")
                 else:
@@ -1035,15 +1265,67 @@ class ObjectHighlighter:
         used_words = sum(len(l.split()) for l in lines)
         if used_words < total_words and lines:
             last = lines[-1]
-            ellipsis_w = font.render("...", True, color).get_width()
-            last_w = font.render(last, True, color).get_width()
+            ellipsis_w = font.size("...")[0]
+            last_w = font.size(last)[0]
             if last_w + ellipsis_w <= max_w:
                 lines[-1] = last + "..."
 
         return [font.render(line, True, color) for line in lines]
 
+    def _build_panel_text(self, seg, link_type, has_thumb, extract_text):
+        """Render all static panel text + geometry ONCE per highlight."""
+        # Word-wrap the title (up to 2 lines)
+        max_title_w = self._panel_w - self._panel_padding * 2
+        title_surfaces = self._wrap_title(seg.title, self._font_title,
+                                          max_title_w, max_lines=2)
+        title_total_h = sum(s.get_height() for s in title_surfaces)
+
+        # Determine panel dimensions
+        # Title bar includes title lines + date line + padding.
+        date_h = self._font_small.get_height()
+        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
+
+        extract_lines = []
+        extract_h = 0
+        if extract_text:
+            extract_lines = self._wrap_text(
+                extract_text, self._font_small,
+                max_title_w, max_lines=3)
+            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
+
+        if has_thumb:
+            panel_w = self._panel_w
+            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
+                       self._panel_padding + extract_h)
+        else:
+            panel_w = self._panel_w_no_thumb
+            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
+
+        date_surf = self._font_small.render(
+            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
+
+        label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
+        type_surf = (self._font_link.render(label, True, color)
+                     if label else None)
+
+        return {
+            'title': seg.title, 'date': seg.date,
+            'extract_text': extract_text,
+            'title_surfaces': title_surfaces,
+            'title_bar_h': title_bar_h,
+            'extract_lines': extract_lines,
+            'extract_h': extract_h,
+            'panel_w': panel_w, 'panel_h': panel_h,
+            'date_surf': date_surf,
+            'type_surf': type_surf,
+        }
+
     def _render_corner_panel(self, screen, seg):
-        """Draw the lower-right info panel with optional thumbnail."""
+        """Draw the lower-right info panel with optional thumbnail.
+
+        All text and geometry are computed ONCE per highlight and
+        cached in _text_cache — the per-frame path is blits only."""
+        _p0 = time.perf_counter()
 
         link_type, _ = classify_link(seg.link)
         # All link types that can produce a visual thumbnail:
@@ -1065,39 +1347,26 @@ class ObjectHighlighter:
         if link_type == "wiki":
             extract_text = self._thumbs.get_extract(seg.obj_id)
 
-        # Word-wrap the title (up to 2 lines)
-        max_title_w = self._panel_w - self._panel_padding * 2
-        title_surfaces = self._wrap_title(seg.title, self._font_title,
-                                          max_title_w, max_lines=2)
-        title_total_h = sum(s.get_height() for s in title_surfaces)
+        tkey = (seg.obj_id, has_thumb)
+        tc = self._text_cache.get(tkey)
+        if tc is None or tc.get('extract_text') != extract_text \
+                or tc.get('title') != seg.title or tc.get('date') != seg.date:
+            tc = self._build_panel_text(seg, link_type, has_thumb,
+                                        extract_text)
+            self._text_cache[tkey] = tc
+            if len(self._text_cache) > self._max_overlay_cache_entries * 2:
+                self._text_cache.pop(next(iter(self._text_cache)))
 
-        # Determine panel dimensions
-        # Title bar includes title lines + date line + padding.
-        date_h = self._font_small.get_height()
-        title_bar_h = title_total_h + date_h + int(16 * self._ui_scale)
-
-        # Wrap extract text to compute its height
-        extract_lines = []
-        extract_h = 0
-        if extract_text:
-            extract_lines = self._wrap_text(
-                extract_text, self._font_small,
-                max_title_w, max_lines=3)
-            extract_h = sum(s.get_height() for s in extract_lines) + int(10 * self._ui_scale)
-
-        if has_thumb:
-            panel_w = self._panel_w
-            panel_h = (title_bar_h + self._panel_h_thumb + self._panel_h_footer +
-                       self._panel_padding + extract_h)
-        else:
-            panel_w = self._panel_w_no_thumb
-            panel_h = title_bar_h + self._panel_h_footer + self._panel_padding
+        title_surfaces = tc['title_surfaces']
+        title_bar_h = tc['title_bar_h']
+        extract_lines = tc['extract_lines']
+        extract_h = tc['extract_h']
+        panel_w = tc['panel_w']
+        panel_h = tc['panel_h']
+        date_surf = tc['date_surf']
 
         panel_x = self._screen_w - panel_w - self._panel_margin - self._overscan_margin
         panel_y = self._screen_h - panel_h - self._panel_margin - self._overscan_margin
-
-        date_surf = self._font_small.render(
-            f"Added: {seg.date}" if seg.date else "", True, LABEL_ACCENT)
 
         # ── Draw panel background (cached per object) ──
         cache_key = (seg.obj_id, has_thumb)
@@ -1133,17 +1402,16 @@ class ObjectHighlighter:
             img_y = panel_y + title_bar_h + int(4 * self._ui_scale)
 
             if thumb_surf is not None:
-                # Scale thumbnail to match ui_scale (cached per obj_id)
+                # Scale thumbnail to match ui_scale (cached per obj_id).
+                # smoothscale of a large image is 20-40ms on the Pi —
+                # doing it on the render path froze one frame per
+                # highlight; it now runs in a throwaway thread and the
+                # placeholder shows until it lands.
                 scaled = self._scaled_thumb_cache.get(seg.obj_id)
                 if scaled is None:
-                    scaled = pygame.transform.smoothscale(
-                        thumb_surf, (self._thumb_w, self._thumb_h))
-                    self._scaled_thumb_cache[seg.obj_id] = scaled
-                    # Evict oldest if cache exceeds size limit
-                    if len(self._scaled_thumb_cache) > self._max_overlay_cache_entries:
-                        self._scaled_thumb_cache.pop(
-                            next(iter(self._scaled_thumb_cache)))
-                screen.blit(scaled, (img_x, img_y))
+                    self._prewarm_thumb_async(seg, thumb_surf)
+                else:
+                    screen.blit(scaled, (img_x, img_y))
             else:
                 # Draw loading placeholder
                 self._render_placeholder(screen, img_x, img_y,
@@ -1161,12 +1429,41 @@ class ObjectHighlighter:
         self._render_footer(screen, seg, link_type,
                             panel_x + self._panel_padding, footer_y,
                             panel_w - self._panel_padding * 2)
+        self._panel_ms += (time.perf_counter() - _p0) * 1000
+
+    def _prewarm_thumb_async(self, seg, thumb_surf):
+        """smoothscale a thumbnail off the render path (daemon thread).
+
+        Benign race: if the main thread also scales the same object the
+        loser's result is simply overwritten in the LRU cache."""
+        import threading
+
+        def work():
+            try:
+                scaled = pygame.transform.smoothscale(
+                    thumb_surf, (self._thumb_w, self._thumb_h))
+                if len(self._scaled_thumb_cache) > \
+                        self._max_overlay_cache_entries:
+                    self._scaled_thumb_cache.pop(
+                        next(iter(self._scaled_thumb_cache)))
+                self._scaled_thumb_cache[seg.obj_id] = scaled
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _render_placeholder(self, screen, x, y, w, h):
         """Draw an animated loading placeholder for the thumbnail."""
-        # Dark background
-        ph_surf = pygame.Surface((w, h))
-        ph_surf.fill((25, 25, 35))
+        # Dark background (cached — avoid per-frame allocation)
+        ph_key = (w, h)
+        ph_surf = self._fill_surf_cache.get(ph_key)
+        if ph_surf is None:
+            ph_surf = pygame.Surface((w, h))
+            ph_surf.fill((25, 25, 35))
+            if len(self._fill_surf_cache) > 8:
+                self._fill_surf_cache.clear()
+            self._fill_surf_cache[ph_key] = ph_surf
+        ph_surf.fill((25, 25, 35))   # re-fill: cache may be shared w/ inline
         screen.blit(ph_surf, (x, y))
 
         # Pulsing border
@@ -1179,22 +1476,40 @@ class ObjectHighlighter:
         )
         pygame.draw.rect(screen, border_color, (x, y, w, h), 1)
 
-        # "Loading..." text
-        load_surf = self._font_small.render("Loading...", True, (80, 80, 100))
+        # "Loading..." text (static — render once)
+        load_surf = self._static_text_cache.get('loading')
+        if load_surf is None:
+            load_surf = self._font_small.render("Loading...", True,
+                                                (80, 80, 100))
+            self._static_text_cache['loading'] = load_surf
         lx = x + (w - load_surf.get_width()) // 2
         ly = y + (h - load_surf.get_height()) // 2
         screen.blit(load_surf, (lx, ly))
 
     def _render_footer(self, screen, seg, link_type, fx, fy, fw):
         """Draw link type indicator and progress bar in the footer area."""
-        label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
-
-        # Link type indicator (left side)
-        if label:
-            type_surf = self._font_link.render(label, True, color)
+        # Link type indicator (left side) — static label text cached
+        # per highlight (in _text_cache['type_surf']); pass it in via
+        # the current panel text cache entry.
+        tc = self._text_cache.get((seg.obj_id, True)) \
+            or self._text_cache.get((seg.obj_id, False))
+        type_surf = tc.get('type_surf') if tc else None
+        if type_surf is None:
+            label, color = LINK_TYPE_META.get(link_type, ("", (100, 100, 100)))
+            if label:
+                key = ('link', label, color)
+                type_surf = self._static_text_cache.get(key)
+                if type_surf is None:
+                    type_surf = self._font_link.render(label, True, color)
+                    self._static_text_cache[key] = type_surf
+        if type_surf is not None:
             screen.blit(type_surf, (fx, fy))
 
-        # Progress bar (right side, takes remaining width)
+        # Progress bar (right side, takes remaining width) — NOT shown
+        # for a forced (Exploring) target: the selection only changes
+        # when the user acts, so a countdown bar is meaningless noise.
+        if self._forced_seg is not None:
+            return
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)
         bar_h = max(2, int(3 * self._ui_scale))
         bar_y = fy + int(16 * self._ui_scale)

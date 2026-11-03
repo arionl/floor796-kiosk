@@ -33,6 +33,7 @@ TILE_DIR = os.path.join(ASSETS_DIR, "tiles")
 TILE_META_PATH = os.path.join(ASSETS_DIR, "tiles_meta.json")
 CHANGELOG_PATH = os.path.join(ASSETS_DIR, "changelog.json")
 HOLOGRAM_DIR = os.path.join(ASSETS_DIR, "holograms")
+TELEPORT_DIR = os.path.join(ASSETS_DIR, "teleport")
 
 # ── Cache (generated at runtime, safe to delete) ─────────────────────────────
 CACHE_DIR = os.path.join(INSTALL_DIR, "cache")
@@ -43,6 +44,6 @@ THUMBNAIL_DIR = os.path.join(CACHE_DIR, "thumbnails")
 
 def ensure_dirs():
     """Create all required directories if they don't exist."""
-    for d in (ASSETS_DIR, TILE_DIR, HOLOGRAM_DIR,
+    for d in (ASSETS_DIR, TILE_DIR, HOLOGRAM_DIR, TELEPORT_DIR,
               CACHE_DIR, STRIP_DIR, THUMBNAIL_DIR):
         os.makedirs(d, exist_ok=True)

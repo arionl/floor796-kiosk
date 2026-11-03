@@ -14,6 +14,9 @@ Endpoints:
   GET  /objects/recent?n=20    JSON N most recently highlighted objects
   POST /overlay                {"enabled": true} or {"enabled": false}
   PATCH/POST /overlay/window   {"window": "30min"} cycle overlay time window
+  POST /viewport               {"x": .., "y": ..} pin camera to a map
+                               position (pauses wandering); {"resume":
+                               true} re-enables wandering
   GET  /screenshot             PNG capture of the live viewport
 
 Uses only stdlib — no external dependencies.
@@ -283,6 +286,54 @@ class StatsHandler(BaseHTTPRequestHandler):
                                  "window": collector.overlay_window})
             else:
                 self._send_json({"error": "missing 'enabled'"}, 400)
+
+        elif path == "/viewport":
+            # Camera control: {"x": .., "y": ..} centers the viewport
+            # on a map position and pauses wandering; {"resume": true}
+            # re-enables wandering from the current position.
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, 400)
+                return
+            q = getattr(self.server, 'viewport_queue', None)
+            if q is None:
+                self._send_json({"error": "viewport control not "
+                                 "available"}, 501)
+                return
+            if data.get('resume'):
+                q.append({'resume': True})
+                self._send_json({"viewport": "resumed"})
+            elif 'x' in data and 'y' in data:
+                q.append({'x': float(data['x']), 'y': float(data['y'])})
+                self._send_json({"viewport": "pinned",
+                                 "x": data['x'], "y": data['y']})
+            else:
+                self._send_json({"error": "need x,y or resume:true"},
+                                 400)
+
+        elif path == "/mode":
+            # Mode control (keyboard-equivalent for remote/debug use):
+            # {"mode": "wandering"|"navigating"|"exploring"} applies the
+            # same transition as the SPACE cycle target.
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, 400)
+                return
+            q = getattr(self.server, 'mode_queue', None)
+            if q is None:
+                self._send_json({"error": "mode control not available"},
+                                 501)
+                return
+            m = data.get('mode')
+            if m in ('wandering', 'navigating', 'exploring'):
+                q.append(m)
+                self._send_json({"mode": m})
+            else:
+                self._send_json(
+                    {"error": "mode must be wandering|navigating|"
+                              "exploring"}, 400)
 
         elif path == "/overlay/window":
             try:

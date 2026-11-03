@@ -16,7 +16,7 @@ Architecture:
 
 Controls (for maintenance/testing only):
   Arrow keys — Pan manually
-  Space                   — Toggle auto-wandering
+  Space                   — Cycle modes: Wandering → Navigating → Exploring
   V                       — Print coverage heatmap to journal
   ESC                     — Quit
 
@@ -56,11 +56,17 @@ try:
 except ImportError:
     HIGHLIGHTER_AVAILABLE = False
 
+# First-party, dependency-free modules — required (no graceful
+# degradation for the mode system; a broken install should fail loud).
+from floor796_kiosk.modes import Mode, ModeMachine
+from floor796_kiosk.explorer import Explorer
+from floor796_kiosk.splash import create_status_display
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 from floor796_kiosk.paths import (
     INSTALL_DIR, ASSETS_DIR, TILE_DIR, TILE_META_PATH,
-    CONTENT_MASK_PATH, STRIP_DIR, HOLOGRAM_DIR, CHANGELOG_PATH,
+    CONTENT_MASK_PATH, STRIP_DIR, HOLOGRAM_DIR, TELEPORT_DIR, CHANGELOG_PATH,
     THUMBNAIL_DIR, ensure_dirs,
 )
 
@@ -148,19 +154,35 @@ def _detect_total_memory_mb():
     return 0
 
 
-def _compute_max_tiles(view_w, view_h, total_mem_mb):
+def _strip_cost_mb(display_depth):
+    """RAM cost of ONE fully-animated tile strip in the runtime cache.
+
+    1024 × (820×60) px: 16-bit ≈ 100 MB, 32-bit ≈ 201 MB.  Static
+    tiles are single-frame (~3 MB) — the budget conservatively prices
+    every slot at the animated cost (most viewport tiles animate)."""
+    return 201 if display_depth == 32 else 100
+
+
+def _compute_max_tiles(view_w, view_h, total_mem_mb, strip_mb=201):
     """Scale MAX_TILES based on viewport area and available RAM.
 
     At 1080p (1920×1080 = ~2M px) with 4 GB, max_tiles=15 is tuned.
     At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
     so we need a larger cache. Scale linearly with viewport area, then
-    cap by available memory (each strip ~96 MB).
+    cap by available memory at the REAL per-strip cost (201 MB for
+    32-bit display-format strips, 100 MB for 16-bit).
 
-    On low-memory boards (e.g. 2 GB Pi 5), the memory cap MUST be able
-    to drop below MAX_TILES_BASE — otherwise the budget is ignored and
-    the kiosk gets OOM-killed (issue: kiosk OOM every ~5 min on 2 GB Pi).
-    The previous `max(MAX_TILES_BASE, ...)` floor defeated mem_cap on
-    those boards because mem_cap (5) < MAX_TILES_BASE (15).
+    The memory cap applies to ALL board sizes.  History: with the
+    32-bit strip conversion enabled, the 4 GB board's 18 tiles held
+    ~3.6 GB of strips, drove the process to 3.3 GB RSS with 430 MB
+    swapped (2026-11-02), and a hard floor at MAX_TILES_BASE formerly
+    OOM-killed 2 GB boards every ~5 min.
+
+    Budget arithmetic (animated strip at the display depth):
+      2 GB board: reserve 1.2 GB → 800 MB → 8 tiles @16-bit (800 MB)
+      4 GB board: reserve ~2.0 GB → 2.0 GB → 10 tiles @32-bit (2.0 GB)
+                  … or 18 tiles if strips stay 16-bit
+      8 GB board: reserve ~3.6 GB → 4.4 GB → 18 tiles (area cap)
     """
     # Scale factor relative to 1080p baseline
     vp_area = view_w * view_h
@@ -168,26 +190,17 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     area_scale = vp_area / base_area
     max_t = int(MAX_TILES_BASE * area_scale)
 
-    # Memory ceiling: reserve a baseline for OS + pygame framebuffer +
-    # hologram cache + python itself. The reserve scales with board RAM —
-    # small boards need most of their RAM for the OS, large boards can
-    # spare proportionally more for the tile cache.
-    #
-    #   2 GB board: reserve 1.2 GB → ~800 MB budget → 8 tiles (~768 MB)
-    #   4 GB board: reserve 2.0 GB → ~2.0 GB budget → 15 tiles (cap at base)
-    #   8 GB board: reserve 2.5 GB → ~5.5 GB budget → 40 tiles (cap)
-    #
-    # The mem_cap MUST be able to drop below MAX_TILES_BASE on constrained
-    # boards — the previous `max(MAX_TILES_BASE, ...)` floor defeated it
-    # entirely and caused OOM kills every ~5 min on 2 GB Pi 5 boards.
-    if total_mem_mb > 0 and total_mem_mb < LOW_MEM_THRESHOLD_MB:
-        # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
-        reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
+    if total_mem_mb > 0:
+        # Reserve for OS + framebuffer + hologram (~240 MB) + teleport
+        # room (~100 MB) + python/pygame base. Scales with board RAM.
+        if total_mem_mb >= 2048:
+            reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4)
+        else:
+            reserve_mb = int(total_mem_mb * 0.6)
         mem_budget_mb = max(0, total_mem_mb - reserve_mb)
-        mem_cap = max(2, int(mem_budget_mb / 96))  # 96 MB per strip
+        mem_cap = max(2, int(mem_budget_mb / strip_mb))
         return min(max_t, mem_cap, MAX_TILES_CAP)
 
-    # 4 GB+ board: scale with viewport, cap at MAX_TILES_CAP.
     return min(max_t, MAX_TILES_CAP)
 
 # ─── Status Display ───────────────────────────────────────────────────────────
@@ -263,41 +276,6 @@ class StatusDisplay:
             self.screen.blit(pct, pct_rect)
 
         pygame.display.flip()
-
-
-class MemoryWarningBanner:
-    """Persistent on-screen banner for low-RAM devices.
-
-    Shown when total system RAM < 4 GB.  The tile cache is too small to
-    keep all in-view tiles loaded, so the user sees blank/missing tiles
-    while wandering.  The banner pre-renders once and is blitted every
-    frame — zero per-frame allocation cost.
-    """
-
-    BANNER_H = 44
-
-    def __init__(self, screen, total_mem_mb, overscan_margin=0):
-        w = screen.get_width()
-        self.overscan_margin = overscan_margin
-        self.surf = pygame.Surface((w, self.BANNER_H), pygame.SRCALPHA)
-
-        # Semi-transparent amber background
-        self.surf.fill((180, 100, 0, 210))
-        # Bottom border line for visual separation
-        pygame.draw.line(self.surf, (255, 180, 0, 255),
-                         (0, self.BANNER_H - 1), (w, self.BANNER_H - 1), 2)
-
-        font = pygame.font.Font(None, 26)
-        ram_gb = total_mem_mb / 1024
-        msg = (f"WARNING: {ram_gb:.0f} GB RAM detected — "
-               f"4 GB recommended for smooth playback. "
-               f"Some tiles may appear blank.")
-        text = font.render(msg, True, (255, 240, 200))
-        text_rect = text.get_rect(center=(w // 2, self.BANNER_H // 2))
-        self.surf.blit(text, text_rect)
-
-    def render(self, screen):
-        screen.blit(self.surf, (0, self.overscan_margin))
 
 
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
@@ -404,6 +382,97 @@ class TileCache:
         self._needed_ids = set()
         self._last_margin_ids = set()
 
+    def _ensure_display_depth(self, surf):
+        """Convert a strip to the display pixel format ONCE, in the
+        worker.
+
+        Strips are stored 24-bit (~100 MB); the display is 32-bit.
+        Without conversion SDL re-converts the blitted region on EVERY
+        frame (dense viewports measured blit=10-11 ms vs ~5 after).
+
+        Fast path (32-bit display): numpy over zero-copy ``get_view``
+        buffers — ufuncs and strided assignments RELEASE the GIL, so a
+        full 100 MB strip converts with at most an ~8 ms main-thread
+        gap (measured on the Pi; a single SDL convert/``tobytes`` holds
+        the GIL 100-950 ms instead).  The converted pixels are written
+        directly into a display-format surface's own buffer, so the
+        per-frame blit is a mask-matched copy under any KMS layout.
+
+        IMPORTANT: numpy views keep their surface LOCKED — every
+        reference (views included) must be dropped before the surface
+        is returned, or every subsequent blit raises
+        "Surfaces must not be locked during blit".
+
+        Fallback (other depths / numpy failure): sliced SDL blits with
+        a GIL yield between slices (~5 ms holds, ~0.7 s per strip)."""
+        if surf.get_bitsize() == self.display_depth:
+            return surf
+        if self.display_depth == 32:
+            try:
+                return self._convert_depth32_numpy(surf)
+            except Exception as e:
+                log.warning('tilecache: fast depth convert failed '
+                            '(%s) — falling back to sliced blit', e)
+        w, h = surf.get_size()
+        target = pygame.Surface((w, h), 0, self.display_depth)
+        step = TILE_H
+        y = 0
+        while y < h:
+            sh = min(step, h - y)
+            target.blit(surf, (0, y), pygame.Rect(0, y, w, sh))
+            y += sh
+            time.sleep(0.01)          # yield the GIL between slices
+        return target
+
+    def _probe_bgr(self, surf_or_none):
+        """Detect a surface format's channel order (True = B,G,R in
+        memory).  surf_or_none=None probes the DISPLAY format."""
+        if surf_or_none is None:
+            display = pygame.display.get_surface()
+            if display is None:
+                raise RuntimeError('display not initialized')
+            p = pygame.Surface((1, 1), 0, display)
+        else:
+            p = pygame.Surface((1, 1), 0, surf_or_none)
+        p.fill((255, 0, 0))
+        return pygame.image.tobytes(p, 'RGB')[0] == 0
+
+    def _convert_depth32_numpy(self, surf):
+        import numpy as np
+        w, h = surf.get_size()
+
+        # Channel orders (probed once per process, cached on instance)
+        if getattr(self, '_strip_src_bgr', None) is None:
+            self._strip_src_bgr = self._probe_bgr(surf)
+            self._strip_dst_bgr = self._probe_bgr(None)
+
+        src_view = surf.get_view('0')
+        rows = np.frombuffer(src_view, np.uint8,
+                             count=surf.get_pitch() * h)
+        rows = rows.reshape(h, surf.get_pitch())[:, :w * 3] \
+            .reshape(h, w, 3)
+        if self._strip_src_bgr:
+            rows = rows[:, :, ::-1]
+
+        display = pygame.display.get_surface()
+        tgt = pygame.Surface((w, h), 0, display)
+        tgt_view = tgt.get_view('0')
+        tp = tgt.get_pitch()
+        buf = np.frombuffer(tgt_view, np.uint8, count=tp * h)
+        out = buf.reshape(h, tp)[:, :w * 4].reshape(h, w, 4)
+        if self._strip_dst_bgr:
+            out[:, :, 0] = rows[:, :, 2]
+            out[:, :, 1] = rows[:, :, 1]
+            out[:, :, 2] = rows[:, :, 0]
+        else:
+            out[:, :, :3] = rows
+        out[:, :, 3] = 0
+        # Drop EVERY view/reference — numpy views keep the BufferProxy
+        # (and thus the surface lock) alive; a locked surface cannot be
+        # blitted.
+        del out, buf, tgt_view, rows, src_view
+        return tgt
+
     def _worker_loop(self):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
         # No-op on homogeneous SoCs like the Raspberry Pi 5.
@@ -434,6 +503,9 @@ class TileCache:
                 # Load 16-bit pre-converted strip from disk. No runtime
                 # conversion needed — prepare_strips() saved them as 16-bit.
                 surf = pygame.image.load(strip_path)
+                # Re-encode to the display format once (sliced — see
+                # _ensure_display_depth) so per-frame blits are copies.
+                surf = self._ensure_display_depth(surf)
                 _, h = surf.get_size()
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
@@ -562,7 +634,7 @@ class TileCache:
                     try:
                         surf = pygame.image.load(strip_path)
                         if surf.get_bitsize() != self.display_depth:
-                            surf = self._convert_to_depth(surf)
+                            surf = self._ensure_display_depth(surf)
                         _, h = surf.get_size()
                         num_frames = max(1, h // TILE_H)
                         self.cache[tid] = (surf, num_frames)
@@ -580,6 +652,103 @@ class TileCache:
 
     def get(self, tile_id):
         return self.cache.get(tile_id)
+
+
+def _rect_subtract(a, b):
+    """Rectangle subtraction: rects covering `a` minus `b` (0-4 rects).
+    An even-odd mask-hole equivalent for outlined boxes."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return [a]
+    out = []
+    if ax < ix1:
+        out.append((ax, ay, ix1 - ax, ah))
+    if ix2 < ax + aw:
+        out.append((ix2, ay, ax + aw - ix2, ah))
+    if ay < iy1:
+        out.append((ix1, ay, ix2 - ix1, iy1 - ay))
+    if iy2 < ay + ah:
+        out.append((ix1, iy2, ix2 - ix1, ay + ah - iy2))
+    return out
+
+
+def _draw_ghost_box(screen, color, rect, excl, width=2):
+    """Draw an outlined box, CLIPPED against the exclusion rect (the
+    highlighted object's content area) — a box that overlaps the
+    highlight has its lines inside the hole suppressed instead of
+    drawn over the artwork.  Emphasized: light gray, same weight as
+    the red box's steady stroke, rounded corners on the unclipped
+    path."""
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return
+    if excl is None or excl.width <= 0:
+        pygame.draw.rect(screen, color, rect, width,
+                         border_radius=max(2, width + 1))
+        return
+    # Outline as 4 filled edge rects, each minus the exclusion.
+    t = width
+    edges = [
+        (x, y, w, t),                    # top
+        (x, y + h - t, w, t),            # bottom
+        (x, y + t, t, h - 2 * t),        # left
+        (x + w - t, y + t, t, h - 2 * t)  # right
+    ]
+    for e in edges:
+        for r in _rect_subtract(e, tuple(excl)):
+            if r[2] > 0 and r[3] > 0:
+                pygame.draw.rect(screen, color, r)
+
+
+class ModeToast:
+    """Transient bottom-center capsule announcing mode changes."""
+
+    TEXTS = None   # filled lazily per Mode (import cycle safety)
+
+    DURATION = 2.5   # seconds
+
+    def __init__(self, screen_w, screen_h):
+        self._screen_w = screen_w
+        self._screen_h = screen_h
+        self._font = None
+        self._surf = None
+        self._mode = None
+        self._until = 0.0
+
+    def show(self, mode):
+        from floor796_kiosk.modes import Mode
+        if ModeToast.TEXTS is None:
+            ModeToast.TEXTS = {
+                Mode.WANDERING: 'wandering — SPACE to navigate',
+                Mode.NAVIGATING: 'navigating — SPACE to explore',
+                Mode.EXPLORING: 'exploring — arrows jump, SPACE to wander',
+            }
+        self._mode = mode
+        self._surf = None          # re-render (mode changed)
+        self._until = time.monotonic() + self.DURATION
+
+    def render(self, screen):
+        if self._mode is None or time.monotonic() > self._until:
+            return
+        if self._font is None:
+            self._font = pygame.font.Font(None, 30)
+        if self._surf is None:
+            text = ModeToast.TEXTS.get(self._mode, self._mode.value)
+            self._surf = self._font.render(text, True, (235, 235, 240))
+        tw, th = self._surf.get_size()
+        pad_x, pad_y = 14, 8
+        cx = self._screen_w // 2
+        y = self._screen_h - 64
+        rect = pygame.Rect(cx - tw // 2 - pad_x, y - pad_y,
+                           tw + pad_x * 2, th + pad_y * 2)
+        bg = pygame.Surface(rect.size, pygame.SRCALPHA)
+        bg.fill((20, 22, 30, 210))
+        screen.blit(bg, rect.topleft)
+        pygame.draw.rect(screen, (90, 160, 255), rect, 1)
+        screen.blit(self._surf, (cx - tw // 2, y))
 
 
 # ─── Coverage-Weighted Wander Navigation ─────────────────────────────────────
@@ -1097,11 +1266,22 @@ class Wanderer:
             return
 
         # Classify tiles by content density for tour ordering
+        # (class computed ONCE per tile — np.mean per comparison made
+        # this O(n²) tour a 50-100ms+ main-thread hitch on the Pi)
+        density_class = {}
+        if self.content_density:
+            for rc, darr in self.content_density.items():
+                if rc in self.animated_tiles:
+                    d = float(np.mean(darr))
+                    density_class[rc] = 0 if d >= 0.60 else (
+                        1 if d >= 0.20 else 2)
+
         def tile_class(rc):
+            if rc in density_class:
+                return density_class[rc]
+            d = 1.0
             if self.content_density and rc in self.content_density:
                 d = float(np.mean(self.content_density[rc]))
-            else:
-                d = 1.0
             if d >= 0.60: return 0  # CORE
             if d >= 0.20: return 1  # EDGE
             return 2                   # TIP
@@ -1438,23 +1618,17 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    status = StatusDisplay(screen)
+    status = create_status_display(screen)
 
-    # ── Low-memory startup warning ──
-    # This is the very first thing the user sees. If the board has less
-    # than ~4 GB RAM the tile cache will be too small to keep all in-view
-    # tiles loaded — we tell the user up front.
+    # ── Low-memory handling ──
+    # 2 GB boards run the full feature set (16-bit strips, capped tile
+    # cache — measured working 2026-11-02). No user-facing
+    # warning; keep only the journal note for diagnostics.
     low_memory = 0 < total_mem_mb < LOW_MEM_THRESHOLD_MB
     if low_memory:
-        ram_gb = total_mem_mb / 1024
-        log.warning("Low memory: %d MB (%.0f GB) — below 4 GB recommendation. "
-                    "Banner will be shown.", total_mem_mb, ram_gb)
-        status.show(
-            f"WARNING: {ram_gb:.0f} GB RAM",
-            "4 GB recommended for smooth playback. "
-            "Some tiles may appear blank.",
-        )
-        time.sleep(4)
+        log.info("Low memory board: %d MB — 16-bit strips, capped tile "
+                 "cache (no banner).", total_mem_mb)
+        time.sleep(0.5)
     else:
         status.show("Floor796 Kiosk", "Starting up...")
         time.sleep(0.5)
@@ -1584,11 +1758,22 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
+    # Strip runtime depth: display-format (32-bit) strips halve blit
+    # cost but DOUBLE cache RAM (201 MB vs 100 MB per animated strip).
+    # Low-RAM boards (< 3.9 GB) keep 16-bit strips and let SDL convert
+    # per blit (~10 ms in dense viewports — the pre-optimization
+    # behavior that ran effectively on the 2 GB Pi 5).
+    display_depth = (screen.get_bitsize()
+                     if total_mem_mb >= LOW_MEM_THRESHOLD_MB else 16)
+    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb,
+                                   _strip_cost_mb(display_depth))
     effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
-    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM, margin=%d)",
-             max_tiles, args.width, args.height, total_mem_mb, effective_margin)
-    cache = TileCache(STRIP_DIR, max_tiles=max_tiles)
+    log.info("Tile cache: max_tiles=%d, strip depth=%d-bit (%d MB/strip), "
+             "(viewport %dx%d, %d MB RAM, margin=%d)",
+             max_tiles, display_depth, _strip_cost_mb(display_depth),
+             args.width, args.height, total_mem_mb, effective_margin)
+    cache = TileCache(STRIP_DIR, max_tiles=max_tiles,
+                      display_depth=display_depth)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
@@ -1608,6 +1793,17 @@ def main():
         log.warning("Hologram overlay failed: %s", e)
         hologram = None
 
+    # ── Teleport room overlay (site-exact implementation) ──
+    teleport = None
+    try:
+        from floor796_kiosk.teleport import TeleportRoom
+        teleport = TeleportRoom(TELEPORT_DIR, tiles_meta=tiles_meta)
+        teleport.prepare()
+        teleport.start_decoder()
+    except Exception as e:
+        log.warning("Teleport room failed: %s", e)
+        teleport = None
+
     status.show("Ready!", f"{len(cache.cache)} tiles loaded", progress=1.0)
     time.sleep(0.5)
 
@@ -1618,9 +1814,12 @@ def main():
     frame_accumulator = 0.0
     frame_interval = 1.0 / args.fps
     last_coverage_log = time.time()
+    pending_viewport = []          # queue of viewport commands (HTTP)
+    pending_mode = []              # queue of mode changes (HTTP)
 
     log.info("Player ready. Map: %dx%d (%dx%d tiles), %d animated.",
              map_w, map_h, grid_cols, grid_rows, anim_count)
+    status.release()     # free the splash strip (~120 MB) before the loop
     log.info("Animation: %d fps, %d-frame loop (%.1fs).",
              args.fps, TILE_FRAMES, TILE_FRAMES / args.fps)
 
@@ -1633,6 +1832,12 @@ def main():
             stats_collector = StatsCollector(
                 sorted(wanderer.animated_tiles), map_w, map_h)
             stats_server = start_stats_server(stats_collector)
+            # Viewport control hook: POST /viewport {"x":..,"y":..} or
+            # {"resume": true} (applied on the main loop, next frame).
+            stats_server.viewport_queue = pending_viewport
+            # Mode control hook: POST /mode {"mode": ...} (applied on
+            # the main loop, next frame — same path as SPACE).
+            stats_server.mode_queue = pending_mode
             stats_overlay = StatsOverlay(
                 args.width, args.height, grid_rows, grid_cols)
             log.info("Stats server: http://127.0.0.1:8796/stats")
@@ -1648,6 +1853,7 @@ def main():
     log.info("Highlighter UI scale: %.2fx (%dx%d)", ui_scale, args.width, args.height)
 
     object_highlighter = None
+    hl_objects = []
     if HIGHLIGHTER_AVAILABLE:
         changelog_path = CHANGELOG_PATH
         if not os.path.exists(changelog_path):
@@ -1677,20 +1883,34 @@ def main():
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
 
+    # ── Modes + Explorer (Wandering/Navigating/Exploring,
+    # SPACE cycles; arrows jump in Exploring) ──
+    mode_machine = ModeMachine(
+        Mode.NAVIGATING if args.no_wander else Mode.WANDERING)
+    mode_toast = ModeToast(args.width, args.height)
+    explorer = None
+    if object_highlighter is not None and hl_objects:
+        explorer = Explorer(hl_objects, SPACING_W, SPACING_H)
+        log.info('Explorer: %d jump targets (of %d segments)',
+                 len(explorer.segments), len(hl_objects))
+    else:
+        log.warning('Explorer unavailable (no objects) — Exploring '
+                    'mode will hold the camera still')
+
     # Wire hologram playback state into the highlighter so 'Hologram #N'
     # labels are only shown while slot N is actually playing.
     if object_highlighter and hologram:
         object_highlighter.set_hologram_state_provider(
             hologram.playback_state)
         log.info("Highlighter hologram gating enabled")
+    if object_highlighter and teleport:
+        object_highlighter.set_teleport_state_provider(
+            teleport.live_index)
+        log.info("Highlighter teleport gating enabled")
 
-    # ── Persistent low-memory banner (pre-rendered, shown every frame) ──
-    mem_banner = None
-    if low_memory:
-        mem_banner = MemoryWarningBanner(screen, total_mem_mb,
-                                         overscan_margin=args.overscan_margin)
-        log.info("Memory warning banner enabled (%d MB < %d MB, overscan margin %dpx)",
-                 total_mem_mb, LOW_MEM_THRESHOLD_MB, args.overscan_margin)
+    # ── Persistent low-memory banner: REMOVED (2026-11-02) — the
+    # 2 GB Pi 5 runs the full feature set; the budget/depth logic
+    # handles constrained boards without nagging the viewer. ──
 
     running = True
 
@@ -1702,11 +1922,61 @@ def main():
     _last_slow_log = 0.0
     _frame_debug = os.environ.get("FLOOR796_FRAME_DEBUG", "")
 
+    def _enter_mode(new_mode):
+        """Apply a mode transition's side effects (shared by SPACE
+        cycling and the /viewport hook): wanderer drive, highlighter
+        enable/suspend, explorer anchor.  In NAVIGATING highlighting is
+        OFF (kiosk rule); WANDERING/EXPLORING have it on."""
+        nonlocal wandering
+        if new_mode is Mode.WANDERING:
+            if explorer is not None:
+                explorer.cancel_flight()
+            if object_highlighter:
+                object_highlighter.enabled = True
+                object_highlighter.resume_auto()
+            wandering = True
+            wanderer.x = pos_x
+            wanderer.y = pos_y
+        elif new_mode is Mode.NAVIGATING:
+            wandering = False
+            if object_highlighter:
+                object_highlighter.enabled = False
+        else:   # EXPLORING
+            wandering = False
+            if object_highlighter:
+                object_highlighter.enabled = True
+                object_highlighter.suspend_auto()
+            if explorer is not None:
+                sel = explorer.enter(pos_x + args.width / 2,
+                                     pos_y + args.height / 2)
+                log.info("explorer: exploring — '%s'",
+                         sel.title[:40] if sel else '(none)')
+                if sel is not None and object_highlighter:
+                    object_highlighter.set_explore_target(sel)
+        mode_toast.show(new_mode)
+
+    # GC pause tracking (slow-frame attribution): record every
+    # collection's duration; slow frames report recent pauses.
+    _gc_pauses = []
+
+    def _gc_cb(phase, info):
+        if phase == 'start':
+            _gc_pauses.append(time.perf_counter())
+        elif _gc_pauses:
+            dur = (time.perf_counter() - _gc_pauses[-1]) * 1000
+            _gc_pauses[-1] = dur
+            del _gc_pauses[:-8]          # keep the last few
+
+    import gc as _gc_mod
+    _gc_mod.callbacks.append(_gc_cb)
+
     while running:
         _ft0 = time.perf_counter()
         dt = clock.tick(30) / 1000.0
+        _t_tick = (time.perf_counter() - _ft0) * 1000   # vsync wait
         dt = min(dt, 1 / 15)
 
+        _t_ev0 = time.perf_counter()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -1714,10 +1984,14 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:
-                    wandering = not wandering
-                    if wandering:
-                        wanderer.x = pos_x
-                        wanderer.y = pos_y
+                    # Mode cycle: Wandering → Navigating →
+                    # Exploring → Wandering (Exploring exits directly
+                    # to Wandering, which resumes the tour from the
+                    # current camera).
+                    _old = mode_machine.current
+                    _new = mode_machine.cycle()
+                    log.info('mode: %s -> %s', _old.value, _new.value)
+                    _enter_mode(_new)
                 elif event.key == pygame.K_v:
                     wanderer.print_coverage()
                 elif event.key == pygame.K_s:
@@ -1738,12 +2012,80 @@ def main():
                         mode = object_highlighter.cycle_label_mode()
                         log.info("Object highlighter label: %s", mode)
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
-                    wandering = False
-                    speed = 500
-                    if event.key == pygame.K_LEFT:  pos_x -= speed * dt
-                    if event.key == pygame.K_RIGHT: pos_x += speed * dt
-                    if event.key == pygame.K_UP:    pos_y -= speed * dt
-                    if event.key == pygame.K_DOWN:  pos_y += speed * dt
+                    _pm = mode_machine.pan_started()
+                    if _pm is Mode.EXPLORING:
+                        # One KEYDOWN = one directional jump (one
+                        # jump per input; flight + cooldown
+                        # gate further input inside the Explorer).
+                        _dirs = {pygame.K_LEFT: (-1, 0),
+                                 pygame.K_RIGHT: (1, 0),
+                                 pygame.K_UP: (0, -1),
+                                 pygame.K_DOWN: (0, 1)}
+                        _dx, _dy = _dirs[event.key]
+                        if explorer is not None:
+                            jumped = explorer.jump(
+                                _dx, _dy,
+                                pos_x + args.width / 2,
+                                pos_y + args.height / 2)
+                            if jumped is not None:
+                                log.info("explorer: jump → '%s'",
+                                         jumped.title[:40])
+                                if object_highlighter:
+                                    object_highlighter.set_explore_target(
+                                        jumped)
+                    elif _pm is Mode.NAVIGATING:
+                        # Pan is allowed in Navigating only — arrows
+                        # are inert in Wandering (kiosk rule).
+                        wandering = False
+                        speed = 500
+                        if event.key == pygame.K_LEFT:  pos_x -= speed * dt
+                        if event.key == pygame.K_RIGHT: pos_x += speed * dt
+                        if event.key == pygame.K_UP:    pos_y -= speed * dt
+                        if event.key == pygame.K_DOWN:  pos_y += speed * dt
+
+        _t_ev = (time.perf_counter() - _t_ev0) * 1000
+
+        if pending_mode:
+            # Remote mode control (POST /mode): same transitions as
+            # SPACE, target mode named directly.
+            m, pending_mode[:] = pending_mode[0], []
+            _target = {'wandering': Mode.WANDERING,
+                       'navigating': Mode.NAVIGATING,
+                       'exploring': Mode.EXPLORING}[m]
+            if mode_machine.current is not _target:
+                log.info('mode: %s -> %s (remote)',
+                         mode_machine.current.value, _target.value)
+                mode_machine.force(_target)
+                _enter_mode(_target)
+
+        if pending_viewport:
+            # External viewport pin (POST /viewport on the stats
+            # server): center the camera on a map position and pause
+            # wandering so the view holds.  Resume via {"resume": true}
+            # or the SPACE key.
+            cmd, pending_viewport[:] = pending_viewport[0], []
+            if cmd.get('resume'):
+                mode_machine.force(Mode.WANDERING)
+                _enter_mode(Mode.WANDERING)
+                log.info('viewport: wandering resumed at %.0f,%.0f',
+                         pos_x, pos_y)
+            else:
+                mode_machine.force(Mode.NAVIGATING)
+                _enter_mode(Mode.NAVIGATING)
+                pos_x = max(0, min(map_w - args.width,
+                                   float(cmd['x']) - args.width / 2))
+                pos_y = max(0, min(map_h - args.height,
+                                   float(cmd['y']) - args.height / 2))
+                wanderer.x, wanderer.y = pos_x, pos_y
+                log.info('viewport: pinned to %.0f,%.0f (camera %.0f,%.0f)',
+                         cmd['x'], cmd['y'], pos_x, pos_y)
+
+        # ── Exploring: the camera flight owns the camera ──
+        if explorer is not None and mode_machine.explorer_drives_camera:
+            _c = explorer.update(dt)
+            if _c is not None:
+                pos_x = _c[0] - args.width / 2
+                pos_y = _c[1] - args.height / 2
 
         if wandering:
             wanderer.update(dt)
@@ -1777,6 +2119,9 @@ def main():
             # Cycle hologram when animation loop restarts
             if hologram and prev_frame_idx > frame_idx:
                 hologram.cycle_next()
+            # Teleport room steps once per animation tick (12 fps).
+            if teleport:
+                teleport.update()
 
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
@@ -1871,20 +2216,61 @@ def main():
             hologram.poll_scenes()
             hologram.update(frame_idx)
             hologram.render(screen, pos_x, pos_y)
+        _t_holo = (time.perf_counter() - _t_holo0) * 1000
+        _t_tele0 = time.perf_counter()
+        if teleport:
+            teleport.render(screen, pos_x, pos_y)
+        _t_tele = (time.perf_counter() - _t_tele0) * 1000
+        _t_high0 = time.perf_counter()
+
+        # ── Exploring: gray ghost boxes for other jump targets ──
+        # Exploring ghost boxes: light-gray outlined boxes on every
+        # selectable object in the viewport, CLIPPED with a hole over
+        # the highlighted object's content area (rect-subtracted
+        # edges) so
+        # neighboring boxes never draw over the highlighted artwork.
+        # Withheld during flight; the selected object's own segments
+        # are excluded
+        # by obj_id.
+        _t_ghost0 = time.perf_counter()
+        if (explorer is not None
+                and mode_machine.explorer_drives_camera
+                and explorer.selection is not None
+                and not explorer.is_flying):
+            _sel = explorer.selection
+            _excl = pygame.Rect(
+                int(_sel.abs_x1 - pos_x) - 2, int(_sel.abs_y1 - pos_y) - 2,
+                int(_sel.abs_x2 - _sel.abs_x1) + 4,
+                int(_sel.abs_y2 - _sel.abs_y1) + 4)
+            for _seg in explorer.viewport_objects(
+                    pos_x, pos_y, args.width, args.height):
+                if _seg.obj_id == _sel.obj_id:
+                    continue
+                _draw_ghost_box(
+                    screen, (205, 205, 215),
+                    (int(_seg.abs_x1 - pos_x), int(_seg.abs_y1 - pos_y),
+                     int(_seg.abs_x2 - _seg.abs_x1),
+                     int(_seg.abs_y2 - _seg.abs_y1)),
+                    _excl, width=2)
+        _t_ghost = (time.perf_counter() - _t_ghost0) * 1000
 
         # ── Object highlighter ──
         if object_highlighter:
             object_highlighter.render(screen, pos_x, pos_y)
         _t_overlay = (time.perf_counter() - _t_holo0) * 1000
+        _t_high = (time.perf_counter() - _t_high0) * 1000
+
+        # ── Mode-change capsule (transient) ──
+        mode_toast.render(screen)
 
         # ── Stats overlay (alpha-blended, zero cost when off) ──
+        _t_post0 = time.perf_counter()
         if stats_collector and stats_collector.overlay_enabled:
             snap = stats_collector.snapshot()
             stats_overlay.render(screen, snap)
 
-        # ── Persistent low-memory warning banner ──
-        if mem_banner:
-            mem_banner.render(screen)
+        # ── Persistent low-memory warning banner: removed ──
+        _t_post = (time.perf_counter() - _t_post0) * 1000
 
         # ── Screenshot request (captured AFTER all drawing, BEFORE flip) ──
         # The HTTP /screenshot endpoint signals a capture request; we copy
@@ -1908,7 +2294,7 @@ def main():
         _ft_total = (time.perf_counter() - _ft0) * 1000
         _frame_times.append(_ft_total)
         _should_log = (_ft_total > 40.0 and
-                       (time.perf_counter() - _last_slow_log) > 5.0)
+                       (time.perf_counter() - _last_slow_log) > 0.4)
         if _frame_debug:
             _should_log = True
         if _should_log:
@@ -1922,6 +2308,29 @@ def main():
                 _t_blit, _t_overlay, _t_ss, _t_flip,
                 cache.pending_count,
             )
+            if _ft_total > 45.0:
+                # Component attribution for slow frames.
+                log.info("[FRAME] slow breakdown: holo=%.1f tele=%.1f "
+                         "highlighter=%.1f (rest=%.1f)",
+                         _t_holo, _t_tele, _t_high,
+                         _t_overlay - _t_holo - _t_tele - _t_high)
+                _accounted = (_t_blit + _t_overlay + _t_ss + _t_flip
+                              + _t_post)
+                log.info("[FRAME] logic=%.1f tick=%.1f ev=%.1f "
+                         "post=%.1f (unaccounted=%.1f)",
+                         _t_blit0 - _ft0 - _t_tick,
+                         _t_tick, _t_ev, _t_post,
+                         _ft_total - _accounted
+                         - (_t_blit0 - _ft0))
+                if object_highlighter and \
+                        getattr(object_highlighter, '_perf_parts', None):
+                    log.info("[FRAME] highlighter parts: %s",
+                             {k: round(v, 1) for k, v in
+                              object_highlighter._perf_parts.items()})
+                _big_gc = [round(p, 1) for p in _gc_pauses[-4:]
+                           if isinstance(p, float) and p > 5.0]
+                if _big_gc:
+                    log.info("[FRAME] recent GC pauses ms: %s", _big_gc)
             _last_slow_log = time.perf_counter()
 
     cache.stop()
