@@ -154,20 +154,35 @@ def _detect_total_memory_mb():
     return 0
 
 
-def _compute_max_tiles(view_w, view_h, total_mem_mb):
+def _strip_cost_mb(display_depth):
+    """RAM cost of ONE fully-animated tile strip in the runtime cache.
+
+    1024 × (820×60) px: 16-bit ≈ 100 MB, 32-bit ≈ 201 MB.  Static
+    tiles are single-frame (~3 MB) — the budget conservatively prices
+    every slot at the animated cost (most viewport tiles animate)."""
+    return 201 if display_depth == 32 else 100
+
+
+def _compute_max_tiles(view_w, view_h, total_mem_mb, strip_mb=201):
     """Scale MAX_TILES based on viewport area and available RAM.
 
     At 1080p (1920×1080 = ~2M px) with 4 GB, max_tiles=15 is tuned.
     At 4K (3840×2160 = ~8.3M px) the viewport shows ~4× more tiles,
     so we need a larger cache. Scale linearly with viewport area, then
-    cap by available memory (each strip ~96 MB at 24-bit source, ~128 MB
-    after display-format conversion — budget uses the larger figure).
+    cap by available memory at the REAL per-strip cost (201 MB for
+    32-bit display-format strips, 100 MB for 16-bit).
 
-    On low-memory boards (e.g. 2 GB Pi 5), the memory cap MUST be able
-    to drop below MAX_TILES_BASE — otherwise the budget is ignored and
-    the kiosk gets OOM-killed (issue: kiosk OOM every ~5 min on 2 GB Pi).
-    The previous `max(MAX_TILES_BASE, ...)` floor defeated mem_cap on
-    those boards because mem_cap (5) < MAX_TILES_BASE (15).
+    The memory cap applies to ALL board sizes.  History: with the
+    32-bit strip conversion enabled, the 4 GB board's 18 tiles held
+    ~3.6 GB of strips, drove the process to 3.3 GB RSS with 430 MB
+    swapped (2026-11-02), and a hard floor at MAX_TILES_BASE formerly
+    OOM-killed 2 GB boards every ~5 min.
+
+    Budget arithmetic (animated strip at the display depth):
+      2 GB board: reserve 1.2 GB → 800 MB → 8 tiles @16-bit (800 MB)
+      4 GB board: reserve ~2.0 GB → 2.0 GB → 10 tiles @32-bit (2.0 GB)
+                  … or 18 tiles if strips stay 16-bit
+      8 GB board: reserve ~3.6 GB → 4.4 GB → 18 tiles (area cap)
     """
     # Scale factor relative to 1080p baseline
     vp_area = view_w * view_h
@@ -175,27 +190,17 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb):
     area_scale = vp_area / base_area
     max_t = int(MAX_TILES_BASE * area_scale)
 
-    # Memory ceiling: reserve a baseline for OS + pygame framebuffer +
-    # hologram cache + python itself. The reserve scales with board RAM —
-    # small boards need most of their RAM for the OS, large boards can
-    # spare proportionally more for the tile cache.
-    #
-    #   2 GB board: reserve 1.2 GB → ~800 MB budget → 8 tiles (~768 MB)
-    #   4 GB board: reserve 2.0 GB → ~2.0 GB budget → 15 tiles (cap at base)
-    #   8 GB board: reserve 2.5 GB → ~5.5 GB budget → 40 tiles (cap)
-    #
-    # The mem_cap MUST be able to drop below MAX_TILES_BASE on constrained
-    # boards — the previous `max(MAX_TILES_BASE, ...)` floor defeated it
-    # entirely and caused OOM kills every ~5 min on 2 GB Pi 5 boards.
-    if total_mem_mb > 0 and total_mem_mb < LOW_MEM_THRESHOLD_MB:
-        # Reserve ~60% of a 2 GB board, tapering to ~50% at 4 GB.
-        reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4) if total_mem_mb >= 2048 else int(total_mem_mb * 0.6)
+    if total_mem_mb > 0:
+        # Reserve for OS + framebuffer + hologram (~240 MB) + teleport
+        # room (~100 MB) + python/pygame base. Scales with board RAM.
+        if total_mem_mb >= 2048:
+            reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4)
+        else:
+            reserve_mb = int(total_mem_mb * 0.6)
         mem_budget_mb = max(0, total_mem_mb - reserve_mb)
-        # ~128 MB per strip after display-format (32-bit) conversion
-        mem_cap = max(2, int(mem_budget_mb / 128))
+        mem_cap = max(2, int(mem_budget_mb / strip_mb))
         return min(max_t, mem_cap, MAX_TILES_CAP)
 
-    # 4 GB+ board: scale with viewport, cap at MAX_TILES_CAP.
     return min(max_t, MAX_TILES_CAP)
 
 # ─── Status Display ───────────────────────────────────────────────────────────
@@ -1796,12 +1801,22 @@ def main():
     log.info("Wander bounds: x=%.0f-%.0f y=%.0f-%.0f",
              wanderer.min_x, wanderer.max_x, wanderer.min_y, wanderer.max_y)
 
-    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb)
+    # Strip runtime depth: display-format (32-bit) strips halve blit
+    # cost but DOUBLE cache RAM (201 MB vs 100 MB per animated strip).
+    # Low-RAM boards (< 3.9 GB) keep 16-bit strips and let SDL convert
+    # per blit (~10 ms in dense viewports — the pre-optimization
+    # behavior that ran effectively on the 2 GB Pi 5).
+    display_depth = (screen.get_bitsize()
+                     if total_mem_mb >= LOW_MEM_THRESHOLD_MB else 16)
+    max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb,
+                                   _strip_cost_mb(display_depth))
     effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
-    log.info("Tile cache: max_tiles=%d (viewport %dx%d, %d MB RAM, margin=%d)",
-             max_tiles, args.width, args.height, total_mem_mb, effective_margin)
+    log.info("Tile cache: max_tiles=%d, strip depth=%d-bit (%d MB/strip), "
+             "(viewport %dx%d, %d MB RAM, margin=%d)",
+             max_tiles, display_depth, _strip_cost_mb(display_depth),
+             args.width, args.height, total_mem_mb, effective_margin)
     cache = TileCache(STRIP_DIR, max_tiles=max_tiles,
-                      display_depth=screen.get_bitsize())
+                      display_depth=display_depth)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,

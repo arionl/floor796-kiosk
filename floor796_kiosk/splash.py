@@ -80,7 +80,8 @@ def load_splash_assets(screen):
 
     if not meta_ok:
         # Decode once: mp4 → single tall strip PNG via ffmpeg, then
-        # convert to a display-format BMP cache.
+        # down-convert to a 16-bit BMP cache (~60 MB vs ~120 at 32-bit
+        # — the per-frame blit conversion during boot is negligible).
         strip_png = os.path.join(SPLASH_CACHE_DIR, 'splash_strip.png')
         cmd = ['ffmpeg', '-y', '-i', SPLASH_MP4,
                '-vf', f'scale={square}:{square}:flags=neighbor,'
@@ -89,12 +90,14 @@ def load_splash_assets(screen):
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             if r.returncode == 0 and os.path.exists(strip_png):
-                surf = pygame.image.load(strip_png).convert()
-                pygame.image.save(surf, strip_bmp)
+                surf = pygame.image.load(strip_png)
+                s16 = pygame.Surface(surf.get_size(), 0, 16)
+                s16.blit(surf, (0, 0))
+                pygame.image.save(s16, strip_bmp)
                 os.remove(strip_png)
                 with open(meta_path, 'w') as f:
                     json.dump(fp, f)
-                strip = surf
+                strip = s16
                 log.info('splash: decoded %d frames (%dpx) from mp4',
                          SPLASH_FRAMES, square)
             else:
@@ -106,7 +109,7 @@ def load_splash_assets(screen):
 
     if strip is None and meta_ok:
         try:
-            strip = pygame.image.load(strip_bmp).convert()
+            strip = pygame.image.load(strip_bmp)   # stays 16-bit
             log.info('splash: strip cache hit (%d frames, %dpx)',
                      SPLASH_FRAMES, square)
         except pygame.error as exc:
@@ -207,7 +210,7 @@ class SplashStatusDisplay:
                              (bar_x, y, fill_w, bar_h), border_radius=3)
 
     def release(self):
-        """Drop the strip/overlay references (~120 MB) once the main
+        """Drop the strip/overlay references (~60 MB) once the main
         loop starts."""
         self.strip = None
         self.frame = None
