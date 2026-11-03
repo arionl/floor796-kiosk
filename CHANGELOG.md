@@ -5,7 +5,11 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
-## Unreleased (v2.5)
+## Unreleased
+
+---
+
+## v2.5.0 — Teleporter room, camera modes, boot splash, smoothness, memory budget (2026-11-02)
 
 ### Teleporter room
 - **Teleporter room overlay** (`floor796_kiosk/teleport.py`) — site-exact
