@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test modes.py — the canonical three-mode state machine (tvOS parity).
+"""Test modes.py — the canonical three-mode state machine.
 
 Select-press (SPACE) cycles Wandering → Navigating → Exploring →
 Wandering; any pan in Wandering enters Navigating; a pan in Exploring
@@ -32,7 +32,7 @@ class TestModeMachine(unittest.TestCase):
         self.assertIs(m.cycle(), Mode.WANDERING)
 
     def test_pan_in_wandering_does_not_move_the_map(self):
-        # Kiosk rule (arion): arrows are inert in Wandering — pan only
+        # Arrows are inert in Wandering — pan only
         # in Navigating.  The mode must not change either.
         m = ModeMachine()
         self.assertIs(m.pan_started(), Mode.WANDERING)

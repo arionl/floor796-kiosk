@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Test ghost-box rendering (Exploring mode).
 
-Covers _rect_subtract (the pygame equivalent of tvOS's even-odd mask
-hole) and _draw_ghost_box: outlined boxes overlapping the highlighted
+Covers _rect_subtract (mask-hole equivalent for outlined boxes) and
+_draw_ghost_box: outlined boxes overlapping the highlighted
 object's content area are CLIPPED — never painted inside the exclusion
 rect — while unclipped boxes draw a complete outline.
 """

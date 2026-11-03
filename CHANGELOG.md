@@ -5,50 +5,129 @@ Tags are cut on `main`; development happens on `dev`.
 
 ---
 
-## Unreleased
+## Unreleased (v2.5)
 
-### Three canonical modes (Stream B of the v2.5 plan — tvOS parity)
-- `modes.py` — Wandering / Navigating / Exploring state machine with the
-  tvOS `cycleMode()` semantics: SPACE cycles W → N → E → W (Exploring
-  exits directly back to Wandering, which resumes the tour from the
-  current camera); any arrow pan in Wandering enters Navigating.
-- `explorer.py` — 1:1 port of tvOS `Explorer.swift`: 90°-cone →
-  180°-half-plane → stay-put jump rule, 0.4 s ease-out-cubic camera
-  flight, 0.3 s landing cooldown, min-size target filter, entry
-  re-anchors to the nearest object (never a prior stint's selection),
-  resume() keeps a selection.
-- Arrows in Exploring = one directional jump per keypress (one per
-  flick on tvOS); the highlighter suspends auto-cycling and follows the
-  explorer's target (box persists until the next jump); auto-selection
-  resumes on returning to Wandering. Transient mode capsule on change.
-- Tests: `tools/test_modes.py`, `tools/test_explorer.py` (all tvOS
-  ExplorerTests cases + kiosk multi-segment case).
-- `TileCache` now converts strips to the ACTUAL display depth (was
-  hardcoded 16 — the numpy 32-bit fast path never activated before).
-
-### Teleport room (Stream A of the v2.5 plan)
-
-### Added
-- **Teleporter room** (`floor796_kiosk/teleport.py`) — site-exact port
-  of the tvOS `Rooms.swift` implementation, verified against the live
-  site semantics: 289×412 overlay anchored `t2r4,618,15`+(-4,1), clip
-  polygon, 4-tick gap → 22-beat materialize (f0 at alpha t/21 with
-  sparkle column t) → 60-tick play ([f0×3, f1…f57]) → 22-beat
-  dematerialize (f58 held, alpha 1−min(1,t/14)) → next scene. Sparkle
-  slots diff the held frame vs the empty-room bg on a 10 px quant
-  grid; the black hide-triangle masks only the diff baselines. All
-  content downloads and caches on-device (list JSON, bg PNG, sprite
-  sheet, `.f796.br` scenes; current+next resident only, ~29 MB/scene).
-  Sprite compositing is the W3C canvas overlay blend in straight
-  alpha, clipped to the room polygon, with per-cell opaque-bbox
-  cropping (10–20 ms per transition beat on the dev host).
+### Teleporter room
+- **Teleporter room overlay** (`floor796_kiosk/teleport.py`) — site-exact
+  implementation of floor796.com's teleport room, verified against the
+  live site semantics: 289×412 overlay anchored `t2r4,618,15`+(-4,1)
+  (origin cross-correlated against the map strips and corrected
+  +4,+4), clip polygon, 4-tick gap → 22-beat materialize (f0 at alpha
+  t/21 with sparkle column t) → 60-tick play ([f0×3, f1…f57]) →
+  22-beat dematerialize (f58 held, alpha 1−min(1,t/14)) → next scene.
+  Sparkle slots diff the held frame vs the empty-room bg on a 10 px
+  quant grid; the black hide-triangle masks only the diff baselines.
+  All content downloads and caches on-device (list JSON, bg PNG,
+  sprite sheet, `.f796.br` scenes); the scene list length is dynamic
+  (the site grew 7 → 8 teleports).
+- **All transition beats are pre-rendered at boot** and persisted to
+  `assets/teleport/teleport/trans_v1/` (8 scenes × 44 beats ≈ 54 MB
+  PNGs; cold boot renders them in a background worker in ~80 s while
+  the room cycles, warm boot loads from cache at ~1 s/scene).  The
+  render loop only blits (overlay ≈ 1.5 ms/frame; before this, dense
+  scenes hit ~400 ms/beat composites on the render thread).  Stale
+  cache entries are pruned when the site's file ids change; runtime
+  decode requests use a priority queue that jumps ahead of boot jobs.
+  Known trade-off: sparkle placement is fixed at first render (delete
+  the trans_v1 dir to re-roll).
+- **Robustness** — every phase-machine branch that skips or gives up
+  waiting re-requests the next scene's decode (previously the
+  request-ahead chain could starve and leave the room static while the
+  map kept animating); a cheap sparkle-less fade covers the rare
+  not-yet-rendered case; cached float32 sprite blocks and bbox crops
+  removed per-beat recomputation.
 - **Highlighter teleport gating** — objects linked
   `event://pick-teleport-N` are selectable only while pad N plays
   live, with mid-highlight abort on dematerialize (mirrors the
   hologram-slot gating).
-- 16 headless tests (`tools/test_teleport.py`): phase machine at every
-  boundary, gap extension/skip, slot diffing, composite math, clip,
-  geometry.
+- Tests: `tools/test_teleport.py` (22 headless cases: phase machine
+  boundaries, gap extension/skip, slot diffing, composite math, clip,
+  geometry, decode-chain liveness).
+
+### Three camera modes: Wandering / Navigating / Exploring
+- **`modes.py`** — the canonical mode state machine.  SPACE cycles
+  Wandering → Navigating → Exploring → Wandering (Exploring exits
+  directly back to Wandering, which resumes the tour from the current
+  camera — no snap-back).  Arrow keys are inert in Wandering; they pan
+  only in Navigating.  Highlighting is OFF while Navigating.
+- **`explorer.py`** — Exploring mode's object-to-object navigation:
+  90°-cone → 180°-half-plane → stay-put jump rule, 0.4 s ease-out
+  camera flight, 0.3 s landing cooldown, min-size target filter.
+  Entry re-anchors to the object nearest the view center; one arrow
+  keypress = one directional jump; the highlighter follows the
+  explorer's target (red box + panel persist until the next jump, no
+  countdown bar — the selection only changes when the user acts).
+- **Gray ghost boxes** while exploring: light-gray outlined boxes on
+  every selectable object in the viewport, CLIPPED with a hole over
+  the highlighted object's content area so neighboring boxes never
+  draw over the highlighted artwork (edge strips minus the exclusion
+  rect).  Withheld during camera flights.
+- Transient bottom-center capsule announces each mode change.
+- Remote/debug control: `POST /mode {"mode": …}` on the stats HTTP
+  server applies the same transitions.
+- Tests: `tools/test_modes.py`, `tools/test_explorer.py`,
+  `tools/test_ghost_boxes.py`.
+
+### Boot splash with the station animation
+- `floor796_kiosk/splash.py` — the looping planet/station video
+  (floor796's about-section animation, `assets/splash/`) plays in a
+  centered square at 66% of screen height over the splash navy, with
+  a space-themed porthole frame graphic composited over it; all boot
+  status text and progress bars render underneath.  The mp4 is
+  ffmpeg-decoded ONCE into a 60-frame strip (same pipeline as tile
+  strips) and cached in `cache/splash/`; later boots blit only.  The
+  strip is 16-bit (~60 MB) and freed before the main loop.  Falls
+  back to the legacy text-only boot screen if assets/ffmpeg are
+  unavailable.  Tests: `tools/test_splash.py`.
+
+### Main-loop smoothness campaign
+- **Highlighter rendering** — all static text cached per highlight
+  (panel title/date/extract rendered once; was up to ~25
+  `font.render` calls/frame), `font.size()` for wrap measurement (no
+  probe surfaces), panel fill surfaces reused, thumbnail `smoothscale`
+  moved off the render path (async prewarm).  Highlighter cost
+  7–11 ms → 0.6–1.7 ms/frame.
+- **Breathing-glow cache thrash fixed** — the continuously-animating
+  glow radius changed the cache key every frame (full 8-layer
+  rebuild + 8 alpha blits/frame).  Radius is now quantized to 2 px
+  steps and the layers pre-composed into one canvas blitted as ring
+  strips only (~4× fewer pixels).  Output pixel-identical; glow cost
+  8–11.5 ms → 0.15 ms/frame.
+- **Wanderer** — tile density classes precomputed once per tile (was
+  an `np.mean` per comparison inside the O(n²) tour build; 50–100 ms
+  main-thread hitches gone).
+- **Frame telemetry** — slow frames (>40 ms) log a per-section
+  breakdown (blit/overlay/hologram/teleport/highlighter +
+  logic/tick/ev/post), highlighter part timings, GC pause tracking,
+  and an unthrottled (0.4 s) slow-log so recurring fallbacks stay
+  visible.
+
+### Tile-strip display-format conversion + depth-aware memory budget
+- Strips are stored 24-bit on disk but blitted to a 32-bit display —
+  SDL re-converted the blitted region every frame (dense viewports
+  10–11 ms).  `TileCache._ensure_display_depth` now converts each
+  strip ONCE in the background worker via numpy over zero-copy
+  `get_view('0')` buffers (GIL-released ufuncs; ≤8 ms main-thread gap
+  for a 100 MB strip, where SDL convert/tobytes hold the GIL
+  100–950 ms), writing into a display-format surface's own buffer
+  with the channel order probed once.  Dense-viewport blit
+  10–11 ms → ~5 ms.  Tests: `tools/test_depth_convert.py`.
+- **Depth-aware cache budget** — 32-bit strips cost ~201 MB each
+  (vs ~100 MB at 16-bit).  The tile budget now prices every slot at
+  the real per-depth cost and caps tile count on ALL board sizes:
+  4 GB boards hold ~10 tiles at 32-bit (~2.0 GB, no swap; previously
+  18 uncapped tiles ≈ 3.6 GB, RSS 3.3 GB + 430 MB swapped), boards
+  under 3.9 GB pin 16-bit strips and keep ~8 tiles — the 2 GB Pi 5
+  runs the full feature set (RSS ~1.45 GB).  The low-memory warning
+  banner and boot warning screen were removed (2 GB verified working).
+  Tests: `tools/test_mem_budget.py`.
+
+### Stats/remote-control endpoints
+- `POST /viewport {"x","y"}` — pin the camera to a map position
+  (pauses wandering); `{"resume":true}` resumes.  Used for on-device
+  A/B performance attribution.
+- `POST /mode {"mode":"wandering"|"navigating"|"exploring"}` —
+  keyboard-equivalent remote mode control.
 
 ---
 

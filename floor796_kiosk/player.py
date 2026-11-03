@@ -656,7 +656,7 @@ class TileCache:
 
 def _rect_subtract(a, b):
     """Rectangle subtraction: rects covering `a` minus `b` (0-4 rects).
-    The pygame equivalent of tvOS's even-odd mask hole."""
+    An even-odd mask-hole equivalent for outlined boxes."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     ix1, iy1 = max(ax, bx), max(ay, by)
@@ -679,10 +679,9 @@ def _draw_ghost_box(screen, color, rect, excl, width=2):
     """Draw an outlined box, CLIPPED against the exclusion rect (the
     highlighted object's content area) — a box that overlaps the
     highlight has its lines inside the hole suppressed instead of
-    drawn over the artwork.  Port of the tvOS ghost-layer even-odd
-    mask (HighlighterOverlayView.updateGhostBoxes, arion 2026-11-01).
-    Emphasized: light gray, same weight as the red box's steady
-    stroke, rounded corners on the unclipped path."""
+    drawn over the artwork.  Emphasized: light gray, same weight as
+    the red box's steady stroke, rounded corners on the unclipped
+    path."""
     x, y, w, h = rect
     if w <= 0 or h <= 0:
         return
@@ -705,8 +704,7 @@ def _draw_ghost_box(screen, color, rect, excl, width=2):
 
 
 class ModeToast:
-    """Transient bottom-center capsule announcing mode changes (tvOS
-    showCapsule parity; kiosk wording mentions the keyboard)."""
+    """Transient bottom-center capsule announcing mode changes."""
 
     TEXTS = None   # filled lazily per Mode (import cycle safety)
 
@@ -1624,7 +1622,7 @@ def main():
 
     # ── Low-memory handling ──
     # 2 GB boards run the full feature set (16-bit strips, capped tile
-    # cache — measured working, arion 2026-11-02). No user-facing
+    # cache — measured working 2026-11-02). No user-facing
     # warning; keep only the journal note for diagnostics.
     low_memory = 0 < total_mem_mb < LOW_MEM_THRESHOLD_MB
     if low_memory:
@@ -1795,7 +1793,7 @@ def main():
         log.warning("Hologram overlay failed: %s", e)
         hologram = None
 
-    # ── Teleport room overlay (site-exact port of the tvOS room) ──
+    # ── Teleport room overlay (site-exact implementation) ──
     teleport = None
     try:
         from floor796_kiosk.teleport import TeleportRoom
@@ -1885,7 +1883,7 @@ def main():
     if stats_collector and object_highlighter:
         stats_collector.set_highlighter(object_highlighter)
 
-    # ── Modes + Explorer (tvOS parity: Wandering/Navigating/Exploring,
+    # ── Modes + Explorer (Wandering/Navigating/Exploring,
     # SPACE cycles; arrows jump in Exploring) ──
     mode_machine = ModeMachine(
         Mode.NAVIGATING if args.no_wander else Mode.WANDERING)
@@ -1910,7 +1908,7 @@ def main():
             teleport.live_index)
         log.info("Highlighter teleport gating enabled")
 
-    # ── Persistent low-memory banner: REMOVED (arion 2026-11-02) — the
+    # ── Persistent low-memory banner: REMOVED (2026-11-02) — the
     # 2 GB Pi 5 runs the full feature set; the budget/depth logic
     # handles constrained boards without nagging the viewer. ──
 
@@ -1986,7 +1984,7 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:
-                    # tvOS cycleMode(): Wandering → Navigating →
+                    # Mode cycle: Wandering → Navigating →
                     # Exploring → Wandering (Exploring exits directly
                     # to Wandering, which resumes the tour from the
                     # current camera).
@@ -2016,8 +2014,8 @@ def main():
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
                     _pm = mode_machine.pan_started()
                     if _pm is Mode.EXPLORING:
-                        # One KEYDOWN = one directional jump (tvOS
-                        # one-jump-per-flick rule; flight + cooldown
+                        # One KEYDOWN = one directional jump (one
+                        # jump per input; flight + cooldown
                         # gate further input inside the Explorer).
                         _dirs = {pygame.K_LEFT: (-1, 0),
                                  pygame.K_RIGHT: (1, 0),
@@ -2226,13 +2224,13 @@ def main():
         _t_high0 = time.perf_counter()
 
         # ── Exploring: gray ghost boxes for other jump targets ──
-        # tvOS parity (HighlighterOverlayView ghost boxes): light-gray
-        # outlined boxes on every selectable object in the viewport,
-        # CLIPPED with a hole over the highlighted object's content
-        # area (even-odd mask on tvOS; rect-subtracted edges here) so
+        # Exploring ghost boxes: light-gray outlined boxes on every
+        # selectable object in the viewport, CLIPPED with a hole over
+        # the highlighted object's content area (rect-subtracted
+        # edges) so
         # neighboring boxes never draw over the highlighted artwork.
-        # Withheld during flight (tvOS withholds until the destination
-        # is rendered); the selected object's own segments are excluded
+        # Withheld during flight; the selected object's own segments
+        # are excluded
         # by obj_id.
         _t_ghost0 = time.perf_counter()
         if (explorer is not None

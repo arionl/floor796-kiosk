@@ -821,7 +821,7 @@ class ObjectHighlighter:
         # Prefetch thumbnail for the new object
         self._thumbs.get(seg.obj_id, seg.link)
 
-    # ── Exploring-mode integration (tvOS: Explorer owns the box) ────
+    # ── Exploring-mode integration (Explorer owns the box) ────
 
     def suspend_auto(self):
         """Stop auto-cycling selections (Exploring takes over)."""
@@ -875,11 +875,10 @@ class ObjectHighlighter:
 
         elif self._state == STATE_HIGHLIGHT:
             if self._forced_seg is not None:
-                # Exploring target: a deliberate selection — the tvOS
-                # explorer keeps its red box until the next jump; skip
-                # the auto-cycling aborts and the duration expiry (the
-                # panel progress bar parks at 100%, matching tvOS
-                # progress:1).
+                # Exploring target: a deliberate selection — keep
+                # the red box until the next jump; skip the
+                # auto-cycling aborts and the duration expiry (the
+                # panel progress bar parks at 100%).
                 return
             # Mid-highlight check: if the current object has scrolled
             # off-screen (e.g. wander direction changed), abort early
@@ -1508,8 +1507,7 @@ class ObjectHighlighter:
 
         # Progress bar (right side, takes remaining width) — NOT shown
         # for a forced (Exploring) target: the selection only changes
-        # when the user acts, so a countdown bar is meaningless noise
-        # (arion; tvOS exploring panels carry no timer either).
+        # when the user acts, so a countdown bar is meaningless noise.
         if self._forced_seg is not None:
             return
         progress = min(1.0, self._timer / HIGHLIGHT_DURATION)

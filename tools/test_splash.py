@@ -27,7 +27,7 @@ class TestSplash(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Real assets from assets/splash/ (tvOS-parity mp4 + frame).
+        # Real assets from assets/splash/.
         cls.square = int(600 * 0.66)
         cls.strip, cls.frame = load_splash_assets(
             pygame.display.set_mode((800, 600)))

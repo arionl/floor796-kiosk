@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """splash.py — boot splash with floor796's own station animation.
 
-Port of the tvOS cold-boot splash (GameViewController.showSplash +
-HighlighterOverlayView-era frame): the looping planet/station video
-(splash-planet.mp4 — floor796's about-section animation, the same
-asset the tvOS app bundles) plays in a centered square at 66% of the
+The looping planet/station video (splash-planet.mp4 — floor796's
+about-section animation) plays in a centered square at 66% of the
 screen height over the splash navy (8,10,16), with the space-themed
 porthole frame graphic (splash-frame.png) composited over it and the
 boot status/progress underneath.
@@ -15,9 +13,9 @@ frame strip cached in cache/splash/; boots after the first load only
 blit.  If the mp4, ffmpeg or the cache are unavailable the splash
 degrades to the legacy text-only status screen — boot never breaks.
 
-Like the tvOS bundle, these two assets are APP CHROME shipped with the
-deploy (not floor796.com map content), so the no-bundling rule for
-site content does not apply.
+These two assets are APP CHROME shipped with the deploy (not
+floor796.com map content), so the no-bundling rule for site content
+does not apply.
 """
 
 import json
@@ -39,7 +37,7 @@ SPLASH_CACHE_DIR = os.path.join(CACHE_DIR, 'splash')
 
 SPLASH_FRAMES = 60        # 5 s at …
 SPLASH_FPS = 12           # … 12 fps, looped
-BG = (8, 10, 16)          # tvOS splash background color
+BG = (8, 10, 16)          # splash background color
 
 
 def _fingerprint(path, square):
@@ -60,7 +58,7 @@ def load_splash_assets(screen):
     mp4 via ffmpeg (~1-2 s once); warm path loads the cached BMP.
     """
     w, h = screen.get_size()
-    square = int(h * 0.66)          # tvOS: VS = bounds.height * 0.66
+    square = int(h * 0.66)          # video square = 66% of height
     if square < 64 or not os.path.exists(SPLASH_MP4):
         return None, None
 

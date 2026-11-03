@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test explorer.py — port of App/Tests/ExplorerTests.swift (all cases).
+"""Test explorer.py — selection geometry, flight, cooldown.
 
 Pure geometry (no pygame): the 90°-cone → 180°-half-plane → stay-put
 jump rule, entry nearest-center selection, flight timing, cooldown,

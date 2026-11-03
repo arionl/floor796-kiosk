@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """explorer.py — Exploring mode's selection engine.
 
-1:1 port of floor796-tvos App/Sources/Explorer.swift (spec 2026-11-01):
-object-to-object navigation on the fixed-scale map.  The camera
+Spec (2026-11-01): object-to-object navigation on the fixed-scale
+map.  The camera
 re-centers on a selected object with a short eased flight.  One flick
 (here: one arrow KEYDOWN) jumps to the nearest object whose center lies
 within a 90° cone around the flick direction; if none, the nearest
@@ -13,9 +13,8 @@ landing.
 Objects are the kiosk's ObjectSegments (highlighter.py) — one per tile
 bounding box, with absolute-map cx/cy.  Pure logic: no pygame.
 
-Ghost boxes: tvOS additionally draws gray ghost boxes for viewport
-objects while exploring; the kiosk skips them for now (per-frame cost
-on the Pi was the concern) — revisit if wanted.
+Ghost boxes for the other viewport objects are drawn by the player
+(see _draw_ghost_box).
 """
 
 import math
@@ -28,7 +27,7 @@ CONE_HALF_ANGLE_COS = 0.7071067811865476   # cos(45°) — half of the 90° cone
 
 
 class Explorer:
-    """Exploring mode engine (port of tvOS Explorer)."""
+    """Exploring mode engine (cone/half-plane selection + flight)."""
 
     def __init__(self, segments, spacing_w=1016, spacing_h=812):
         # Same minimum-size rule as the highlighter's selection pass —
@@ -56,8 +55,8 @@ class Explorer:
         """Select the object whose center is nearest the camera center
         and begin a flight to it.  Returns the new selection (None when
         there are no objects — caller should treat Exploring as
-        unavailable).  Mode entry ALWAYS re-anchors (tvOS rule:
-        never snap back to a previous stint's selection)."""
+        unavailable).  Mode entry ALWAYS re-anchors (never snap
+        back to a previous stint's selection)."""
         first = self.nearest(cam_x, cam_y, self.segments)
         if first is None:
             return None

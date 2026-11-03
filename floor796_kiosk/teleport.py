@@ -2,10 +2,9 @@
 """
 Teleport room renderer for the floor796 kiosk player.
 
-Site-exact port of floor796-tvos ``App/Sources/Rooms.swift`` (TeleportRoom /
-TeleK) — that implementation was verified against the live site's
-render.js and is the semantic authority.  Do not approximate from
-memory; re-read Rooms.swift when in doubt.
+Site-exact implementation (TeleportRoom / TeleK), verified against
+the live site's render.js, which is the semantic authority.  Do not
+approximate from memory; re-verify against the site when in doubt.
 
 The teleport room is a 289x412 scene overlay anchored at site point
 ``t2r4,618,15`` (+ (-4, 1)) near the top-left of the map.  7 teleport
@@ -50,7 +49,7 @@ from .hologram import decode_f796_br
 
 log = logging.getLogger('floor796')
 
-# ─── Constants (TeleK in Rooms.swift — do not tweak) ────────────────────────
+# ─── Constants (TeleK — site-derived, do not tweak) ────────────────────────
 
 WIDTH = 289
 HEIGHT = 412
@@ -65,7 +64,7 @@ OFF_Y = 1
 # Measured correction: cross-correlating teleport-bg.png against the
 # map tile strips (tools/tele_align.py, 2026-11-02) puts the room art
 # at (+4,+4) from the site-formula anchor on THIS map grid — the
-# tvOS-tuned OFF constants are 4px up-left of the kiosk tiles, which
+# site-tuned OFF constants sit 4px up-left of the kiosk tiles, which
 # read as a "background shift" during the alpha cross-fades.
 ORIGIN_FIX_X = 4
 ORIGIN_FIX_Y = 4
@@ -148,8 +147,8 @@ def resolve_point(tiles, ref, x, y, spacing_w=TILE_SPACING_W,
                   spacing_h=TILE_SPACING_H):
     """Resolve a site point (tileRef + local x/y) to absolute map coords.
 
-    Mirrors tvOS TileRefResolver.resolve: (col*spacing_w + x,
-    row*spacing_h + y).  Returns None when the tile is unknown.
+    Site formula: (col*spacing_w + x, row*spacing_h + y).
+    Returns None when the tile is unknown.
     """
     entry = tiles.get(ref)
     if entry is None:
@@ -468,7 +467,7 @@ class TeleportRoom:
         composites and save them.  Sparkle slots are generated ONCE per
         transition (site semantics — beats share the slot set and
         differ only in sprite column); the persisted cache freezes the
-        sparkle placement per scene (arion: loops are fixed, pre-render
+        sparkle placement per scene (loops are fixed by design; pre-render
         everything up-front)."""
         scene = self.scenes.get(idx)
         if scene is None or scene.trans_mat is not None:
@@ -759,8 +758,8 @@ def _composite_pixels(src, alpha, t, slots, sprites, clip_mask):
     """Pure composite math (site drawSlots semantics) in STRAIGHT alpha.
 
     1) image pass — canvas drawImage at globalAlpha over a cleared
-       canvas: alpha scales, colors stay straight (unlike the tvOS
-       premultiplied storage, pygame blits are straight-alpha);
+       canvas: alpha scales, colors stay straight (pygame blits are
+       straight-alpha, not premultiplied);
     2) sprite pass — 'overlay' composite at FULL opacity (the site
        restores globalAlpha before drawing sparkles), W3C blend with a
        straight-alpha sprite source over the (semi-transparent) canvas,

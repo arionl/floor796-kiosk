@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""modes.py — the three canonical camera modes (tvOS parity).
+"""modes.py — the three canonical camera modes.
 
-Mirrors floor796-tvos GameViewController's mode semantics
-(docs/architecture.md §3.1):
+Design spec (2026-11-01):
 
   Wandering   self-driving camera (A* tours); the default.  Arrow
-              keys are inert here (kiosk rule) — SPACE enters
-              Navigating for manual pan.
+              keys are inert here — SPACE enters Navigating for
+              manual pan.
   Navigating  user-driven pan; entered by a click from Wandering; a
               click advances to Exploring.
   Exploring   object-to-object navigation (see explorer.py); a click
               returns to Wandering, which resumes the tour from the
               current camera position.
 
-Keyboard stands in for the Siri Remote: SPACE = select-click (cycles
-modes), arrow keys = pan/flick.  Pure logic — no pygame, no I/O.
+SPACE cycles modes; arrow keys pan (Navigating) or jump
+(Exploring).  Pure logic — no pygame, no I/O.
 """
 
 from enum import Enum
@@ -31,15 +30,15 @@ _CYCLE_ORDER = (Mode.WANDERING, Mode.NAVIGATING, Mode.EXPLORING)
 
 class ModeMachine:
     """Select-press (SPACE) cycles Wandering → Navigating → Exploring →
-    Wandering.  Arrows are inert in Wandering (kiosk rule: the map
-    cannot be moved by hand until Navigating).  Resuming
+    Wandering.  Arrows are inert in Wandering (the map cannot be
+    moved by hand until Navigating).  Resuming
     Wandering continues the tour from the current camera — no
     snap-back.
 
-    Exactly the tvOS cycleMode() semantics:
-      exploring → click → exit exploring + wander;
-      wandering → click → stop wandering (= Navigating);
-      navigating → click → enter exploring.
+    Transition table:
+      exploring → select → exit exploring + wander;
+      wandering → select → stop wandering (= Navigating);
+      navigating → select → enter exploring.
     """
 
     def __init__(self, initial=Mode.WANDERING):
@@ -54,7 +53,7 @@ class ModeMachine:
     # ── Transitions ──────────────────────────────────────────────────
 
     def cycle(self):
-        """Select-press: advance one mode (with the tvOS exit rules)."""
+        """Select-press: advance one mode (with the exit rules above)."""
         if self._mode is Mode.EXPLORING:
             # Exploring exits directly to Wandering (resume tour).
             self._mode = Mode.WANDERING
@@ -66,8 +65,8 @@ class ModeMachine:
     def pan_started(self):
         """A pan gesture began (arrow key).
 
-        Arrows only pan in NAVIGATING (kiosk rule, arion: arrows in
-        Wandering must not move the map — SPACE first).  In Exploring a
+        Arrows only pan in NAVIGATING (in Wandering they are inert —
+        SPACE first).  In Exploring a
         pan is not a pan — it is a directional JUMP; the mode is
         unchanged and the caller routes the input to the Explorer.
         This method is mode-preserving; it exists so callers have one
@@ -77,7 +76,7 @@ class ModeMachine:
     def force(self, mode):
         """External control hook (e.g. the HTTP /viewport endpoint
         pinning the camera): set the mode outright, bypassing the
-        click-cycle.  Not part of the tvOS remote semantics."""
+        click-cycle."""
         self._mode = mode
         return self._mode
 
