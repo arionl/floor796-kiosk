@@ -314,7 +314,7 @@ async function loadSettings() {
         `<input type="radio" name="res" value="${c.value}" ` +
         `${c.available ? "" : "disabled"} ` +
         `${d.settings.resolution === c.value ? "checked" : ""}>` +
-        `<span><span class="lbl">${c.label}</span>${badge>` +
+        `<span><span class="lbl">${c.label}</span>${badge}` +
         `<div class="why">${c.reason} — ${c.detail}</div></span>`;
       box.appendChild(row);
     });
