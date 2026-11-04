@@ -7,6 +7,31 @@ Tags are cut on `main`; development happens on `dev`.
 
 ## Unreleased
 
+### Settings web UI (kiosk "settings")
+- The stats HTTP server now serves a settings & debug web page at
+  `http://127.0.0.1:8796/` (stdlib-only, embedded HTML, dark theme).
+  - **Resolution setting** — Auto (display native, with the standing
+    <=4 GB 1080p cap) / 1080p / 4K, each option annotated with the
+    hardware reality (board RAM, display's reported mode, what the
+    active render is and why).  4K is only offered when the display
+    reports a >=4K mode and carries a RAM warning below 8 GB; forcing
+    1080p on a 4K display lets KMSDRM negotiate 1080p (the low-RAM
+    path).  Setting persists in `settings.json` and applies at the
+    next player start.
+  - **Cache clearing (cold/warm boot simulation)** — per-cache size
+    report and clear buttons: tile strips, content mask, splash
+    strip, teleporter transitions, thumbnails, and full tile
+    re-download; individually, selected, or all.
+  - **Debug controls** — camera mode buttons, viewport pin/resume,
+    stats overlay toggle/window, live screenshot viewer, and a
+    graceful **Restart player** action (systemd restarts within ~5 s).
+  - New endpoints: `GET /` (page), `GET/POST /settings`,
+    `GET /debug/caches`, `POST /debug/clear`, `POST /debug/restart`;
+    `/health` now includes the version.
+  - `floor796_kiosk/settings.py` (resolution decision logic, atomic
+    settings file), `stats/webui.py` (page + cache registry).
+    Tests: `tools/test_settings.py` (43).
+
 ---
 
 ## v2.5.0 — Teleporter room, camera modes, boot splash, smoothness, memory budget (2026-11-02)
