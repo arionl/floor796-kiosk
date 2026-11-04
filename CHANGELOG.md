@@ -7,6 +7,26 @@ Tags are cut on `main`; development happens on `dev`.
 
 ## Unreleased
 
+### Cost-weighted tile cache (4K edge-load fix)
+- The tile cache is now budgeted in MB with per-tile real costs:
+  animated strips 201/100 MB (32/16-bit) but static single-frame
+  tiles ~3.4/1.7 MB.  Previously every slot was priced at the full
+  animated-strip cost, which on 4K boards left the cache barely
+  covering the visible set and silently shrank the prefetch margin
+  ring to 0 — edge tiles began loading only when they entered the
+  viewport (visible "late tiles" at 4K).  The 2-ring margin is back
+  on every board: static tiles are always admitted; animated strips
+  are admitted while the MB budget allows (visible tiles always
+  load).  Eviction is cost-weighted (biggest non-visible first;
+  visible tiles never evicted); when the visible set alone exceeds
+  the budget (small boards) the ring is skipped rather than churned.
+  OOM protection is unchanged — same reserve formula, now expressed
+  as a spendable MB budget (`_compute_tile_budget_mb`).  Measured:
+  4 GB board RSS/avail/swap and frame times unchanged (avg 37.1 ms)
+  with the ring active; 2 GB board RSS +80 MB (static ring), no OOM.
+  Tests: `tools/test_mem_budget.py` extended to 16 (admission,
+  eviction order, budget math).
+
 ### Settings web UI (kiosk "settings")
 - The stats HTTP server now serves a settings & debug web page at
   `http://127.0.0.1:8796/` (stdlib-only, embedded HTML, dark theme).
