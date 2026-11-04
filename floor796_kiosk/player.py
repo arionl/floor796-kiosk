@@ -1558,24 +1558,33 @@ def main():
             args.width = 1920
             args.height = 1080
             log.warning("Could not detect display resolution; falling back to 1920x1080")
+    detected_w = args.width
+    detected_h = args.height
 
-    # ── Resolution cap for low-RAM boards ──
-    # Boards with <= 4 GB RAM are capped at 1080p even if a higher-res
-    # display is attached (e.g. 1440p/4K monitor).  Higher resolutions need
-    # too many tiles in the viewport cache for the memory budget.
+    # ── Resolution: operator setting + low-RAM auto cap ──
+    # settings.json (edited via the web UI on the stats server) can
+    # force 1080p on a high-res display or 4K where the auto-cap would
+    # have held the board back.  Auto keeps the standing rule: boards
+    # with <= 4 GB RAM render at 1080p regardless of the display.
     total_mem_mb = _detect_total_memory_mb()
     log.info("System memory: %d MB", total_mem_mb if total_mem_mb else -1)
 
-    resolution_capped = False
-    if total_mem_mb > 0 and total_mem_mb <= MAX_RES_1080P_MEM_MB:
-        if args.width > 1920 or args.height > 1080:
-            log.info("Capping display from %dx%d to 1920x1080 "
-                     "(%d MB RAM <= %d MB threshold)",
-                     args.width, args.height, total_mem_mb,
-                     MAX_RES_1080P_MEM_MB)
-            args.width = 1920
-            args.height = 1080
-            resolution_capped = True
+    from floor796_kiosk import settings as settings_mod
+    from floor796_kiosk.paths import SETTINGS_PATH
+    boot_settings = settings_mod.load_settings(SETTINGS_PATH)
+    args.width, args.height, res_source, res_notes = \
+        settings_mod.resolve_resolution(
+            boot_settings["resolution"], detected_w, detected_h,
+            total_mem_mb)
+    resolution_capped = res_source in ("auto-capped-1080p",
+                                       "forced-1080p",
+                                       "fallback-1080p")
+    if boot_settings["resolution"] != settings_mod.RES_AUTO:
+        log.info("Settings: resolution=%s → %dx%d (%s)",
+                 boot_settings["resolution"], args.width, args.height,
+                 res_source)
+    for note in res_notes:
+        log.info("Resolution: %s", note)
 
     # ── 4K handling ──
     # Only 8 GB+ boards with native 4K displays reach this path (low-RAM
@@ -1816,6 +1825,7 @@ def main():
     last_coverage_log = time.time()
     pending_viewport = []          # queue of viewport commands (HTTP)
     pending_mode = []              # queue of mode changes (HTTP)
+    restart_requested = threading.Event()  # set via POST /debug/restart
 
     log.info("Player ready. Map: %dx%d (%dx%d tiles), %d animated.",
              map_w, map_h, grid_cols, grid_rows, anim_count)
@@ -1838,6 +1848,25 @@ def main():
             # Mode control hook: POST /mode {"mode": ...} (applied on
             # the main loop, next frame — same path as SPACE).
             stats_server.mode_queue = pending_mode
+            # Settings web UI: hardware facts for the resolution
+            # options, the boot-time resolution decision, and a
+            # graceful-restart hook (POST /debug/restart).
+            stats_server.settings_hw = {
+                "total_mem_mb": total_mem_mb,
+                "detected_w": detected_w,
+                "detected_h": detected_h,
+            }
+            stats_server.settings_active = {
+                "w": args.width, "h": args.height, "source": res_source,
+                "setting": boot_settings["resolution"],
+            }
+
+            def _request_restart():
+                if restart_requested.is_set():
+                    return False
+                restart_requested.set()
+                return True
+            stats_server.request_restart = _request_restart
             stats_overlay = StatsOverlay(
                 args.width, args.height, grid_rows, grid_cols)
             log.info("Stats server: http://127.0.0.1:8796/stats")
@@ -1972,6 +2001,10 @@ def main():
 
     while running:
         _ft0 = time.perf_counter()
+        if restart_requested.is_set():
+            log.info("Restart requested via settings web UI — "
+                     "exiting (systemd will restart)")
+            break
         dt = clock.tick(30) / 1000.0
         _t_tick = (time.perf_counter() - _ft0) * 1000   # vsync wait
         dt = min(dt, 1 / 15)

@@ -4,6 +4,8 @@ assets/
 !assets/splash/
 # Generated cache — rebuilt automatically, not tracked in git
 cache/
+# Operator settings (written via the settings web UI)
+/settings.json
 # Legacy directories (pre-refactor)
 tiles/
 strips/

@@ -40,6 +40,16 @@ CACHE_DIR = os.path.join(INSTALL_DIR, "cache")
 STRIP_DIR = os.path.join(CACHE_DIR, "strips")
 CONTENT_MASK_PATH = os.path.join(CACHE_DIR, "content_mask.npz")
 THUMBNAIL_DIR = os.path.join(CACHE_DIR, "thumbnails")
+SPLASH_CACHE_DIR = os.path.join(CACHE_DIR, "splash")
+
+# ── Teleport room ────────────────────────────────────────────────────────────
+# TeleportRoom(cache_dir=TELEPORT_DIR) nests a 'teleport' content dir and a
+# 'trans_vN' pre-rendered-transition cache under it.
+TELEPORT_TRANS_DIR = os.path.join(TELEPORT_DIR, "teleport", "trans_v1")
+TILE_STATE_PATH = os.path.join(ASSETS_DIR, "tile_state.json")
+
+# ── Operator settings (settings web UI) ──────────────────────────────────────
+SETTINGS_PATH = os.path.join(INSTALL_DIR, "settings.json")
 
 
 def ensure_dirs():

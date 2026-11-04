@@ -24,12 +24,17 @@ Uses only stdlib — no external dependencies.
 
 import io
 import json
+import os
 import struct
 import threading
 import zlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
+
+from floor796_kiosk import __version__, paths
+from floor796_kiosk import settings as settings_mod
+from floor796_kiosk.stats import webui
 
 # ── PNG encoder (minimal, no Pillow needed) ───────────────────────────────────
 
@@ -146,19 +151,49 @@ class StatsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_html(self, text):
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         collector = self.server.collector
 
         # Parse path and query
-        path = self.path.split("?")[0]
+        raw_path = self.path
+        path = raw_path.split("?")[0]
         params = {}
-        if "?" in self.path:
-            for pair in self.path.split("?")[1].split("&"):
+        if "?" in raw_path:
+            for pair in raw_path.split("?")[1].split("&"):
                 if "=" in pair:
                     k, v = pair.split("=", 1)
                     params[k] = v
 
-        if path == "/stats":
+        if path == "/" or path == "/ui" or path == "/index.html":
+            self._send_html(webui.PAGE)
+
+        elif path == "/settings":
+            hw = getattr(self.server, "settings_hw", None)
+            if hw is None:
+                self._send_json({"error": "settings not available"}, 501)
+                return
+            s = settings_mod.load_settings(paths.SETTINGS_PATH)
+            self._send_json({
+                "settings": s,
+                "capabilities": settings_mod.resolution_capabilities(
+                    hw["detected_w"], hw["detected_h"], hw["total_mem_mb"]),
+                "hw": hw,
+                "active": getattr(self.server, "settings_active", {}),
+                "version": __version__,
+            })
+
+        elif path == "/debug/caches":
+            self._send_json({"caches": webui.cache_report()})
+
+        elif path == "/stats":
             window = parse_window(params.get("window"))
             snap = collector.snapshot(window)
             self._send_json(snap)
@@ -166,6 +201,7 @@ class StatsHandler(BaseHTTPRequestHandler):
         elif path == "/health":
             snap = collector.snapshot()
             health = {
+                "version": __version__,
                 "uptime": snap["uptime"],
                 "rss_mb": snap["rss_mb"],
                 "rss_min": snap["rss_min"],
@@ -272,7 +308,68 @@ class StatsHandler(BaseHTTPRequestHandler):
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len) if content_len > 0 else b""
 
-        if path == "/overlay":
+        def _json_body():
+            try:
+                return json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, 400)
+                return None
+
+        if path == "/settings":
+            data = _json_body()
+            if data is None:
+                return
+            hw = getattr(self.server, "settings_hw", None)
+            if hw is None:
+                self._send_json({"error": "settings not available"}, 501)
+                return
+            res = data.get("resolution")
+            if res not in settings_mod.RES_CHOICES:
+                self._send_json({"error": "resolution must be one of "
+                                 + "|".join(settings_mod.RES_CHOICES)}, 400)
+                return
+            if res == settings_mod.RES_4K:
+                caps = {c["value"]: c for c in
+                        settings_mod.resolution_capabilities(
+                            hw["detected_w"], hw["detected_h"],
+                            hw["total_mem_mb"])}
+                if not caps[settings_mod.RES_4K]["available"]:
+                    self._send_json(
+                        {"error": "4K not supported by this display "
+                         "(reports %dx%d)" % (hw["detected_w"],
+                                              hw["detected_h"])}, 409)
+                    return
+            saved = settings_mod.save_settings(
+                paths.SETTINGS_PATH, {"resolution": res})
+            self._send_json({"settings": saved,
+                             "applies": "next player start"})
+
+        elif path == "/debug/clear":
+            data = _json_body()
+            if data is None:
+                return
+            targets = data.get("targets")
+            if not isinstance(targets, list) or not targets:
+                self._send_json(
+                    {"error": "need a non-empty 'targets' list"}, 400)
+                return
+            freed, report = webui.clear_caches(targets)
+            self._send_json({"freed_bytes": freed, "cleared": report})
+
+        elif path == "/debug/restart":
+            # Graceful player exit; systemd (Restart=always) brings the
+            # service back within a few seconds.
+            fn = getattr(self.server, "request_restart", None)
+            if fn is None:
+                self._send_json({"error": "restart not available"}, 501)
+                return
+            if fn():
+                self._send_json({"restarting": True})
+            else:
+                self._send_json(
+                    {"error": "a restart was already requested"}, 409)
+
+        elif path == "/overlay":
             try:
                 data = json.loads(body) if body else {}
             except json.JSONDecodeError:
