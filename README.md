@@ -63,6 +63,12 @@ automatically downloaded and incorporated on the next boot.
   metrics: FPS, memory, CPU, tile cache, coverage heatmaps, per-object highlight
   stats, and more.  An on-screen overlay (toggled with `S`) shows real-time
   performance, coverage, and label statistics.
+- **Settings & debug web UI** — the same HTTP server serves an operator
+  page at `http://127.0.0.1:8796/` (see below): resolution selection
+  (Auto / 1080p / 4K, informed by the display's reported mode and board
+  RAM), cache clearing for cold/warm boot simulation, camera/overlay
+  debug controls, a live screenshot viewer, and a one-click player
+  restart.
 
   ![Stats overlay](stats_overlay_screenshot.png)
 
@@ -144,13 +150,15 @@ floor796-kiosk/
 │   ├── modes.py                  Camera mode state machine (W/N/E)
 │   ├── explorer.py               Exploring-mode object-to-object navigation
 │   ├── splash.py                 Boot splash (station animation strip)
+│   ├── settings.py               Operator settings (resolution logic, settings.json)
 │   ├── highlighter.py            Object highlighter (855 objects, LRU selection)
 │   ├── thumbnails.py             Thumbnail fetcher (YouTube, images, video, wiki, tenor, fandom, web)
 │   ├── cpu_affinity.py           big.LITTLE CPU core pinning
 │   └── stats/
 │       ├── __init__.py
 │       ├── collector.py          Telemetry collector (ring buffers, heatmaps)
-│       ├── http_server.py        HTTP API server (127.0.0.1:8796)
+│       ├── http_server.py        HTTP API + settings/debug server (127.0.0.1:8796)
+│       ├── webui.py              Settings & debug web page + cache registry
 │       └── overlay.py            On-screen alpha-blended stats overlay
 ├── assets/                       Downloaded from floor796.com (cached, gitignored)
 │   ├── tiles/                    Source tile MP4s
@@ -175,6 +183,7 @@ floor796-kiosk/
 │   ├── test_mem_budget.py        [Test] Depth-aware tile-cache memory budget
 │   ├── test_depth_convert.py     [Test] Strip 24→32-bit numpy conversion
 │   ├── test_panel_occlusion.py   [Test] Highlighter panel occlusion rules
+│   ├── test_settings.py          [Test] Settings + web UI endpoints (43 checks)
 │   ├── sim_wander.py             [Maintained] Wanderer coverage simulation
 │   ├── sim_heatmap.py            [Maintained] Wanderer heatmap simulation + visualization
 │   ├── sim_prefetch_v3.py        [Maintained] Tile prefetch/cache eviction simulation
@@ -374,13 +383,55 @@ loading placeholder.
 
 Thumbnails are cached in `cache/thumbnails/` and fetched in background threads.
 
+### Settings & Web UI
+
+The stats HTTP server serves an operator page at `http://127.0.0.1:8796/`
+(reachable over SSH with `ssh -L 18796:127.0.0.1:8796 <pi>`).  It is
+stdlib-only — a single embedded HTML page talking to the JSON endpoints.
+
+**Resolution setting** — three options, each annotated with the hardware
+reality (board RAM, the display's reported mode, and what the player is
+currently rendering and why):
+
+- **Auto** (default) — the display's native mode, with the standing rule
+  that boards with ≤4 GB RAM render at 1080p regardless of the display.
+- **1080p** — always 1920×1080.  On a higher-res display, KMSDRM
+  negotiates a 1080p mode and the display's scaler upscales — the right
+  choice for a 4K TV attached to a board without the RAM to feed it.
+- **4K** — 3840×2160, only offered when the display reports a ≥4K mode;
+  carries a warning when board RAM is under 8 GB (allowed as an explicit
+  operator choice — the tile-cache budget still protects the board).
+
+The setting persists in `settings.json` (install root, gitignored) and
+applies at the next player start.
+
+**Cache clearing (cold/warm boot simulation)** — a live report of every
+cache (tile strips, content mask, splash strip, teleporter transitions,
+thumbnails, downloaded tiles) with file counts, sizes, and rebuild
+costs.  Caches can be cleared individually, as a selection, or all at
+once (full cold boot: tiles re-download ~123 MB, strips re-decode
+~8 min).  Clearing is safe while the player runs — everything rebuilds
+at the next start.
+
+**Debug controls** — camera mode buttons (Wandering/Navigating/
+Exploring), viewport pin/resume, stats overlay toggle and time window,
+a live screenshot viewer, and a **Restart player** button (graceful
+exit; systemd restarts the service within ~5 s).
+
 ### Telemetry & Stats API
 
 The player runs a lightweight HTTP server on `127.0.0.1:8796` (stdlib only,
 no external dependencies).  All endpoints return JSON unless noted.
+`GET /` serves the settings & debug web page described above.
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /` | Settings & debug web UI (see *Settings & Web UI* above) |
+| `GET /settings` | Current settings + resolution options with hardware capabilities |
+| `POST /settings` | `{"resolution": "auto" \| "1080p" \| "4k"}` — persists, applies at next start |
+| `GET /debug/caches` | Per-cache report: files, bytes, rebuild cost |
+| `POST /debug/clear` | `{"targets": ["strips", "content_mask", "splash", "teleport_trans", "thumbnails", "tiles"]}` |
+| `POST /debug/restart` | Graceful player exit (systemd restarts within ~5 s) |
 | `GET /stats[?window=30m]` | Full telemetry snapshot (FPS, memory, CPU, coverage, wanderer position, highlighter state, label stats) |
 | `GET /health` | 24-hour health trends (RSS, CPU, FPS with min/max/avg) |
 | `GET /heatmap[?window=1h]` | Viewport visit heatmap as a PNG image |
@@ -525,7 +576,9 @@ When a keyboard/mouse is connected during maintenance:
 
 ### Rebuilding the cache
 
-The `cache/` directory is fully rebuildable.  To force a clean rebuild:
+The `cache/` directory is fully rebuildable — the settings web UI's
+*Clear selected / Clear ALL* buttons do this without a shell.  The
+manual equivalent:
 
 ```bash
 sudo systemctl stop floor796-kiosk
@@ -606,6 +659,7 @@ python3 tools/test_splash.py          # boot splash strip
 python3 tools/test_mem_budget.py      # tile-cache memory budget
 python3 tools/test_depth_convert.py   # strip depth conversion
 python3 tools/test_panel_occlusion.py # panel occlusion rules
+python3 tools/test_settings.py        # settings + web UI endpoints
 ```
 
 **Maintained simulations** — import the real classes from the
