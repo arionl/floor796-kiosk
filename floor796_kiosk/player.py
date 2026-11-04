@@ -205,6 +205,30 @@ def _compute_max_tiles(view_w, view_h, total_mem_mb, strip_mb=201):
 
 # ─── Status Display ───────────────────────────────────────────────────────────
 
+def _compute_tile_budget_mb(total_mem_mb):
+    """Memory (MB) the tile cache may spend on display-format strips.
+
+    Same reserve formula _compute_max_tiles uses (OS + framebuffer +
+    hologram + teleport room + python/pygame base, scaled with board
+    RAM), but expressed as a spendable MB budget instead of a tile
+    count — the cost-weighted cache (see TileCache) prices each tile
+    at its real cost: animated strips 201/100 MB (32/16-bit), static
+    single-frame tiles ~3.4/1.7 MB.
+    """
+    if total_mem_mb <= 0:
+        return None
+    if total_mem_mb >= 2048:
+        reserve_mb = int(1200 + (total_mem_mb - 2048) * 0.4)
+    else:
+        reserve_mb = int(total_mem_mb * 0.6)
+    return max(0, total_mem_mb - reserve_mb)
+
+
+def _static_tile_cost_mb(display_depth):
+    """Cost of a cached static (single-frame) tile at display depth."""
+    return TILE_W * TILE_H * (display_depth // 8) / 1e6
+
+
 def _compute_effective_margin(max_tiles, view_w, view_h):
     """Shrink the margin ring to fit within the tile cache budget.
 
@@ -363,13 +387,31 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
 # ─── Lazy Tile Cache ─────────────────────────────────────────────────────────
 
 class TileCache:
-    """Async tile cache — loads and converts strips in a background thread."""
+    """Async tile cache — loads and converts strips in a background thread.
 
-    def __init__(self, strip_dir, max_tiles=30, display_depth=16):
+    Two budget modes:
+    - Legacy count mode (mem_budget_mb=None): evict beyond `max_tiles`
+      tile count — the pre-cost-budget behavior.
+    - Cost-weighted mode (mem_budget_mb set): every cached tile is
+      priced at its real display-format cost (animated strip
+      201/100 MB at 32/16-bit, static single-frame ~3.4/1.7 MB) and
+      the cache evicts/limits by total MB.  Cheap static tiles make
+      the prefetch margin ring effectively free, so edge tiles
+      pre-load before they scroll into view even on boards whose
+      animated-strip budget alone would have zeroed the margin.
+    """
+
+    def __init__(self, strip_dir, max_tiles=30, display_depth=16,
+                 mem_budget_mb=None, animated_ids=None):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
         self.display_depth = display_depth
+        self.mem_budget_mb = mem_budget_mb
+        self.animated_ids = animated_ids if animated_ids is not None else set()
+        self._strip_cost_mb = _strip_cost_mb(display_depth)
+        self._static_cost_mb = _static_tile_cost_mb(display_depth)
+        self._cost_mb = {}
         self.load_count = 0
         self._queue = []
         self._results = {}
@@ -381,6 +423,20 @@ class TileCache:
         self._visible_ids = set()
         self._needed_ids = set()
         self._last_margin_ids = set()
+
+    def _tile_cost_mb(self, tile_id):
+        """Projected/actual cached cost of a tile at display depth."""
+        if tile_id in self.animated_ids:
+            return self._strip_cost_mb
+        return self._static_cost_mb
+
+    def _cached_cost_mb(self):
+        return sum(self._cost_mb.values())
+
+    def _over_budget(self):
+        if self.mem_budget_mb is None:
+            return len(self.cache) > self.max_tiles
+        return self._cached_cost_mb() > self.mem_budget_mb
 
     def _ensure_display_depth(self, surf):
         """Convert a strip to the display pixel format ONCE, in the
@@ -549,6 +605,37 @@ class TileCache:
             new_visible = new_pending & visible_ids
             new_margin = new_pending & margin_ids
 
+            # Budget admission for margin tiles: visible tiles are
+            # always loaded (they're on screen); margin tiles join the
+            # queue only if the projected total stays within budget.
+            # Cheap static tiles (~3.4 MB) nearly always pass; animated
+            # strips (201 MB) are admitted while budget allows — so the
+            # prefetch ring fills with statics first and never thrash-
+            # loads big strips we'd evict again immediately.
+            if self.mem_budget_mb is not None and new_margin:
+                projected = self._cached_cost_mb()
+                for collection in (self._queue, list(self._results.keys())):
+                    for t in collection:
+                        projected += self._tile_cost_mb(t)
+                # Incoming visible tiles WILL be queued after admission —
+                # their cost is already committed; count it.
+                for t in new_visible:
+                    projected += self._tile_cost_mb(t)
+                admitted = []
+                for t in sorted(new_margin,
+                                key=lambda t: (t in self.animated_ids, t)):
+                    # If the visible set alone already spends the budget
+                    # (small boards), admit nothing — a ring we'd evict
+                    # on the next poll is pure load churn.
+                    if projected > self.mem_budget_mb:
+                        break
+                    c = self._tile_cost_mb(t)
+                    if (projected + c <= self.mem_budget_mb
+                            or t not in self.animated_ids):
+                        admitted.append(t)
+                        projected += c
+                new_margin = set(admitted)
+
             # Priority queue: new visible tiles go to the FRONT of the
             # queue (they're on screen right now), margin tiles go to
             # the back (they're prefetch for the near future).
@@ -584,17 +671,27 @@ class TileCache:
                 self._queue = promoted + remaining
 
             # Graceful eviction: don't evict old-direction tiles immediately.
-            if len(self.cache) > self.max_tiles:
+            # Cost-weighted mode evicts by MB (biggest first within each
+            # priority class); count mode keeps the legacy tile-count rule.
+            if self._over_budget():
                 # Priority 1: evict tiles not in needed set at all
                 evictable = [t for t in self.cache if t not in needed]
-                while len(self.cache) > self.max_tiles and evictable:
-                    del self.cache[evictable.pop(0)]
+                evictable.sort(key=lambda t: -self._cost_mb.get(
+                    t, self._tile_cost_mb(t)))
+                while self._over_budget() and evictable:
+                    self._evict(evictable.pop(0))
                 # Priority 2: evict non-visible margin tiles
-                if len(self.cache) > self.max_tiles:
+                if self._over_budget():
                     evictable = [t for t in self.cache if t not in visible_ids]
-                    evictable.sort(key=lambda t: 0 if t in margin_ids else -1)
-                    while len(self.cache) > self.max_tiles and evictable:
-                        del self.cache[evictable.pop()]
+                    evictable.sort(key=lambda t: (-self._cost_mb.get(
+                        t, self._tile_cost_mb(t)),
+                        0 if t in margin_ids else -1))
+                    while self._over_budget() and evictable:
+                        self._evict(evictable.pop(0))
+
+    def _evict(self, tile_id):
+        self.cache.pop(tile_id, None)
+        self._cost_mb.pop(tile_id, None)
 
     def poll_results(self):
         with self._lock:
@@ -607,21 +704,26 @@ class TileCache:
         # triggers the OOM killer before the next set_needed() can evict.
         for tid, (surf, num_frames) in ready.items():
             self.cache[tid] = (surf, num_frames)
+            self._cost_mb[tid] = self._tile_cost_mb(tid)
             self.load_count += 1
         # Intelligent eviction using last-known priority from set_needed().
         # NEVER evict visible tiles — that causes on-screen blanking.
-        if len(self.cache) > self.max_tiles:
+        if self._over_budget():
             vis = self._visible_ids
             needed = self._needed_ids
             # Priority 1: evict tiles not in the needed set at all
             evictable = [t for t in self.cache if t not in needed]
-            while len(self.cache) > self.max_tiles and evictable:
-                self.cache.pop(evictable.pop(0))
+            evictable.sort(key=lambda t: -self._cost_mb.get(
+                t, self._tile_cost_mb(t)))
+            while self._over_budget() and evictable:
+                self._evict(evictable.pop(0))
             # Priority 2: evict needed-but-not-visible (margin tiles)
-            if len(self.cache) > self.max_tiles:
+            if self._over_budget():
                 evictable = [t for t in self.cache if t not in vis]
-                while len(self.cache) > self.max_tiles and evictable:
-                    self.cache.pop(evictable.pop())
+                evictable.sort(key=lambda t: -self._cost_mb.get(
+                    t, self._tile_cost_mb(t)))
+                while self._over_budget() and evictable:
+                    self._evict(evictable.pop(0))
 
     def preload_all(self, tile_ids, status=None, status_label=""):
         total = len(tile_ids)
@@ -638,6 +740,7 @@ class TileCache:
                         _, h = surf.get_size()
                         num_frames = max(1, h // TILE_H)
                         self.cache[tid] = (surf, num_frames)
+                        self._cost_mb[tid] = self._tile_cost_mb(tid)
                         self.load_count += 1
                     except Exception:
                         pass
@@ -1774,15 +1877,30 @@ def main():
     # behavior that ran effectively on the 2 GB Pi 5).
     display_depth = (screen.get_bitsize()
                      if total_mem_mb >= LOW_MEM_THRESHOLD_MB else 16)
+    tile_budget_mb = _compute_tile_budget_mb(total_mem_mb)
     max_tiles = _compute_max_tiles(args.width, args.height, total_mem_mb,
                                    _strip_cost_mb(display_depth))
-    effective_margin = _compute_effective_margin(max_tiles, args.width, args.height)
-    log.info("Tile cache: max_tiles=%d, strip depth=%d-bit (%d MB/strip), "
-             "(viewport %dx%d, %d MB RAM, margin=%d)",
-             max_tiles, display_depth, _strip_cost_mb(display_depth),
-             args.width, args.height, total_mem_mb, effective_margin)
+    # Cost-weighted cache: the prefetch margin ring is back to the full
+    # 2 rings on every board — cheap static tiles (~3.4 MB) are always
+    # admitted, animated strips (201/100 MB) only while the MB budget
+    # allows.  The old count-based margin shrink (which zeroed the
+    # ring on 4K boards and left edge tiles loading late) no longer
+    # applies; the budget itself protects memory.
+    effective_margin = CACHE_MARGIN
+    animated_tile_ids = {
+        tid for tid, info in tiles_meta["tiles"].items()
+        if info.get("animated", False)}
+    log.info("Tile cache: budget=%s MB, strip depth=%d-bit "
+             "(%d MB animated / %.1f MB static, %d animated tiles), "
+             "margin=%d (cost-weighted, count cap %d)",
+             tile_budget_mb if tile_budget_mb is not None else "∞",
+             display_depth, _strip_cost_mb(display_depth),
+             _static_tile_cost_mb(display_depth), len(animated_tile_ids),
+             effective_margin, max_tiles)
     cache = TileCache(STRIP_DIR, max_tiles=max_tiles,
-                      display_depth=display_depth)
+                      display_depth=display_depth,
+                      mem_budget_mb=tile_budget_mb,
+                      animated_ids=animated_tile_ids)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
