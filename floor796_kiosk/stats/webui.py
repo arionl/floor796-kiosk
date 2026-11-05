@@ -11,7 +11,8 @@ from floor796_kiosk import paths
 # Each clearable cache: key → (label, paths, what rebuilding costs)
 CACHE_TARGETS = {
     "strips": ("Tile animation strips", [paths.STRIP_DIR],
-               "re-decodes all tile MP4s (~8 min at next boot)"),
+               "re-decodes from freshly fetched tile MP4s "
+               "(~8 min at next boot)"),
     "content_mask": ("Content density mask", [paths.CONTENT_MASK_PATH],
                      "rebuilds from strips (~2 min)"),
     "splash": ("Boot splash strip", [paths.SPLASH_CACHE_DIR],
@@ -22,10 +23,12 @@ CACHE_TARGETS = {
                        "background at next boot"),
     "thumbnails": ("Label thumbnails", [paths.THUMBNAIL_DIR],
                    "re-fetches thumbnails as objects are highlighted"),
-    "tiles": ("Downloaded tiles + metadata", [paths.TILE_DIR,
+    "tiles": ("Tile cache (full cold boot)", [paths.STRIP_DIR,
+                                              paths.TILE_DIR,
                                               paths.TILE_META_PATH,
                                               paths.TILE_STATE_PATH],
-              "FULL cold boot: re-downloads ~123 MB from the site"),
+              "FULL cold boot: re-downloads and re-decodes every tile "
+              "one at a time from the site"),
 }
 CACHE_ORDER = ("strips", "content_mask", "splash", "teleport_trans",
                "thumbnails", "tiles")

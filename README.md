@@ -94,7 +94,7 @@ automatically downloaded and incorporated on the next boot.
 | OS                 | Raspberry Pi OS / Armbian (Bookworm or Trixie)   |
 | Display            | HDMI (1920×1080 native, or higher with 4 GB+)    |
 | Network            | Internet for initial download + updates          |
-| Storage            | 4 GB free (tiles + decoded strips)               |
+| Storage            | 4 GB free (decoded strips; MP4s are transient)   |
 
 > **2 GB boards** (e.g. Raspberry Pi 5 2 GB) run the full feature set with a
 > reduced tile cache (8 tiles, 16-bit strips) — ~1.45 GB RSS.  The tile-cache
@@ -121,15 +121,18 @@ The installer copies the code and configures the system service — it does
 **not** download any content.  Tiles, labels, and all other assets are
 fetched automatically on the first boot of the player:
 
-- ~123 MB of tiles from floor796.com
+- Tile MP4s from floor796.com, fetched ONE AT A TIME and decoded to
+  frame strips (each MP4 is deleted the moment its strip is built, so
+  only one MP4 is ever on disk at once)
 - Object labels (changelog.json)
 - Boot splash animation strip (decoded once from the bundled mp4)
 - Teleporter room scenes + pre-rendered transitions (~54 MB, rendered in the
   background while the room cycles)
-- Decoded frame strips (~8 minutes)
+- Decoded frame strips (~8 minutes; the durable per-tile artifacts)
 - Content density mask (~2 minutes)
 
-All of this is cached — subsequent boots take ~20 seconds.
+All of this is cached — subsequent boots take ~20 seconds, fetch nothing,
+and hold zero tile MP4s.
 
 ---
 
@@ -143,7 +146,7 @@ floor796-kiosk/
 │   ├── paths.py                  Centralized path management
 │   ├── board_detect.py           Board detection (Pi 5 / OrangePi / generic)
 │   ├── player.py                 Main player (rendering, modes, ghost boxes)
-│   ├── tile_manager.py           Tile download + auto-update logic
+│   ├── tile_manager.py           Update planning + one-at-a-time fetching
 │   ├── content_mask.py           Content density mask generator
 │   ├── hologram.py               Hologram scene overlay
 │   ├── teleport.py               Teleporter room overlay (pre-rendered transitions)
@@ -161,7 +164,8 @@ floor796-kiosk/
 │       ├── webui.py              Settings & debug web page + cache registry
 │       └── overlay.py            On-screen alpha-blended stats overlay
 ├── assets/                       Downloaded from floor796.com (cached, gitignored)
-│   ├── tiles/                    Source tile MP4s
+│   ├── tiles/                    TRANSIENT SCRATCH: at most the 1 MP4
+│   │                             currently being decoded (empty at rest)
 │   ├── tiles_meta.json           Grid metadata
 │   ├── tile_state.json           Per-tile download fingerprints (update detection)
 │   ├── changelog.json            Object labels / polygon data
@@ -223,12 +227,46 @@ floor796-kiosk/
 
 Floor796's map is a grid of 1024×820 pixel tiles.  Most tiles are static
 (single-frame), but ~50 tiles in the center are animated (60-frame loops at
-12 fps).  The player downloads these as MP4s from the CDN, decodes them to
+12 fps).  The player fetches tiles as MP4s from the CDN, decodes them to
 full-resolution BMP frame strips using ffmpeg, and caches them in
 `cache/strips/`.
 
 Tiles are spaced at 1016×812 intervals (8 px overlap per axis), matching the
 floor796.com front-end.  This overlap is critical for pixel-perfect alignment.
+
+#### Storage contract: MP4s are transient scratch
+
+The decoded strip in `cache/strips/<tid>.bmp` is the durable per-tile
+artifact.  A tile's source MP4 is deleted the moment its strip is built,
+and tiles are processed ONE AT A TIME (fetch → decode → discard) — never
+bulk-downloaded.  At rest `assets/tiles/` is empty; peak disk usage equals
+final usage plus one in-flight MP4.  Leftover MP4s whose strips already
+exist are swept at every boot (idempotent migration for older installs,
+~130 MB freed).
+
+#### Content change detection (when does a tile re-encode?)
+
+Change detection is metadata-driven — no per-file HTTP HEAD/ETag probing.
+Every boot fetches `floor796.com/data/matrix.json` + `changelog.json` (no
+tile downloads) and compares each tile's persisted fingerprint
+(`tile_state.json`: mp4 URL, expected size, changelog entry ids, pending
+flag) against the live matrix:
+
+| reason | trigger |
+|---|---|
+| `new` | no fingerprint record for the tile |
+| `re-rendered` | MP4 URL changed — the URL embeds the render timestamp, so any re-render gets a new URL |
+| `changelog` | the set of changelog entry ids referencing the tile changed (the author extends tiles in phases) |
+| `retry` | previous fetch never completed (`pending` flag) |
+| `size` | the matrix's declared MP4 size moved |
+| `corrupt` | an MP4 exists on disk but its size ≠ the declared size |
+| `missing` | no usable copy at all — no MP4 **and** no complete strip |
+
+A missing MP4 is deliberately *not* a trigger by itself: a tile whose
+fingerprint matches and whose strip exists is up to date.  Planned fetches
+run through the same one-at-a-time strip pass; state is committed only
+after the pass, so an interrupted boot re-plans the same tiles (existing
+strips are skipped — self-healing) and failed fetches retry via `pending`.
 
 ### Wandering Algorithm
 

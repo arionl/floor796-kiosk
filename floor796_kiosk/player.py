@@ -304,7 +304,8 @@ class StatusDisplay:
 
 # ─── Frame Strip Preparation ──────────────────────────────────────────────────
 
-def prepare_strips(tiles_meta, status=None, display_depth=16):
+def prepare_strips(tiles_meta, status=None, display_depth=16,
+                   fetch_plan=None, fetch_one=None):
     """Decode each tile MP4 to a full-res frame strip via ffmpeg, then
     convert to display_depth-bit for minimal memory and zero runtime
     conversion cost.
@@ -313,23 +314,58 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
     Strips are saved as BMP at the target depth so pygame.image.load()
     produces a surface at the correct depth with no conversion needed.
     Skips tiles that are already decoded at the correct depth.
+
+    STORAGE CONTRACT — MP4s are transient scratch, tiles are processed
+    ONE AT A TIME: a tile whose strip is missing is fetched (via
+    ``fetch_one`` from ``fetch_plan``), decoded to its strip, and its
+    MP4 deleted immediately after the strip is verified.  At rest the
+    tile directory is empty; peak disk = final + one in-flight MP4.
+
+    Returns (built_ids, failed_ids): tiles whose strips were (re)built
+    this pass, and tiles whose fetch failed (marked pending, retried
+    next boot).
     """
     os.makedirs(STRIP_DIR, exist_ok=True)
     tiles = list(tiles_meta["tiles"].items())
     total = len(tiles)
     decoded = 0
     skipped = 0
+    built_ids = []
+    failed_ids = []
+    plan_by_tid = {p["tid"]: p for p in (fetch_plan or [])}
 
     for tile_id, info in tiles:
-        # We use .bmp for pre-converted strips, .png for ffmpeg-decoded.
         strip_bmp = os.path.join(STRIP_DIR, f"{tile_id}.bmp")
         strip_png = os.path.join(STRIP_DIR, f"{tile_id}.png")
+        mp4_path = os.path.join(TILE_DIR, info["mp4"])
 
-        # Check if 16-bit BMP already exists
+        # Complete strip already exists — nothing to do (warm boot).
         if os.path.exists(strip_bmp) and os.path.getsize(strip_bmp) > 1000:
             decoded += 1
             skipped += 1
             continue
+
+        # STORAGE CONTRACT: fetch the MP4 only when the strip is
+        # missing, one tile at a time.
+        if not os.path.exists(mp4_path):
+            entry = plan_by_tid.get(tile_id)
+            if entry is None or fetch_one is None:
+                # No local copy and nothing planned (interrupted pass
+                # with stale state, or an offline first run) — count
+                # as not built; the next boot re-plans it.
+                decoded += 1
+                failed_ids.append(tile_id)
+                continue
+            if status:
+                status.show("Preparing tiles",
+                            f"{decoded + 1} / {total} — fetching",
+                            progress=decoded / total)
+            _tid, ok, err = fetch_one(entry)
+            if not ok:
+                log.warning("Tile %s fetch failed: %s", tile_id, err)
+                decoded += 1
+                failed_ids.append(tile_id)
+                continue
 
         # Need to create the strip. Do we have a PNG from a previous run?
         need_ffmpeg = True
@@ -337,10 +373,15 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
             need_ffmpeg = False
 
         if need_ffmpeg:
-            mp4_path = os.path.join(TILE_DIR, info["mp4"])
             if not os.path.exists(mp4_path):
                 decoded += 1
+                failed_ids.append(tile_id)
                 continue
+
+            if status:
+                status.show("Preparing tiles",
+                            f"{decoded + 1} / {total} — decoding",
+                            progress=decoded / total)
 
             animated = info.get("animated", False)
             if animated:
@@ -358,7 +399,10 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
                           "-an", strip_png]
                 subprocess.run(cmd_fb, capture_output=True, timeout=30)
 
-        # Convert PNG strip to target-depth BMP
+        # Convert PNG strip to target-depth BMP — written ATOMICALLY
+        # (tmp + rename) so a crash can't leave a partial BMP that
+        # reads as a complete strip.
+        strip_ok = False
         if os.path.exists(strip_png):
             try:
                 surf = pygame.image.load(strip_png)
@@ -366,22 +410,47 @@ def prepare_strips(tiles_meta, status=None, display_depth=16):
                     s16 = pygame.Surface(surf.get_size(), 0, display_depth)
                     s16.blit(surf, (0, 0))
                     surf = s16
-                pygame.image.save(surf, strip_bmp)
+                tmp_bmp = strip_bmp + ".tmp.bmp"
+                pygame.image.save(surf, tmp_bmp)
+                os.replace(tmp_bmp, strip_bmp)
                 # Remove the PNG to save disk space
                 os.remove(strip_png)
+                strip_ok = (os.path.getsize(strip_bmp) > 1000)
             except Exception:
-                pass
+                log.warning("Strip conversion failed for %s", tile_id,
+                            exc_info=True)
+
+        if strip_ok:
+            built_ids.append(tile_id)
+            # STORAGE CONTRACT: the strip is the durable artifact —
+            # the MP4 has served its purpose, discard it now.
+            if os.path.exists(mp4_path):
+                try:
+                    os.remove(mp4_path)
+                except OSError as exc:
+                    log.warning("Could not remove scratch mp4 for %s: %s",
+                                tile_id, exc)
+        else:
+            failed_ids.append(tile_id)
 
         decoded += 1
         if status and (decoded % 5 == 0 or decoded == total):
-            status.show("Decoding tile animations",
+            status.show("Preparing tiles",
                         f"{decoded} / {total} tiles",
                         progress=decoded / total)
 
     if status:
-        status.show("Decoding complete",
-                    f"{skipped} cached, {total - skipped} decoded",
-                    progress=1.0)
+        if failed_ids:
+            status.show("Tile prep incomplete",
+                        f"{skipped} cached, {len(built_ids)} decoded, "
+                        f"{len(failed_ids)} pending retry",
+                        progress=1.0)
+        else:
+            status.show("Tiles ready",
+                        f"{skipped} cached, {len(built_ids)} decoded",
+                        progress=1.0)
+
+    return (built_ids, failed_ids)
 
 
 # ─── Lazy Tile Cache ─────────────────────────────────────────────────────────
@@ -1747,38 +1816,34 @@ def main():
 
     ensure_dirs()
 
-    # ── Check for tile updates (graceful offline fallback) ──
-    update_result = None
+    # ── Plan tile updates (graceful offline fallback) ──
+    # STORAGE CONTRACT: this builds the plan only — no bulk downloads.
+    # The fetch runs one tile at a time inside the strip pass below,
+    # and each MP4 is discarded the moment its strip is built.
+    plan_result = None
+    tile_manager = None
     try:
         from floor796_kiosk import tile_manager
         if tile_manager.has_cached_tiles():
             status.show("Checking for updates...")
-            update_result = tile_manager.check_and_update()
-            if update_result.get("offline"):
+            plan_result = tile_manager.check_and_update()
+            if plan_result.get("offline"):
                 status.show("Offline mode", "Using cached tiles")
                 time.sleep(1.5)
-            elif update_result.get("updated"):
-                new = len(update_result.get("new_tiles", []))
-                changed = len(update_result.get("changed", []))
-                if changed:
-                    status.show("Tiles updated",
-                                f"{new - changed} new, {changed} refreshed",
-                                progress=1.0)
-                else:
-                    status.show("Tiles updated",
-                                f"{new} new tiles downloaded", progress=1.0)
-                time.sleep(1.5)
+            elif plan_result.get("updated"):
+                new = len(plan_result.get("new_tiles", []))
+                changed = len(plan_result.get("changed", []))
+                status.show("Tiles to update",
+                            f"{new - changed} new, {changed} refreshed",
+                            progress=1.0)
             else:
                 status.show("Tiles current")
                 time.sleep(0.5)
         else:
-            status.show("First run — downloading tiles...",
+            status.show("First run — preparing tiles...",
                         "This will take a few minutes")
-            update_result = tile_manager.check_and_update(
-                status_callback=lambda done, total, tid, ok: status.show(
-                    "Downloading tiles", f"{done} / {total}", progress=done / total)
-            )
-            if update_result.get("offline"):
+            plan_result = tile_manager.check_and_update()
+            if plan_result.get("offline"):
                 status.show("No internet connection",
                             "Connect to the network and restart.")
                 time.sleep(5)
@@ -1800,30 +1865,47 @@ def main():
     map_w = grid_cols * SPACING_W
     map_h = grid_rows * SPACING_H
 
-    # ── Check for missing MP4s ──
-    missing = [tid for tid, i in tiles_meta["tiles"].items()
-               if not os.path.exists(os.path.join(TILE_DIR, i["mp4"]))]
-    if missing:
-        status.show("Error", f"{len(missing)} tile MP4s missing.")
-        time.sleep(5)
-        sys.exit(1)
-
-    # ── Decode strips ──
+    # ── Strip pass: fetch → decode → discard, ONE tile at a time ──
     status.show("Checking tile strips...")
-    prepare_strips(tiles_meta, status=status, display_depth=16)
+    fetch_plan = (plan_result or {}).get("plan") or []
+    built_ids, fetch_failed = prepare_strips(
+        tiles_meta, status=status, display_depth=16,
+        fetch_plan=fetch_plan,
+        fetch_one=tile_manager.fetch_tile if fetch_plan else None)
 
-    # ── Patch content mask for tiles refreshed this boot ──
-    # tile_manager deletes strips of re-fetched tiles, and prepare_strips
-    # re-decodes them above.  Their density rows in content_mask.npz are
-    # stale until patched here (full rebuild takes minutes on a Pi).
-    if update_result and update_result.get("changed"):
-        changed_tiles = update_result["changed"]
+    # Commit fingerprints for the pass (failures marked pending so the
+    # next boot retries them), then the STORAGE CONTRACT sweep: any
+    # leftover MP4 whose strip exists is scratch (migrates installs
+    # from the keep-forever scheme).
+    if tile_manager:
+        if plan_result and not plan_result.get("offline") and \
+                plan_result.get("records"):
+            tile_manager.write_state(plan_result["records"],
+                                     plan_result.get("entries", {}),
+                                     failed_ids=set(fetch_failed))
+        try:
+            tile_manager.sweep_scratch_mp4s(tiles_meta)
+        except Exception:
+            log.exception("mp4 sweep failed")
+
+    missing_strips = [tid for tid in tiles_meta["tiles"]
+                      if not os.path.exists(
+                          os.path.join(STRIP_DIR, f"{tid}.bmp"))]
+    if missing_strips:
+        log.warning("%d tile strip(s) missing after pass (pending retry "
+                    "next boot): %s", len(missing_strips), missing_strips[:8])
+
+    # ── Patch content mask for tiles re-decoded this boot ──
+    # prepare_strips re-decodes fetched tiles above; their density rows
+    # in content_mask.npz are stale until patched here (a full rebuild
+    # takes minutes on a Pi).
+    if built_ids:
         log.info("Patching content mask for %d refreshed tile(s): %s",
-                 len(changed_tiles), changed_tiles)
+                 len(built_ids), built_ids)
         try:
             from floor796_kiosk.content_mask import update_tiles
             patched = update_tiles(tiles_meta, CONTENT_MASK_PATH,
-                                   changed_tiles, strip_dir=STRIP_DIR)
+                                   built_ids, strip_dir=STRIP_DIR)
             if patched:
                 log.info("Content mask patched.")
             else:

@@ -7,6 +7,37 @@ Tags are cut on `main`; development happens on `dev`.
 
 ## Unreleased
 
+### Storage contract: MP4s are transient scratch (cold/warm boot rework)
+- The decoded frame strip in `cache/strips/` is the durable per-tile
+  artifact; a tile's source MP4 is deleted the moment its strip is
+  built, and tiles are fetched ONE AT A TIME (fetch → decode →
+  discard) — never bulk-downloaded.  At rest `assets/tiles/` is empty;
+  peak disk = final disk + one in-flight MP4.  A boot-time sweep
+  removes leftover MP4s whose strips already exist (migrates older
+  installs, ~130 MB freed); MP4s without strips are kept for their
+  pending (re)decode.
+- Cold/warm boot parity with the design spec: boot builds an update
+  PLAN from the live matrix + changelog (metadata only, no tile
+  downloads); warm boots with complete strips fetch nothing (a missing
+  MP4 plus a complete strip is up to date); the strip pass runs the
+  plan serially, writes strips ATOMICALLY (tmp + rename — a crash
+  can't leave a partial BMP that reads as complete), and commits
+  fingerprints only after the pass — an interrupted boot re-plans the
+  same tiles, skips existing strips, and retries failed fetches via
+  the pending flag.
+- Change detection is unchanged in spirit and now documented in the
+  README: metadata fingerprints (mp4 URL with embedded render
+  timestamp + declared size + changelog entry ids + pending flag),
+  reason strings new/re-rendered/changelog/retry/size/corrupt/missing,
+  with `missing` redefined to mean "no MP4 AND no complete strip".
+- `has_cached_tiles` now counts strips (not MP4s); strips are saved
+  atomically; the missing-MP4 hard exit at boot is gone (missing
+  strips retry next boot instead).
+- Tests: `tools/test_tile_update.py` rewritten around the contract —
+  plan-only first run, serial fetch, warm no-op with zero MP4s, a real
+  ffmpeg strip pass verifying build → discard, corrupt/pending/retry
+  paths, and the sweep's strip-presence gating (43 checks).
+
 ### Cost-weighted tile cache (4K edge-load fix)
 - The tile cache is now budgeted in MB with per-tile real costs:
   animated strips 201/100 MB (32/16-bit) but static single-frame
