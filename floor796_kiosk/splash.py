@@ -21,6 +21,7 @@ does not apply.
 import json
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -133,11 +134,16 @@ class SplashStatusDisplay:
     so every existing boot call site works unchanged; without assets
     it renders the legacy text-only status screen.
 
-    The animation is driven by its own 12 fps ticker thread: boot
-    phases block for seconds between status updates, and the video
-    used to freeze between them, jumping only when the progress bar
-    moved.  The ticker keeps re-rendering the last shown state so the
-    video plays continuously; show() just updates the state."""
+    The animation advances at 12 fps even while boot phases block the
+    main thread for seconds between status updates (the video used to
+    freeze between them, jumping only when the progress bar moved).
+    This is done with a MAIN-THREAD interval timer (SIGALRM) whose
+    handler re-renders the last shown state: on the raw DRM/KMSDRM
+    video driver, display flips from a background thread silently
+    never reach the screen (SDL video is main-thread-only), so a
+    ticker thread is not an option.  Blocking boot calls (subprocess,
+    sleep, IO) are interruptible and auto-restart (PEP 475), so the
+    timer fires between them at full frame rate."""
 
     def __init__(self, screen, strip=None, frame=None):
         self.screen = screen
@@ -150,35 +156,59 @@ class SplashStatusDisplay:
         self.frame = frame
         self.square = strip.get_width() if strip else 0
         self._t0 = time.monotonic()
-        # Renderer state shared with the ticker thread.
+        # Renderer state (show() and the SIGALRM handler share the
+        # main thread; the lock makes the handler skip a beat instead
+        # of re-entering a render already in progress).
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._stopped = False
         self._last_msg = ('', '', None)
         self._last_fi = -1
-        self._ticker = None
+        self._prev_handler = None
         if strip is not None:
-            self._ticker = threading.Thread(
-                target=self._tick, name='splash-anim', daemon=True)
-            self._ticker.start()
+            self._start_anim_timer()
 
-    def _tick(self):
-        """Redraw loop: renders a new animation frame at SPLASH_FPS
-        even when no show() calls arrive (all blits only — the strip
-        is pre-decoded)."""
-        period = 1.0 / SPLASH_FPS
-        next_t = time.monotonic() + period
-        while not self._stop.is_set():
-            fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
-                % SPLASH_FRAMES
-            if fi != self._last_fi:
-                msg, detail, progress = self._last_msg
-                try:
-                    self._render(msg, detail, progress, fi)
-                except pygame.error:
-                    # display torn down mid-boot — stop ticking
-                    self._stop.set()
-            self._stop.wait(max(0.0, next_t - time.monotonic()))
-            next_t += period
+    def _start_anim_timer(self):
+        """Install the 12 fps SIGALRM interval timer (main thread
+        only; falls back silently to updates-on-show otherwise)."""
+        try:
+            self._prev_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, self._on_anim_timer)
+            signal.setitimer(signal.ITIMER_REAL,
+                             1.0 / SPLASH_FPS, 1.0 / SPLASH_FPS)
+        except (ValueError, OSError) as exc:
+            self._prev_handler = None
+            log.warning('splash: animation timer unavailable (%s) — '
+                        'updates only on status changes', exc)
+
+    def _stop_anim_timer(self):
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if self._prev_handler is not None:
+                signal.signal(signal.SIGALRM, self._prev_handler)
+                self._prev_handler = None
+        except (ValueError, OSError):
+            pass
+
+    def _on_anim_timer(self, signum, frame):
+        """Re-render the last shown state with the current animation
+        frame.  Runs ON the main thread between bytecode checkpoints —
+        never mid-C-call — so pygame stays single-threaded; if show()
+        is mid-render, skip this beat."""
+        if self._stopped or self.strip is None:
+            return
+        fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
+            % SPLASH_FRAMES
+        if fi == self._last_fi:
+            return
+        if not self._lock.acquire(blocking=False):
+            return                      # show() rendering — skip beat
+        try:
+            msg, detail, progress = self._last_msg
+            self._render(msg, detail, progress, fi)
+        except pygame.error:
+            self._stopped = True
+        finally:
+            self._lock.release()
 
     # ── Layout ──────────────────────────────────────────────────────
 
@@ -190,54 +220,57 @@ class SplashStatusDisplay:
         self._last_msg = (message, detail, progress)
         fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
             % SPLASH_FRAMES
-        self._render(message, detail, progress, fi)
+        with self._lock:
+            self._render(message, detail, progress, fi)
 
     def _render(self, message, detail='', progress=None, fi=0):
-        with self._lock:
-            if self.strip is not None:
-                self._last_fi = fi
-                self.screen.fill(BG)
+        """Render one frame — caller holds ``self._lock`` (show() or
+        the timer handler; the lock is NOT reentrant, so _render must
+        never take it itself)."""
+        if self.strip is not None:
+            self._last_fi = fi
+            self.screen.fill(BG)
 
-                # Current animation frame (12 fps loop).
-                vx, vy = self._video_rect()
-                v = self.square
-                sub = self.strip.subsurface((0, fi * v, v, v))
-                self.screen.blit(sub, (vx, vy))
-                if self.frame is not None:
-                    self.screen.blit(self.frame, (0, 0))
+            # Current animation frame (12 fps loop).
+            vx, vy = self._video_rect()
+            v = self.square
+            sub = self.strip.subsurface((0, fi * v, v, v))
+            self.screen.blit(sub, (vx, vy))
+            if self.frame is not None:
+                self.screen.blit(self.frame, (0, 0))
 
-                # Status text below the framed video.
-                base_y = (self.h + v) // 2 + 34
-                text = self.font_md.render(message, True, (235, 235, 240))
-                self.screen.blit(
-                    text, text.get_rect(center=(self.w // 2, base_y)))
-                detail_rect = text.get_rect()
-                if detail:
-                    d = self.font_sm.render(detail, True, (140, 140, 150))
-                    detail_rect = d.get_rect(
-                        center=(self.w // 2, base_y + 28))
-                    self.screen.blit(d, detail_rect)
-                if progress is not None:
-                    self._progress_bar(progress, detail_rect.bottom + 22)
-            else:
-                # Legacy text-only layout (StatusDisplay parity) — no
-                # animation, so no ticker runs for this instance.
-                self.screen.fill(BG)
-                text = self.font_lg.render(message, True, (235, 235, 240))
-                rect = text.get_rect(
-                    center=(self.w // 2, self.h // 2 - 40))
-                self.screen.blit(text, rect)
-                detail_rect = rect
-                if detail:
-                    d = self.font_md.render(detail, True, (140, 140, 150))
-                    detail_rect = d.get_rect(
-                        center=(self.w // 2, rect.bottom + 25))
-                    self.screen.blit(d, detail_rect)
-                if progress is not None:
-                    self._progress_bar(progress, detail_rect.bottom + 30,
-                                       large=True)
+            # Status text below the framed video.
+            base_y = (self.h + v) // 2 + 34
+            text = self.font_md.render(message, True, (235, 235, 240))
+            self.screen.blit(
+                text, text.get_rect(center=(self.w // 2, base_y)))
+            detail_rect = text.get_rect()
+            if detail:
+                d = self.font_sm.render(detail, True, (140, 140, 150))
+                detail_rect = d.get_rect(
+                    center=(self.w // 2, base_y + 28))
+                self.screen.blit(d, detail_rect)
+            if progress is not None:
+                self._progress_bar(progress, detail_rect.bottom + 22)
+        else:
+            # Legacy text-only layout (StatusDisplay parity) — no
+            # animation, so no ticker runs for this instance.
+            self.screen.fill(BG)
+            text = self.font_lg.render(message, True, (235, 235, 240))
+            rect = text.get_rect(
+                center=(self.w // 2, self.h // 2 - 40))
+            self.screen.blit(text, rect)
+            detail_rect = rect
+            if detail:
+                d = self.font_md.render(detail, True, (140, 140, 150))
+                detail_rect = d.get_rect(
+                    center=(self.w // 2, rect.bottom + 25))
+                self.screen.blit(d, detail_rect)
+            if progress is not None:
+                self._progress_bar(progress, detail_rect.bottom + 30,
+                                   large=True)
 
-            pygame.display.flip()
+        pygame.display.flip()
 
     def _progress_bar(self, progress, y, large=False):
         progress = max(0.0, min(1.0, progress))
@@ -252,12 +285,10 @@ class SplashStatusDisplay:
                              (bar_x, y, fill_w, bar_h), border_radius=3)
 
     def release(self):
-        """Stop the animation ticker and drop the strip/overlay
+        """Stop the animation timer and drop the strip/overlay
         references (~60 MB) once the main loop starts."""
-        self._stop.set()
-        if self._ticker is not None:
-            self._ticker.join(timeout=1.0)
-            self._ticker = None
+        self._stopped = True
+        self._stop_anim_timer()
         with self._lock:
             self.strip = None
             self.frame = None

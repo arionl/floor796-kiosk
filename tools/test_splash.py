@@ -77,9 +77,11 @@ class TestSplash(unittest.TestCase):
         d.release()
         self.assertIsNone(d.strip)
 
-    def test_ticker_animates_between_show_calls(self):
+    def test_timer_animates_between_show_calls(self):
         """The video must keep animating while boot phases block
-        between status updates — no show() calls for a while."""
+        between status updates — no show() calls for a while.  The
+        SIGALRM handler fires on the main thread (PEP 475 restarts
+        the interrupted sleep), exactly like a blocking boot call."""
         if self.strip is None:
             self.skipTest('decode unavailable')
         scr = pygame.display.set_mode((800, 600))
@@ -105,15 +107,41 @@ class TestSplash(unittest.TestCase):
         finally:
             d.release()
 
-    def test_release_stops_ticker(self):
+    def test_timer_renders_during_blocking_subprocess(self):
+        """The real boot pattern: main thread blocked in a subprocess
+        while the animation keeps rendering."""
+        if self.strip is None:
+            self.skipTest('decode unavailable')
+        import subprocess
+        scr = pygame.display.set_mode((800, 600))
+        d = SplashStatusDisplay(scr, self.strip, self.frame)
+        try:
+            frames = []
+            real_render = d._render
+
+            def counting_render(*a, **k):
+                frames.append(a[-1] if a else k.get('fi'))
+                real_render(*a, **k)
+
+            d._render = counting_render
+            d.show('Booting')
+            del frames[:]
+            subprocess.run(['sleep', '0.6'])
+            self.assertGreaterEqual(len(frames), 3,
+                                    f'only {len(frames)} frames during a '
+                                    '0.6 s subprocess')
+        finally:
+            d.release()
+
+    def test_release_stops_timer(self):
         if self.strip is None:
             self.skipTest('decode unavailable')
         scr = pygame.display.set_mode((800, 600))
         d = SplashStatusDisplay(scr, self.strip, self.frame)
         d.show('Booting')
         d.release()
-        self.assertTrue(d._stop.is_set())
-        self.assertIsNone(d._ticker)
+        self.assertTrue(d._stopped)
+        self.assertIsNone(d._prev_handler)
         flips = {'n': 0}
         real_flip = pygame.display.flip
 
@@ -124,7 +152,7 @@ class TestSplash(unittest.TestCase):
         try:
             time.sleep(0.4)
             self.assertEqual(flips['n'], 0,
-                             'ticker still rendering after release()')
+                             'timer still rendering after release()')
         finally:
             pygame.display.flip = real_flip
 
