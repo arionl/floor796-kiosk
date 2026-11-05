@@ -10,14 +10,20 @@ Tags are cut on `main`; development happens on `dev`.
 ### Splash video animates continuously
 - The boot splash's station animation used to advance only when a
   status/progress update redrew the screen — between updates the
-  video froze and jumped when the progress bar moved.  The splash now
-  runs its own 12 fps ticker thread that re-renders the last shown
-  state (all blits, pre-decoded strip), so the video plays smoothly
-  while boot phases block.  show() only updates text/progress; the
-  ticker stops and frees the strip in release() before the main
-  loop.  Two new tests cover redraw-without-show-calls and
-  ticker shutdown; the splash test now uses an isolated strip cache
-  so it never clobbers the production cache.
+  video froze and jumped when the progress bar moved.  The animation
+  is now driven by a main-thread 12 fps interval timer (SIGALRM)
+  whose handler re-renders the last shown state (all blits,
+  pre-decoded strip): blocking boot calls (subprocess, sleep, IO)
+  are interruptible and auto-restart, so frames advance while boot
+  phases run.  A background-thread ticker was tried first and DOES
+  NOT work on the real display — SDL/KMSDRM display flips from a
+  non-main thread silently never reach the screen (headless tests
+  can't catch this; it only shows on the device).  show() only
+  updates text/progress; the timer stops and frees the strip in
+  release() before the main loop.  New tests cover
+  redraw-without-show-calls, rendering during a blocking
+  subprocess, and timer shutdown; the splash test uses an isolated
+  strip cache so it never clobbers the production cache.
 
 ### Storage contract: MP4s are transient scratch (cold/warm boot rework)
 - The decoded frame strip in `cache/strips/` is the durable per-tile
