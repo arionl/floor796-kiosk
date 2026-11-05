@@ -9,6 +9,7 @@ text-only layout.  All exercised against a dummy display.
 import os
 import shutil
 import sys
+import time
 import unittest
 
 import pygame
@@ -27,10 +28,19 @@ class TestSplash(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Real assets from assets/splash/.
+        # Real assets from assets/splash/, but an ISOLATED strip cache
+        # so the test never clobbers (or depends on the permissions
+        # of) the production cache decoded for the real display size.
+        import tempfile
+        cls._tmp = tempfile.mkdtemp(prefix='f796_splash_test_')
+        S.SPLASH_CACHE_DIR = cls._tmp
         cls.square = int(600 * 0.66)
         cls.strip, cls.frame = load_splash_assets(
             pygame.display.set_mode((800, 600)))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def test_strip_decoded_with_60_frames(self):
         if not os.path.exists(S.SPLASH_MP4):
@@ -66,6 +76,57 @@ class TestSplash(unittest.TestCase):
         self.assertNotEqual(scr.get_at((cx, cy))[:3], S.BG)
         d.release()
         self.assertIsNone(d.strip)
+
+    def test_ticker_animates_between_show_calls(self):
+        """The video must keep animating while boot phases block
+        between status updates — no show() calls for a while."""
+        if self.strip is None:
+            self.skipTest('decode unavailable')
+        scr = pygame.display.set_mode((800, 600))
+        d = SplashStatusDisplay(scr, self.strip, self.frame)
+        try:
+            flips = {'n': 0}
+            real_flip = pygame.display.flip
+
+            def counting_flip():
+                flips['n'] += 1
+                real_flip()
+
+            pygame.display.flip = counting_flip
+            try:
+                d.show('Booting', 'step 1/2', progress=0.5)
+                before = flips['n']
+                time.sleep(0.6)          # ~7 frames at 12 fps, no show()
+                gained = flips['n'] - before
+                self.assertGreaterEqual(gained, 3,
+                                        f'only {gained} redraws in 0.6 s')
+            finally:
+                pygame.display.flip = real_flip
+        finally:
+            d.release()
+
+    def test_release_stops_ticker(self):
+        if self.strip is None:
+            self.skipTest('decode unavailable')
+        scr = pygame.display.set_mode((800, 600))
+        d = SplashStatusDisplay(scr, self.strip, self.frame)
+        d.show('Booting')
+        d.release()
+        self.assertTrue(d._stop.is_set())
+        self.assertIsNone(d._ticker)
+        flips = {'n': 0}
+        real_flip = pygame.display.flip
+
+        def counting_flip():
+            flips['n'] += 1
+
+        pygame.display.flip = counting_flip
+        try:
+            time.sleep(0.4)
+            self.assertEqual(flips['n'], 0,
+                             'ticker still rendering after release()')
+        finally:
+            pygame.display.flip = real_flip
 
     def test_fallback_legacy_layout_without_assets(self):
         old_mp4 = S.SPLASH_MP4

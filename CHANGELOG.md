@@ -7,6 +7,18 @@ Tags are cut on `main`; development happens on `dev`.
 
 ## Unreleased
 
+### Splash video animates continuously
+- The boot splash's station animation used to advance only when a
+  status/progress update redrew the screen — between updates the
+  video froze and jumped when the progress bar moved.  The splash now
+  runs its own 12 fps ticker thread that re-renders the last shown
+  state (all blits, pre-decoded strip), so the video plays smoothly
+  while boot phases block.  show() only updates text/progress; the
+  ticker stops and frees the strip in release() before the main
+  loop.  Two new tests cover redraw-without-show-calls and
+  ticker shutdown; the splash test now uses an isolated strip cache
+  so it never clobbers the production cache.
+
 ### Storage contract: MP4s are transient scratch (cold/warm boot rework)
 - The decoded frame strip in `cache/strips/` is the durable per-tile
   artifact; a tile's source MP4 is deleted the moment its strip is

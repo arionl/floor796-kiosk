@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 
 import pygame
@@ -130,7 +131,13 @@ class SplashStatusDisplay:
     """StatusDisplay-compatible boot screen with the station animation
     looping behind the status text.  API matches StatusDisplay.show()
     so every existing boot call site works unchanged; without assets
-    it renders the legacy text-only layout."""
+    it renders the legacy text-only status screen.
+
+    The animation is driven by its own 12 fps ticker thread: boot
+    phases block for seconds between status updates, and the video
+    used to freeze between them, jumping only when the progress bar
+    moved.  The ticker keeps re-rendering the last shown state so the
+    video plays continuously; show() just updates the state."""
 
     def __init__(self, screen, strip=None, frame=None):
         self.screen = screen
@@ -143,6 +150,35 @@ class SplashStatusDisplay:
         self.frame = frame
         self.square = strip.get_width() if strip else 0
         self._t0 = time.monotonic()
+        # Renderer state shared with the ticker thread.
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._last_msg = ('', '', None)
+        self._last_fi = -1
+        self._ticker = None
+        if strip is not None:
+            self._ticker = threading.Thread(
+                target=self._tick, name='splash-anim', daemon=True)
+            self._ticker.start()
+
+    def _tick(self):
+        """Redraw loop: renders a new animation frame at SPLASH_FPS
+        even when no show() calls arrive (all blits only — the strip
+        is pre-decoded)."""
+        period = 1.0 / SPLASH_FPS
+        next_t = time.monotonic() + period
+        while not self._stop.is_set():
+            fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
+                % SPLASH_FRAMES
+            if fi != self._last_fi:
+                msg, detail, progress = self._last_msg
+                try:
+                    self._render(msg, detail, progress, fi)
+                except pygame.error:
+                    # display torn down mid-boot — stop ticking
+                    self._stop.set()
+            self._stop.wait(max(0.0, next_t - time.monotonic()))
+            next_t += period
 
     # ── Layout ──────────────────────────────────────────────────────
 
@@ -151,49 +187,57 @@ class SplashStatusDisplay:
         return ((self.w - v) // 2, (self.h - v) // 2)
 
     def show(self, message, detail='', progress=None):
-        self.screen.fill(BG)
+        self._last_msg = (message, detail, progress)
+        fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
+            % SPLASH_FRAMES
+        self._render(message, detail, progress, fi)
 
-        if self.strip is not None:
-            # Current animation frame (12 fps loop).
-            fi = int((time.monotonic() - self._t0) * SPLASH_FPS) \
-                % SPLASH_FRAMES
-            vx, vy = self._video_rect()
-            v = self.square
-            sub = self.strip.subsurface((0, fi * v, v, v))
-            self.screen.blit(sub, (vx, vy))
-            if self.frame is not None:
-                self.screen.blit(self.frame, (0, 0))
+    def _render(self, message, detail='', progress=None, fi=0):
+        with self._lock:
+            if self.strip is not None:
+                self._last_fi = fi
+                self.screen.fill(BG)
 
-            # Status text below the framed video.
-            base_y = (self.h + v) // 2 + 34
-            text = self.font_md.render(message, True, (235, 235, 240))
-            self.screen.blit(
-                text, text.get_rect(center=(self.w // 2, base_y)))
-            detail_rect = text.get_rect()
-            if detail:
-                d = self.font_sm.render(detail, True, (140, 140, 150))
-                detail_rect = d.get_rect(
-                    center=(self.w // 2, base_y + 28))
-                self.screen.blit(d, detail_rect)
-            if progress is not None:
-                self._progress_bar(progress, detail_rect.bottom + 22)
-        else:
-            # Legacy text-only layout (StatusDisplay parity).
-            text = self.font_lg.render(message, True, (235, 235, 240))
-            rect = text.get_rect(
-                center=(self.w // 2, self.h // 2 - 40))
-            self.screen.blit(text, rect)
-            detail_rect = rect
-            if detail:
-                d = self.font_md.render(detail, True, (140, 140, 150))
-                detail_rect = d.get_rect(
-                    center=(self.w // 2, rect.bottom + 25))
-                self.screen.blit(d, detail_rect)
-            if progress is not None:
-                self._progress_bar(progress, detail_rect.bottom + 30,
-                                   large=True)
+                # Current animation frame (12 fps loop).
+                vx, vy = self._video_rect()
+                v = self.square
+                sub = self.strip.subsurface((0, fi * v, v, v))
+                self.screen.blit(sub, (vx, vy))
+                if self.frame is not None:
+                    self.screen.blit(self.frame, (0, 0))
 
-        pygame.display.flip()
+                # Status text below the framed video.
+                base_y = (self.h + v) // 2 + 34
+                text = self.font_md.render(message, True, (235, 235, 240))
+                self.screen.blit(
+                    text, text.get_rect(center=(self.w // 2, base_y)))
+                detail_rect = text.get_rect()
+                if detail:
+                    d = self.font_sm.render(detail, True, (140, 140, 150))
+                    detail_rect = d.get_rect(
+                        center=(self.w // 2, base_y + 28))
+                    self.screen.blit(d, detail_rect)
+                if progress is not None:
+                    self._progress_bar(progress, detail_rect.bottom + 22)
+            else:
+                # Legacy text-only layout (StatusDisplay parity) — no
+                # animation, so no ticker runs for this instance.
+                self.screen.fill(BG)
+                text = self.font_lg.render(message, True, (235, 235, 240))
+                rect = text.get_rect(
+                    center=(self.w // 2, self.h // 2 - 40))
+                self.screen.blit(text, rect)
+                detail_rect = rect
+                if detail:
+                    d = self.font_md.render(detail, True, (140, 140, 150))
+                    detail_rect = d.get_rect(
+                        center=(self.w // 2, rect.bottom + 25))
+                    self.screen.blit(d, detail_rect)
+                if progress is not None:
+                    self._progress_bar(progress, detail_rect.bottom + 30,
+                                       large=True)
+
+            pygame.display.flip()
 
     def _progress_bar(self, progress, y, large=False):
         progress = max(0.0, min(1.0, progress))
@@ -208,10 +252,15 @@ class SplashStatusDisplay:
                              (bar_x, y, fill_w, bar_h), border_radius=3)
 
     def release(self):
-        """Drop the strip/overlay references (~60 MB) once the main
-        loop starts."""
-        self.strip = None
-        self.frame = None
+        """Stop the animation ticker and drop the strip/overlay
+        references (~60 MB) once the main loop starts."""
+        self._stop.set()
+        if self._ticker is not None:
+            self._ticker.join(timeout=1.0)
+            self._ticker = None
+        with self._lock:
+            self.strip = None
+            self.frame = None
         log.info('splash: released frame memory')
 
 
