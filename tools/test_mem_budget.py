@@ -162,6 +162,46 @@ class TestParallelLoadWorkers(unittest.TestCase):
         self.assertEqual(len(c._workers), 2)
 
 
+class TestInflightDedup(unittest.TestCase):
+    """A tile being loaded by a worker must not be re-enqueued by
+    set_needed() — without the in-flight set, a popped tile is in
+    neither queue nor cache nor results and gets loaded TWICE
+    (observed as duplicate [TILELOAD] lines seconds apart)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import pygame
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        pygame.init()
+        pygame.display.set_mode((64, 64))
+
+    def test_inflight_not_reenqueued(self):
+        c = TileCache("/nonexistent", display_depth=32)
+        c._inflight.add("t0")
+        c.set_needed({"t0", "t1"}, set())
+        with c._lock:
+            self.assertNotIn("t0", c._queue)
+            self.assertIn("t1", c._queue)
+
+    def test_inflight_cleared_on_missing_strip(self):
+        """Worker pops a tile whose strip is absent — the in-flight
+        marker must be dropped so a later set_needed can retry it."""
+        import threading
+        c = TileCache("/nonexistent", display_depth=32, load_workers=1)
+        with c._lock:
+            c._queue = ["t0"]
+            c._inflight.add("t0")   # simulate: about to be popped
+        # feed the worker a tile with no strip on disk
+        with c._lock:
+            c._queue = ["t0"]
+        c.start()
+        import time as _t
+        _t.sleep(0.3)
+        c.stop()
+        with c._lock:
+            self.assertNotIn("t0", c._inflight)
+
+
 class TestMemBudget(unittest.TestCase):
 
     def test_strip_cost(self):

@@ -486,6 +486,12 @@ class TileCache:
         self._slow_load_count = 0
         self._queue = []
         self._results = {}
+        # Tiles currently being loaded by a worker.  A popped tile is
+        # in neither queue nor cache nor results, so without this set
+        # set_needed() re-enqueues it and a second worker loads the
+        # SAME strip concurrently (observed as duplicate [TILELOAD]
+        # lines seconds apart on 8 GB boards).
+        self._inflight = set()
         self._lock = threading.Lock()
         self._workers = []
         self._stop_flag = False
@@ -601,9 +607,13 @@ class TileCache:
         return tgt
 
     def _worker_loop(self, worker_idx=0):
-        # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
-        # No-op on homogeneous SoCs like the Raspberry Pi 5.
-        pin_background_thread("tile_cache")
+        # NOT pinned to slow cores: a load is disk IO + a GIL-releasing
+        # numpy depth convert, and on big.LITTLE SoCs the little cores
+        # ran it ~2x slower (5-7 s per animated strip — slower than the
+        # margin-ring window, so edge tiles arrived late).  The OS
+        # scheduler + nice priority below keep the render loop preferred.
+        # (Other background threads — holo/teleport decoders — stay
+        # pinned; their work is small and bursty.)
 
         # Lower this thread's OS priority so it never starves the render loop
         try:
@@ -616,6 +626,7 @@ class TileCache:
             with self._lock:
                 if self._queue:
                     tid = self._queue.pop(0)
+                    self._inflight.add(tid)
             if tid is None:
                 time.sleep(0.05)
                 continue
@@ -625,6 +636,8 @@ class TileCache:
                 # Fall back to PNG (pre-conversion or older format)
                 strip_path = os.path.join(self.strip_dir, f"{tid}.png")
             if not os.path.exists(strip_path):
+                with self._lock:
+                    self._inflight.discard(tid)
                 continue
             _t0 = time.perf_counter()
             try:
@@ -638,6 +651,7 @@ class TileCache:
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
                     self._results[tid] = (surf, num_frames)
+                    self._inflight.discard(tid)
                 # Load telemetry: how long a tile takes from queue to
                 # resident (disk read + depth convert).  A visible tile
                 # arriving late is bounded by this number × queued-ahead
@@ -655,6 +669,8 @@ class TileCache:
                              tid, _ms, _mb, num_frames, worker_idx)
                 time.sleep(0.05)
             except Exception:
+                with self._lock:
+                    self._inflight.discard(tid)
                 log.warning("[TILELOAD] %s FAILED", tid, exc_info=True)
 
     def _convert_to_depth(self, surf):
@@ -698,7 +714,8 @@ class TileCache:
         self._needed_ids = needed
         self._last_margin_ids = margin_ids
         with self._lock:
-            already = set(self.cache.keys()) | set(self._queue) | set(self._results.keys())
+            already = (set(self.cache.keys()) | set(self._queue)
+                       | set(self._results.keys()) | set(self._inflight))
             new_pending = needed - already
             new_visible = new_pending & visible_ids
             new_margin = new_pending & margin_ids
@@ -1895,10 +1912,15 @@ def main():
     map_h = grid_rows * SPACING_H
 
     # ── Strip pass: fetch → decode → discard, ONE tile at a time ──
+    # Build depth for NEW strips: 24-bit BMP is the on-disk container
+    # (pygame's BMP writer is always 24-bit), but the in-memory
+    # intermediate controls precision — 32-bit boards build from the
+    # full-color source instead of a 16-bit down-convert.
+    strip_depth = 32 if total_mem_mb >= LOW_MEM_THRESHOLD_MB else 16
     status.show("Checking tile strips...")
     fetch_plan = (plan_result or {}).get("plan") or []
     built_ids, fetch_failed = prepare_strips(
-        tiles_meta, status=status, display_depth=16,
+        tiles_meta, status=status, display_depth=strip_depth,
         fetch_plan=fetch_plan,
         fetch_one=tile_manager.fetch_tile if fetch_plan else None)
 
