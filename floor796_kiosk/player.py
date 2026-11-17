@@ -2334,6 +2334,7 @@ def main():
                         if event.key == pygame.K_DOWN:  pos_y += speed * dt
 
         _t_ev = (time.perf_counter() - _t_ev0) * 1000
+        _t_drv0 = time.perf_counter()   # explorer/wanderer/highlighter
 
         if pending_mode:
             # Remote mode control (POST /mode): same transitions as
@@ -2392,6 +2393,7 @@ def main():
         if object_highlighter:
             object_highlighter.update(dt, pos_x, pos_y,
                                        heading[0], heading[1])
+        _t_drv = (time.perf_counter() - _t_drv0) * 1000
 
         frame_accumulator += dt
         if frame_accumulator >= frame_interval:
@@ -2413,6 +2415,7 @@ def main():
             if teleport:
                 teleport.update()
 
+        _t_cache0 = time.perf_counter()
         visible_ids, margin_ids = _visible_and_margin_tile_ids(
             pos_x, pos_y, args.width, args.height,
             tiles_meta=tiles_meta,
@@ -2422,6 +2425,8 @@ def main():
         )
         cache.set_needed(visible_ids, margin_ids)
         cache.poll_results()
+        _t_cache = (time.perf_counter() - _t_cache0) * 1000
+        _t_cov0 = time.perf_counter()
 
         if wandering:
             wanderer.record_visits(visible_ids)
@@ -2439,6 +2444,9 @@ def main():
                      cov_visited, cov_total, cov_mn, cov_mx,
                      int(cov_blank * 100), wanderer.waypoints_picked)
             last_coverage_log = now
+
+        _t_cov = (time.perf_counter() - _t_cov0) * 1000
+        _t_stats0 = time.perf_counter()
 
         # ── Stats collection (once per frame) ──
         if stats_collector:
@@ -2472,6 +2480,8 @@ def main():
                                else "native"),
                 "cpu_affinity": get_affinity_info(),
             })
+
+        _t_stats = (time.perf_counter() - _t_stats0) * 1000
 
         # ── Render ──
         _t_blit0 = time.perf_counter()
@@ -2617,10 +2627,13 @@ def main():
                               + _t_holo + _t_tele + _t_ghost + _t_high
                               + _t_post + _t_ss + _t_flip)
                 log.info("[FRAME] breakdown: tick=%.1f ev=%.1f "
-                         "logic=%.1f blit=%.1f holo=%.1f tele=%.1f "
+                         "logic=%.1f (drv=%.1f cache=%.1f cov=%.1f "
+                         "stats=%.1f) blit=%.1f holo=%.1f tele=%.1f "
                          "ghost=%.1f highlight=%.1f post=%.1f ss=%.1f "
                          "flip=%.1f (unaccounted=%.1f)",
-                         _t_tick, _t_ev, _t_logic, _t_blit,
+                         _t_tick, _t_ev, _t_logic,
+                         _t_drv, _t_cache, _t_cov, _t_stats,
+                         _t_blit,
                          _t_holo, _t_tele, _t_ghost, _t_high,
                          _t_post, _t_ss, _t_flip,
                          _ft_total - _accounted)
