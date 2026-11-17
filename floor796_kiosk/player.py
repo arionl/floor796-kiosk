@@ -471,21 +471,23 @@ class TileCache:
     """
 
     def __init__(self, strip_dir, max_tiles=30, display_depth=16,
-                 mem_budget_mb=None, animated_ids=None):
+                 mem_budget_mb=None, animated_ids=None, load_workers=1):
         self.strip_dir = strip_dir
         self.cache = {}
         self.max_tiles = max_tiles
         self.display_depth = display_depth
         self.mem_budget_mb = mem_budget_mb
         self.animated_ids = animated_ids if animated_ids is not None else set()
+        self.load_workers = max(1, int(load_workers))
         self._strip_cost_mb = _strip_cost_mb(display_depth)
         self._static_cost_mb = _static_tile_cost_mb(display_depth)
         self._cost_mb = {}
         self.load_count = 0
+        self._slow_load_count = 0
         self._queue = []
         self._results = {}
         self._lock = threading.Lock()
-        self._worker = None
+        self._workers = []
         self._stop_flag = False
         # Last-known tile priority sets from set_needed(). Used by
         # poll_results() to do intelligent eviction (never evict visible).
@@ -598,7 +600,7 @@ class TileCache:
         del out, buf, tgt_view, rows, src_view
         return tgt
 
-    def _worker_loop(self):
+    def _worker_loop(self, worker_idx=0):
         # Pin this thread to slow cores on big.LITTLE SoCs (OrangePi 5 Max).
         # No-op on homogeneous SoCs like the Raspberry Pi 5.
         pin_background_thread("tile_cache")
@@ -624,6 +626,7 @@ class TileCache:
                 strip_path = os.path.join(self.strip_dir, f"{tid}.png")
             if not os.path.exists(strip_path):
                 continue
+            _t0 = time.perf_counter()
             try:
                 # Load 16-bit pre-converted strip from disk. No runtime
                 # conversion needed — prepare_strips() saved them as 16-bit.
@@ -635,9 +638,24 @@ class TileCache:
                 num_frames = max(1, h // TILE_H)
                 with self._lock:
                     self._results[tid] = (surf, num_frames)
+                # Load telemetry: how long a tile takes from queue to
+                # resident (disk read + depth convert).  A visible tile
+                # arriving late is bounded by this number × queued-ahead
+                # tiles; slow loads (>1.5 s) are the late-edge suspect.
+                _ms = (time.perf_counter() - _t0) * 1000
+                _mb = os.path.getsize(strip_path) / 1e6
+                if _ms > 1500:
+                    self._slow_load_count += 1
+                    log.warning("[TILELOAD] %s took %.0f ms (%.0f MB, "
+                                "%d frames, worker %d) — SLOW",
+                                tid, _ms, _mb, num_frames, worker_idx)
+                else:
+                    log.info("[TILELOAD] %s %.0f ms (%.0f MB, %d frames, "
+                             "worker %d)",
+                             tid, _ms, _mb, num_frames, worker_idx)
                 time.sleep(0.05)
             except Exception:
-                pass
+                log.warning("[TILELOAD] %s FAILED", tid, exc_info=True)
 
     def _convert_to_depth(self, surf):
         """Convert a surface to the display depth (16-bit) to halve memory."""
@@ -648,13 +666,24 @@ class TileCache:
         return s16
 
     def start(self):
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker.start()
+        # Parallel strip loads: a single worker serializes 1-3 s loads,
+        # so a batch of new tiles (direction change, boundary crossing
+        # at 4K viewports) leaves edge tiles blank until the queue
+        # drains.  Loads release the GIL (pygame.image.load, numpy
+        # converts), so workers scale; the count is set by the caller
+        # (RAM-gated — each in-flight load transiently holds a source
+        # strip + its display-format copy).
+        for i in range(self.load_workers):
+            t = threading.Thread(target=self._worker_loop,
+                                 args=(i,), daemon=True,
+                                 name=f"tile_cache_{i}")
+            t.start()
+            self._workers.append(t)
 
     def stop(self):
         self._stop_flag = True
-        if self._worker:
-            self._worker.join(timeout=2)
+        for t in self._workers:
+            t.join(timeout=2)
 
     def set_needed(self, visible_ids, margin_ids):
         # Fast path: if tile sets haven't changed since last call, skip
@@ -1972,17 +2001,23 @@ def main():
     animated_tile_ids = {
         tid for tid, info in tiles_meta["tiles"].items()
         if info.get("animated", False)}
+    # Parallel strip loaders: each in-flight load transiently holds a
+    # source strip + its display-format copy (~300-600 MB at 32-bit),
+    # so only boards with real headroom (>= 6 GB) run two workers;
+    # smaller boards keep the single-loader memory profile.
+    load_workers = 2 if total_mem_mb >= 6000 else 1
     log.info("Tile cache: budget=%s MB, strip depth=%d-bit "
              "(%d MB animated / %.1f MB static, %d animated tiles), "
-             "margin=%d (cost-weighted, count cap %d)",
+             "margin=%d (cost-weighted, count cap %d), %d load worker(s)",
              tile_budget_mb if tile_budget_mb is not None else "∞",
              display_depth, _strip_cost_mb(display_depth),
              _static_tile_cost_mb(display_depth), len(animated_tile_ids),
-             effective_margin, max_tiles)
+             effective_margin, max_tiles, load_workers)
     cache = TileCache(STRIP_DIR, max_tiles=max_tiles,
                       display_depth=display_depth,
                       mem_budget_mb=tile_budget_mb,
-                      animated_ids=animated_tile_ids)
+                      animated_ids=animated_tile_ids,
+                      load_workers=load_workers)
     visible_tile_ids, margin_tile_ids = _visible_and_margin_tile_ids(
         wanderer.x, wanderer.y, args.width, args.height,
         grid_cols, grid_rows, tiles_meta, effective_margin, tile_grid=tile_grid,
@@ -2536,25 +2571,37 @@ def main():
             _avg = sum(_frame_times) / len(_frame_times)
             log.info(
                 "[FRAME] %.1fms (avg=%.1f p50=%.1f n=%d) "
-                "blit=%.1f overlay=%.1f ss=%.1f flip=%.1f pending=%d",
+                "blit=%.1f overlay=%.1f ss=%.1f flip=%.1f pending=%d "
+                "loads=%d slow=%d",
                 _ft_total, _avg, _p50, len(_frame_times),
                 _t_blit, _t_overlay, _t_ss, _t_flip,
                 cache.pending_count,
+                cache.load_count, cache._slow_load_count,
             )
             if _ft_total > 45.0:
-                # Component attribution for slow frames.
-                log.info("[FRAME] slow breakdown: holo=%.1f tele=%.1f "
-                         "highlighter=%.1f (rest=%.1f)",
-                         _t_holo, _t_tele, _t_high,
-                         _t_overlay - _t_holo - _t_tele - _t_high)
-                _accounted = (_t_blit + _t_overlay + _t_ss + _t_flip
-                              + _t_post)
-                log.info("[FRAME] logic=%.1f tick=%.1f ev=%.1f "
-                         "post=%.1f (unaccounted=%.1f)",
-                         _t_blit0 - _ft0 - _t_tick,
-                         _t_tick, _t_ev, _t_post,
-                         _ft_total - _accounted
-                         - (_t_blit0 - _ft0))
+                # Honest per-section attribution (all sections measured
+                # directly; unaccounted = total − sum, so a nonzero value
+                # means an untimed segment or an external stall).
+                #   tick    = clock.tick(30) vsync wait
+                #   ev      = pygame event pump
+                #   logic   = everything between events and render:
+                #             wanderer/explorer drive, highlighter
+                #             update, cache set_needed/poll_results,
+                #             coverage stats, stats collection
+                #   ghost   = explorer ghost boxes
+                #   post    = stats overlay render
+                _t_logic = (_t_blit0 - _t_ev0) * 1000 - _t_ev
+                _accounted = (_t_tick + _t_ev + _t_logic + _t_blit
+                              + _t_holo + _t_tele + _t_ghost + _t_high
+                              + _t_post + _t_ss + _t_flip)
+                log.info("[FRAME] breakdown: tick=%.1f ev=%.1f "
+                         "logic=%.1f blit=%.1f holo=%.1f tele=%.1f "
+                         "ghost=%.1f highlight=%.1f post=%.1f ss=%.1f "
+                         "flip=%.1f (unaccounted=%.1f)",
+                         _t_tick, _t_ev, _t_logic, _t_blit,
+                         _t_holo, _t_tele, _t_ghost, _t_high,
+                         _t_post, _t_ss, _t_flip,
+                         _ft_total - _accounted)
                 if object_highlighter and \
                         getattr(object_highlighter, '_perf_parts', None):
                     log.info("[FRAME] highlighter parts: %s",

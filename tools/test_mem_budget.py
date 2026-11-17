@@ -107,6 +107,61 @@ class TestCostWeightedCache(unittest.TestCase):
         self.assertNotIn("anim3", self.cache.cache)
 
 
+class TestParallelLoadWorkers(unittest.TestCase):
+    """The load-worker pool: strips load from a real (temp) strip dir
+    through set_needed/poll_results with 1 and 2 workers, and every
+    load is expected to land."""
+
+    @classmethod
+    def setUpClass(cls):
+        import pygame
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        pygame.init()
+        pygame.display.set_mode((64, 64))
+        import tempfile
+        import shutil
+        cls.tmp = tempfile.mkdtemp(prefix="f796_workers_")
+        # Six REAL static-size strips (1024x820 24-bit BMPs)
+        import pygame as pg
+        for i in range(6):
+            surf = pg.Surface((1024, 820))
+            surf.fill((40 * i % 255, 80, 120))
+            pg.image.save(surf, os.path.join(cls.tmp, f"t{i}.bmp"))
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _load_all(self, workers):
+        import time as _time
+        c = TileCache(self.tmp, max_tiles=30, display_depth=32,
+                      mem_budget_mb=None, load_workers=workers)
+        tids = {f"t{i}" for i in range(6)}
+        c.set_needed(tids, set())
+        c.start()
+        deadline = _time.monotonic() + 15
+        while _time.monotonic() < deadline:
+            c.poll_results()
+            c.set_needed(tids, set())
+            if all(c.get(t) for t in tids):
+                break
+            _time.sleep(0.05)
+        c.stop()
+        return all(c.get(t) for t in tids), c
+
+    def test_single_worker_loads_all(self):
+        ok, c = self._load_all(1)
+        self.assertTrue(ok)
+        self.assertEqual(c.load_count, 6)
+
+    def test_two_workers_load_all(self):
+        ok, c = self._load_all(2)
+        self.assertTrue(ok)
+        self.assertEqual(c.load_count, 6)
+        self.assertEqual(len(c._workers), 2)
+
+
 class TestMemBudget(unittest.TestCase):
 
     def test_strip_cost(self):
