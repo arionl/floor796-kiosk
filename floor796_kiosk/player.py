@@ -1840,7 +1840,30 @@ def main():
             flags |= pygame.SCALED
     else:
         flags = 0 if resolution_capped else pygame.SCALED
-    screen = pygame.display.set_mode((args.width, args.height), flags, vsync=1)
+    # Present-path attribution: pygame emits a Python Warning when a
+    # SCALED window falls back to a software renderer (the 4K present
+    # killer); capturing it makes the fallback explicit in the journal
+    # instead of silent.  On kmsdrm with a working EGL (V3D/Panfrost)
+    # there is no warning and SDL presents via GLES.
+    import warnings as _warnings
+    with _warnings.catch_warnings(record=True) as _caught:
+        _warnings.simplefilter("always")
+        screen = pygame.display.set_mode((args.width, args.height),
+                                         flags, vsync=1)
+    _fb = [str(w.message) for w in _caught
+           if "renderer" in str(w.message).lower()]
+    # Measured, not inferred: flip an empty screen a few times.  GPU
+    # present at 4K ≈ 1-3 ms/flip; a software present ≈ 15-30 ms/flip.
+    _t_fb = time.perf_counter()
+    for _ in range(5):
+        pygame.display.flip()
+    _fb_ms = (time.perf_counter() - _t_fb) / 5 * 1000
+    log.info("Display: video=%s scaled=%s mode=%dx%d "
+             "present=%.1f ms/flip%s",
+             pygame.display.get_driver(),
+             bool(flags & pygame.SCALED), args.width, args.height,
+             _fb_ms,
+             f" WARNING: {_fb[0]}" if _fb else "")
     pygame.display.set_caption("Floor796 Kiosk")
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
