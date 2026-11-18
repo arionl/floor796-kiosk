@@ -393,7 +393,14 @@ class StatsCollector:
         """
         now = time.time()
 
+        # Attribution for slow updates (the observed 5.1 ms-quantized
+        # stalls on 8 GB boards are GIL preemption by another thread or
+        # lock contention with the webui snapshot — the actual work here
+        # is microseconds).  Cheap enough to always measure.
+        _t0 = time.perf_counter()
         with self._lock:
+            _t_lock = time.perf_counter() - _t0
+            _t1 = time.perf_counter()
             self._frame = dict(frame_data)
 
             # Update tile visit ring buffer
@@ -403,6 +410,7 @@ class StatsCollector:
             # Update spatial heatmap
             if "x" in frame_data and "y" in frame_data:
                 self._heatmap.update(frame_data["x"], frame_data["y"], now)
+            _t_work = time.perf_counter() - _t1
 
             # Sample scalar metrics
             if "blank_ratio" in frame_data:
@@ -412,6 +420,8 @@ class StatsCollector:
 
             # Sample health metrics
             self._sample_health(now)
+        self.last_breakdown = ("lock=%.1f work=%.1f"
+                               % (_t_lock * 1000, _t_work * 1000))
 
     def _sample_health(self, now):
         """Sample RSS memory and CPU usage."""

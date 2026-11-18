@@ -455,6 +455,20 @@ def prepare_strips(tiles_meta, status=None, display_depth=16,
 
 # ─── Lazy Tile Cache ─────────────────────────────────────────────────────────
 
+_AFFINITY_CACHE = {"t": 0.0, "v": None}
+
+
+def _affinity_cache_get():
+    """get_affinity_info() reads /proc topology — cache for 10 s so the
+    per-frame stats dict costs no syscalls."""
+    import time as _time
+    now = _time.monotonic()
+    if _AFFINITY_CACHE["v"] is None or now - _AFFINITY_CACHE["t"] > 10:
+        _AFFINITY_CACHE["v"] = get_affinity_info()
+        _AFFINITY_CACHE["t"] = now
+    return _AFFINITY_CACHE["v"]
+
+
 class TileCache:
     """Async tile cache — loads and converts strips in a background thread.
 
@@ -2289,6 +2303,8 @@ def main():
         _t_tick = (time.perf_counter() - _ft0) * 1000   # vsync wait
         dt = min(dt, 1 / 15)
 
+        _tt0 = time.thread_time()      # this thread's CPU
+        _pt0 = time.process_time()     # whole-process CPU (all threads)
         _t_ev0 = time.perf_counter()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -2501,7 +2517,7 @@ def main():
                 "scale_mode": ("4k-native" if args.width > 3000
                                else "4k-xrandr" if physical_w > 3000
                                else "native"),
-                "cpu_affinity": get_affinity_info(),
+                "cpu_affinity": _affinity_cache_get(),
             })
 
         _t_stats = (time.perf_counter() - _t_stats0) * 1000
@@ -2649,17 +2665,23 @@ def main():
                 _accounted = (_t_tick + _t_ev + _t_logic + _t_blit
                               + _t_holo + _t_tele + _t_ghost + _t_high
                               + _t_post + _t_ss + _t_flip)
+                _tt = (time.thread_time() - _tt0)
+                _pt = (time.process_time() - _pt0)
                 log.info("[FRAME] breakdown: tick=%.1f ev=%.1f "
                          "logic=%.1f (drv=%.1f cache=%.1f cov=%.1f "
                          "stats=%.1f) blit=%.1f holo=%.1f tele=%.1f "
                          "ghost=%.1f highlight=%.1f post=%.1f ss=%.1f "
-                         "flip=%.1f (unaccounted=%.1f)",
+                         "flip=%.1f (unaccounted=%.1f) "
+                         "cpu: thread=%.1f process=%.1f%s",
                          _t_tick, _t_ev, _t_logic,
                          _t_drv, _t_cache, _t_cov, _t_stats,
                          _t_blit,
                          _t_holo, _t_tele, _t_ghost, _t_high,
                          _t_post, _t_ss, _t_flip,
-                         _ft_total - _accounted)
+                         _ft_total - _accounted,
+                         _tt, _pt,
+                         " [STATS] " + stats_collector.last_breakdown
+                         if stats_collector and _t_stats > 15 else "")
                 if object_highlighter and \
                         getattr(object_highlighter, '_perf_parts', None):
                     log.info("[FRAME] highlighter parts: %s",
